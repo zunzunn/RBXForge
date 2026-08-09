@@ -303,6 +303,64 @@ def scenario_agent_from_env_mock():
     print("OK  agent_from_env builds an agent from environment configuration")
 
 
+def scenario_regression_vec3_format_guidance():
+    """Regression: real Ollama picked create_part but wrote position in a
+    non-object format (observed: 'params.position must be an object with numeric
+    x, y, z'). The model-facing definition must describe vectors as explicit
+    objects so the model stops guessing, while validation stays strict."""
+
+    # (1) What the AI now sees: vec3 shorthand (_model_schema) is flattened into
+    # an explicit object schema with numeric x/y/z, so the model knows the shape.
+    mod = load_agent_module()
+    agent = make_agent(RecordingProvider(""))
+    create_part = agent.tool_definitions()[0]
+    vec = create_part["parameters"]["properties"]["position"]
+    assert vec["type"] == "object", vec
+    assert vec["required"] == ["x", "y", "z"], vec
+    assert vec["properties"] == {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+    }, vec
+    assert create_part["parameters"]["properties"]["size"]["type"] == "object"
+    prompt_text = mod.build_system_prompt(agent.registry)
+    assert "never arrays like [0,5,0]" in prompt_text, prompt_text
+    assert '"position": {"x": 0, "y": 5, "z": 0}' in prompt_text, prompt_text
+
+    # (2) The observed model output shapes (position/size as non-objects) are
+    # STILL rejected with exactly the reported error - validation is not
+    # weakened by the representation fix.
+    observed_shapes = {
+        "array": {"position": [0, 5, 0], "size": [4, 4, 4]},
+        "string": {"position": "0, 5, 0", "size": "4, 4, 4"},
+    }
+    for label, vectors in observed_shapes.items():
+        arguments = dict(valid_part_arguments())
+        arguments.update({"position": vectors["position"], "size": vectors["size"]})
+        provider = RecordingProvider(json.dumps({
+            "tool": "create_part",
+            "arguments": arguments,
+        }))
+        rbx = FakeRBX(ok_part_response())
+        result = make_agent(provider, rbx=rbx).run("create a red cube")
+        assert result.ok is False, (label, result)
+        assert result.error["code"] == "invalid_arguments", (label, result)
+        assert "params.position must be an object with numeric x, y, z" in result.error["message"], \
+            (label, result.error)
+        assert rbx.requests == [], (label, rbx.requests)
+
+    # (3) A compliant model (object form) still executes end-to-end.
+    provider = RecordingProvider(json.dumps({
+        "tool": "create_part",
+        "arguments": valid_part_arguments(),
+    }))
+    rbx = FakeRBX(ok_part_response())
+    result = make_agent(provider, rbx=rbx).run("create a red cube")
+    assert result.ok is True, result
+    print("OK  vec3 shown as explicit object schema; observed bad shapes still rejected; "
+          "compliant calls still execute")
+
+
 def main():
     scenario_tool_definitions_sent_to_ai()
     scenario_valid_ai_tool_call()
@@ -313,6 +371,7 @@ def main():
     scenario_provider_error()
     scenario_create_part_through_registry_success()
     scenario_agent_from_env_mock()
+    scenario_regression_vec3_format_guidance()
     print("\nAll agent scenarios passed.")
 
 

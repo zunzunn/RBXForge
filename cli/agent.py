@@ -126,18 +126,55 @@ def parse_tool_call(text):
 # --------------------------------------------------------------------------- #
 
 
+def _model_schema(schema):
+    """Flatten an internal RBXForge schema into a model-friendly JSON Schema.
+
+    The registry validator understands our custom ``"vec3"`` type, but that bare
+    string is opaque to an LLM - a model that sees ``{"type": "vec3"}`` guesses
+    the format (arrays like ``[0,5,0]``, strings like ``"0,5,0"``), which the
+    validator rightly rejects. Present vectors as a plain object schema with
+    numeric ``x``/``y``/``z`` properties and a description showing the exact
+    form, so the model reliably produces ``{"x": ..., "y": ..., "z": ...}``.
+    Validation itself is untouched.
+    """
+    kind = schema.get("type")
+    if kind == "vec3":
+        return {
+            "type": "object",
+            "description": "a 3D vector as an object with numeric x, y, z, "
+                           'e.g. {"x": 0, "y": 5, "z": 0} - never an array or '
+                           'a string like "0,5,0"',
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+            "required": ["x", "y", "z"],
+        }
+    if kind == "object":
+        out = dict(schema)
+        out["properties"] = {
+            key: _model_schema(child)
+            for key, child in schema.get("properties", {}).items()
+        }
+        return out
+    return dict(schema)
+
+
 def tool_definitions(registry):
     """Return the registered tools as a serializable list for the model.
 
     Each entry carries the same metadata the CLI validates against - name,
-    description, and parameters (the tool's ``input_schema``) - so the model can
-    select a tool and supply schema-valid arguments.
+    description, and parameters - so the model can select a tool and supply
+    schema-valid arguments. Parameters are flattened via :func:`_model_schema`
+    so internal shorthand like ``vec3`` is described in a format the model
+    understands while the validator keeps its strict checks.
     """
     return [
         {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema,
+            "parameters": _model_schema(tool.input_schema),
         }
         for tool in registry.list()
     ]
@@ -154,7 +191,15 @@ def build_system_prompt(registry):
         + "\n"
         "Reply with only a single JSON object selecting a tool and its arguments:\n"
         '{"tool": "<tool name>", "arguments": { ... }}\n'
-        "'arguments' must satisfy the selected tool's parameters schema exactly.\n"
+        "'arguments' must satisfy the selected tool's parameters schema exactly; "
+        "every declared property is required.\n"
+        "3D vectors (e.g. position, size) are JSON objects of the form "
+        '{"x": number, "y": number, "z": number} - never arrays like [0,5,0] '
+        'and never strings like "0,5,0".\n'
+        'Example call:\n'
+        '{"tool": "create_part", "arguments": {"name": "RedCube", '
+        '"position": {"x": 0, "y": 5, "z": 0}, '
+        '"size": {"x": 4, "y": 4, "z": 4}, "color": "red"}}\n'
         "Do not include any other text in your reply."
     )
 

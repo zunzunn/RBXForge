@@ -2,10 +2,11 @@
 
 > **Status:** Partially implemented.
 >
-> - **Current / Implemented (Phase 2A):** the transport and the message types below are
+> - **Current / Implemented (Phase 2B):** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. One Studio operation (`create_part`) is implemented as a
->   request/response exchange.
+>   `plugin/rbxforge.lua`. One Studio operation (`create_part`) is implemented as a registered
+>   tool, dispatched through registries on both sides, with CLI-side argument validation before
+>   any `request` is sent.
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -238,12 +239,18 @@ Implemented error codes:
    `PLUGIN DISCONNECTED` and forgets the connection. The server keeps running.
 5. RBXForge terminates cleanly on `quit` (it sends no frames; TCP close is the signal).
 
-## Tool Execution (Implemented — Phase 2A)
+## Tool Execution (Implemented — Phase 2B)
 
-Each RBXForge tool call maps to one `request` message (see [TOOLS.md](./TOOLS.md)). The
-plugin executes the tool in Studio and returns a `response` (success or error). Exactly
-one operation is implemented: `create_part` (creates a Part in `workspace` with the given
-name, position, size, and color). Every request gets a response — never silence.
+Each RBXForge tool call maps to one `request` message (see [TOOLS.md](./TOOLS.md)); the tool
+`params` are defined in "Implemented tools and their `params`" above. Before any `request` is
+sent, the CLI **validates the arguments against the tool's input schema**
+(cli/rbxforge.py `ToolRegistry`). Invalid arguments are rejected locally — no `request` is sent —
+and reported to the caller. On the plugin side, incoming `request`s are dispatched through a
+**tool-handler registry** (`plugin/rbxforge.lua` `toolHandlers` / `registerTool`), not a
+hard-coded branch. Exactly one tool is implemented: `create_part` (creates a Part in `workspace`
+with the given name, position, size, and color). Every `request` gets a `response` — never
+silence; the CLI-side validation failure replaces the request/response round trip with a local
+rejection before anything is sent.
 
 ## Future Streaming / Events (Planned)
 

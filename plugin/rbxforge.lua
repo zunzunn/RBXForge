@@ -181,9 +181,21 @@ local function handleCreatePart(id, params)
 	})
 end
 
-local toolHandlers = {
-	create_part = handleCreatePart,
-}
+-- Tool handler registry: incoming request messages are dispatched through this
+-- table rather than hard-coded branches. Each handler is registered by name with
+-- registerTool(); handleRequest looks the tool up here.
+local toolHandlers = {}
+
+local function registerTool(name, handler)
+	if toolHandlers[name] then
+		log("duplicate tool handler registration: " .. tostring(name))
+		return
+	end
+	toolHandlers[name] = handler
+end
+
+-- Registered tool handlers (dispatch happens in handleRequest).
+registerTool("create_part", handleCreatePart)
 
 local function handleRequest(id, payload)
 	local tool = payload.tool

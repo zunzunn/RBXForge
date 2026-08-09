@@ -1,11 +1,13 @@
-# RBXForge — Tool System (Conceptual)
+# RBXForge — Tool System
 
-> **Status:** Planned, with one implemented prototype.
+> **Status:** One tool implemented (Phase 2B); the rest is conceptual.
 >
-> - **Implemented (Phase 2A):** `create_part` — a minimal, hard-coded prototype that creates a
->   single Part in `workspace`. It is wired end-to-end (CLI → `request` message → plugin →
->   Studio → `response`) but takes only fixed test parameters. See
->   [PROTOCOL.md](./PROTOCOL.md) for the wire format.
+> - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
+>   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
+>   description, input schema** — and arguments are **validated against that schema before any
+>   request is sent**. The Studio plugin (`plugin/rbxforge.lua`) dispatches incoming `request`
+>   messages through its own tool-handler registry. See [PROTOCOL.md](./PROTOCOL.md) for the wire
+>   format.
 > - **Planned:** everything else below is conceptual only. **No other tools are implemented.**
 >   Final APIs are deliberately **not invented yet.**
 
@@ -21,6 +23,25 @@ AI Model
    ↓
 Agent  ── calls ──►  RBXForge Tool System  ──►  Studio Plugin  ──►  Roblox Studio
 ```
+
+## Implemented Tool (Phase 2B)
+
+### create_part
+
+- **Purpose:** Create a Part in the current project's `workspace`.
+- **Inputs (schema, validated by the CLI before sending):**
+  - `name` — string, at least one character
+  - `position` — object with numeric `x`, `y`, `z`
+  - `size` — object with numeric `x`, `y`, `z`
+  - `color` — string, one of `"red"`
+- **Expected output:** `ok: true` with the created part's `{ name, position, size, color }`,
+  or `ok: false` with `error.code` / `error.message`.
+- **Why the agent might use it:** "create a red cube" (prototype for the future, general
+  `create_instance` tool).
+
+The CLI exposes one command, `create_part`, which runs this tool with its fixed test defaults.
+The tool layer is generic: any argument set that passes the input schema can be executed via the
+registry (`ToolRegistry.execute`).
 
 ## Conceptual Tool List
 
@@ -47,6 +68,8 @@ implementation.
 These names match the conceptual set in the product vision. Some vision examples were worded as
 `create_part`, `create_model`, `create_folder`; here they are grouped under `create_instance`
 with a `type` parameter. The exact granularity is **not decided** and is an open design question.
+`create_part` is implemented (Phase 2B) as the first concrete tool and serves as the template for
+the future `create_instance`.
 
 ## Tool Anatomy
 
@@ -57,6 +80,11 @@ Each tool is described conceptually by:
   than as a final schema.
 - **Expected output:** What the agent can expect back (success/failure, plus data).
 - **Why the agent might use it:** Typical situations where the tool is the right choice.
+
+> **Implemented tool anatomy (Phase 2B):** every registered tool carries machine-readable
+> metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
+> against that schema before sending a `request`. `create_part` is the first such tool; the
+> conceptual entries below are still being designed.
 
 ---
 
@@ -168,6 +196,10 @@ Each tool is described conceptually by:
 ## Design Notes
 
 - The list above is **conceptual**. Exact names, arguments, and schemas are open questions.
+- **Implemented registry (Phase 2B):** the CLI keeps a `ToolRegistry` keyed by tool name; each
+  `Tool` carries `name`, `description`, and `input_schema` and knows how to turn validated
+  arguments into a protocol request/response exchange. Adding a tool later means registering one
+  more `Tool` — no protocol changes required.
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

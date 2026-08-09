@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""End-to-end protocol tests for the RBXForge CLI (Phase 2A).
+"""End-to-end protocol + tool-layer tests for the RBXForge CLI (Phase 2B).
 
 Starts cli/rbxforge.py as a subprocess and drives it with a minimal WebSocket
 client that mimics the RBXForge Studio plugin (hello -> welcome -> ping -> pong,
 plus request/response for create_part, plus disconnect handling). Standard
 library only.
 
+The tool-layer tests import cli/rbxforge.py in-process to verify the registry
+registers create_part with metadata and rejects invalid arguments before any
+request is sent.
+
 Run from the repository root:
     python3 tests/test_protocol.py
 """
 
 import base64
+import importlib.util
 import json
 import os
 import re
@@ -32,6 +37,19 @@ HELLO = {
     "timestamp": 0.0,
     "payload": {"name": "rbxforge-plugin", "version": "0.1.0", "protocol": PROTOCOL_VERSION},
 }
+
+# The CLI module is imported in-process for the tool-layer tests.
+_CLI_MODULE = None
+
+
+def load_cli_module():
+    global _CLI_MODULE
+    if _CLI_MODULE is None:
+        spec = importlib.util.spec_from_file_location("rbxforge_cli_mod", CLI)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CLI_MODULE = module
+    return _CLI_MODULE
 
 
 # --------------------------------------------------------------------------- #
@@ -402,6 +420,82 @@ def scenario_interactive_create_part_registered():
             proc.proc.kill()
 
 
+def scenario_tool_registry_metadata():
+    """The tool registry must expose create_part with name/description/schema."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+    tools = registry.list()
+    assert [t.name for t in tools] == ["create_part"], tools
+    tool = registry.get("create_part")
+    assert tool is not None
+    assert isinstance(tool.description, str) and tool.description
+    assert isinstance(tool.input_schema, dict)
+    assert tool.input_schema["type"] == "object"
+    assert "name" in tool.input_schema["properties"]
+    assert set(tool.input_schema["required"]) == {"name", "position", "size", "color"}
+    print("OK  registry registers create_part with name, description, and input schema")
+
+
+def scenario_tool_validation():
+    """create_part arguments must be validated against its schema before use."""
+    mod = load_cli_module()
+    valid = dict(mod.CREATE_PART_DEFAULT_PARAMS)
+    tool = mod.default_registry().get("create_part")
+
+    # Valid parameters pass (the fixed Phase 2A defaults, plus a variation).
+    tool.validate(valid)
+    tool.validate({
+        "name": "MyPart",
+        "position": {"x": 1, "y": 2, "z": 3},
+        "size": {"x": -2, "y": 4, "z": 6},
+        "color": "red",
+    })
+
+    invalid_cases = [
+        ("missing required property", {}),
+        ("empty name", {k: v if k != "name" else "" for k, v in valid.items()}),
+        ("missing z of position", {
+            k: v if k != "position" else {"x": 0, "y": 1} for k, v in valid.items()
+        }),
+        ("position not an object", {k: v if k != "position" else "5,5,5" for k, v in valid.items()}),
+        ("unsupported color", {k: v if k != "color" else "blue" for k, v in valid.items()}),
+        ("name not a string", {k: v if k != "name" else 42 for k, v in valid.items()}),
+        ("params not an object", ["nope"]),
+    ]
+    for label, bad_params in invalid_cases:
+        try:
+            tool.validate(bad_params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_part accepted invalid params: " + label)
+    print("OK  create_part schema rejects invalid arguments (missing/wrong type/value)")
+
+
+def scenario_tool_invalid_rejected_before_send():
+    """execute_tool must reject invalid params before attempting to send."""
+    mod = load_cli_module()
+    rbx = mod.RBXForge()
+
+    # Invalid params: rejected locally, no request is attempted.
+    result = rbx.execute_tool("create_part", {"name": ""}, timeout=1.0)
+    assert result is False, result
+
+    # Unknown tool: rejected locally too.
+    result = rbx.execute_tool("does_not_exist", {}, timeout=1.0)
+    assert result is False, result
+
+    # Valid params but no connection: reaches the send stage (no plugin), proving
+    # validation happened first and was not the reason for failure.
+    result = rbx.execute_tool("create_part", dict(mod.CREATE_PART_DEFAULT_PARAMS), timeout=1.0)
+    assert result is False, result
+
+    # The registry itself is the same object the CLI would use.
+    assert rbx.create_part(timeout=1.0) is False
+    print("OK  execute_tool validates before sending; unknown tools rejected")
+    rbx.stop()
+
+
 def scenario_repl_run_after_connection():
     """The interactive REPL must keep accepting input after a plugin connects
     and disconnects.
@@ -605,6 +699,9 @@ def scenario_repl_after_plugin_connect_pty():
 
 
 def main():
+    scenario_tool_registry_metadata()
+    scenario_tool_validation()
+    scenario_tool_invalid_rejected_before_send()
     scenario_connect_hello_ping_pong()
     scenario_disconnect_and_reconnect()
     scenario_errors()

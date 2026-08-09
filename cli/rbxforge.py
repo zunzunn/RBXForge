@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RBXForge CLI - Phase 2A: local connection plus one Studio operation.
+"""RBXForge CLI - Phase 2B: local connection plus a formal tool layer.
 
 Runs a local WebSocket server on 127.0.0.1. The RBXForge Studio plugin (see
 plugin/rbxforge.lua) connects to this process. This milestone implements:
@@ -7,7 +7,9 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
 - connection detection (the CLI reports when the plugin connects / disconnects)
 - a hello/welcome handshake
 - a test message: ping -> pong
-- one Studio operation: create_part (request/response over the same socket)
+- a tool registry (name, description, input schema) that validates arguments
+  before sending a request; create_part is the first registered tool
+  (request/response over the same socket)
 
 Standard library only; no external dependencies.
 
@@ -338,6 +340,171 @@ class REPLConsole:
 
 
 # --------------------------------------------------------------------------- #
+# Tool layer (see docs/TOOLS.md and docs/PROTOCOL.md)
+# --------------------------------------------------------------------------- #
+
+
+class ToolError(Exception):
+    """Base class for tool-layer errors."""
+
+
+class UnknownToolError(ToolError):
+    """Raised when a tool name is not registered."""
+
+
+class InvalidParamsError(ToolError):
+    """Raised when params do not match a tool's input schema."""
+
+
+def _validate_value(value, spec, path):
+    """Validate one value against a schema fragment; returns an error string or None.
+
+    The schema is a small JSON-like object with a ``type`` key. Supported types:
+    ``object`` (with ``properties`` and ``required``), ``vec3`` (an object with
+    numeric x, y, z), ``string`` (optionally ``min_length`` / ``enum``), and
+    ``number``.
+    """
+    kind = spec.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return path + " must be an object"
+        for required in spec.get("required", []):
+            if required not in value:
+                return path + " is missing required property '" + required + "'"
+        for key, child in spec.get("properties", {}).items():
+            if key in value:
+                error = _validate_value(value[key], child, path + "." + key)
+                if error is not None:
+                    return error
+    elif kind == "vec3":
+        if not isinstance(value, dict):
+            return path + " must be an object with numeric x, y, z"
+        for axis in ("x", "y", "z"):
+            component = value.get(axis)
+            if isinstance(component, bool) or not isinstance(component, (int, float)):
+                return path + "." + axis + " must be a number"
+    elif kind == "string":
+        if not isinstance(value, str):
+            return path + " must be a string"
+        if "min_length" in spec and len(value) < spec["min_length"]:
+            return path + " must be at least {0} character(s)".format(spec["min_length"])
+        if "enum" in spec and value not in spec["enum"]:
+            choices = ", ".join(repr(choice) for choice in spec["enum"])
+            return path + " must be one of " + choices
+    elif kind == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return path + " must be a number"
+    else:
+        return path + " uses an unsupported schema type: {0!r}".format(kind)
+    return None
+
+
+class Tool:
+    """A single RBXForge operation: metadata plus parameter handling.
+
+    ``input_schema`` is a small JSON-like object the CLI validates arguments
+    against before any request is sent. ``run`` is the caller-side executor: a
+    callable ``run(rbx, validated_params, timeout)`` that turns a validated call
+    into the protocol's request/response exchange.
+    """
+
+    def __init__(self, name, description, input_schema, run):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self._run = run
+
+    def validate(self, params):
+        """Validate ``params`` against the input schema; raise on failure."""
+        error = _validate_value(params, self.input_schema, "params")
+        if error is not None:
+            raise InvalidParamsError(error)
+        return params
+
+    def run(self, rbx, params, timeout=10.0):
+        return self._run(rbx, params, timeout)
+
+
+class ToolRegistry:
+    """Ordered collection of tools keyed by name."""
+
+    def __init__(self):
+        self._tools = {}
+
+    def register(self, tool):
+        if tool.name in self._tools:
+            raise ValueError("a tool named {0!r} is already registered".format(tool.name))
+        self._tools[tool.name] = tool
+
+    def get(self, name):
+        return self._tools.get(name)
+
+    def list(self):
+        return [self._tools[name] for name in sorted(self._tools)]
+
+    def execute(self, rbx, name, params, timeout=10.0):
+        """Validate ``params`` for the named tool, then run it over the protocol."""
+        tool = self.get(name)
+        if tool is None:
+            raise UnknownToolError("unknown tool: {0}".format(name))
+        validated = tool.validate(params)
+        return tool.run(rbx, validated, timeout)
+
+
+CREATE_PART_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "min_length": 1},
+        "position": {"type": "vec3"},
+        "size": {"type": "vec3"},
+        "color": {"type": "string", "enum": ["red"]},
+    },
+    "required": ["name", "position", "size", "color"],
+}
+
+CREATE_PART_DEFAULT_PARAMS = {
+    "name": "RBXForgeTestPart",
+    "position": {"x": 0, "y": 5, "z": 0},
+    "size": {"x": 4, "y": 4, "z": 4},
+    "color": "red",
+}
+
+
+def create_part_tool():
+    """Build the create_part tool (the fixed-phase test parameters are the CLI
+    defaults; the tool itself accepts any schema-valid parameters)."""
+
+    def run(rbx, params, timeout):
+        response = rbx.send_request("create_part", params, timeout)
+        if response is None:
+            rbx.log("create_part failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            part = response.get("result") or {}
+            rbx.log("create_part OK: created {0}".format(part.get("name")))
+            return True
+        error = response.get("error") or {}
+        rbx.log("create_part FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "create_part",
+        "Create a Part in workspace with the given name, position, size, and color.",
+        CREATE_PART_SCHEMA,
+        run,
+    )
+
+
+def default_registry():
+    """Build the registry with all built-in tools registered."""
+    registry = ToolRegistry()
+    registry.register(create_part_tool())
+    return registry
+
+
+# --------------------------------------------------------------------------- #
 # RBXForge protocol layer (see docs/PROTOCOL.md)
 # --------------------------------------------------------------------------- #
 
@@ -345,10 +512,11 @@ class REPLConsole:
 class RBXForge:
     """Connection tracking, message dispatch, and the ping command."""
 
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, console=None):
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, console=None, registry=None):
         self.host = host
         self.port = port
         self.console = console if console is not None else REPLConsole()
+        self.registry = registry if registry is not None else default_registry()
         self.server = None
         self.connection = None
         self.connection_lock = threading.Lock()
@@ -555,27 +723,20 @@ class RBXForge:
         self.log("timed out waiting for response ({0}) after {1:g}s".format(mid, timeout))
         return None
 
-    def create_part(self, timeout=10.0):
-        """Create a test part in Studio via the plugin (Phase 2A)."""
-        params = {
-            "name": "RBXForgeTestPart",
-            "position": {"x": 0, "y": 5, "z": 0},
-            "size": {"x": 4, "y": 4, "z": 4},
-            "color": "red",
-        }
-        response = self.send_request("create_part", params, timeout)
-        if response is None:
-            self.log("create_part failed: no response from the plugin")
+    def execute_tool(self, name, params, timeout=10.0):
+        """Validate and run a registered tool; returns True/False and logs results."""
+        try:
+            return self.registry.execute(self, name, params, timeout)
+        except UnknownToolError as exc:
+            self.log("cannot execute: {0}".format(exc))
             return False
-        if response.get("ok"):
-            part = response.get("result") or {}
-            self.log("create_part OK: created {0}".format(part.get("name")))
-            return True
-        error = response.get("error") or {}
-        self.log("create_part FAILED: [{0}] {1}".format(
-            error.get("code"), error.get("message")
-        ))
-        return False
+        except InvalidParamsError as exc:
+            self.log("cannot execute {0}: invalid parameters: {1}".format(name, exc))
+            return False
+
+    def create_part(self, timeout=10.0):
+        """Create the test part in Studio via the registered create_part tool."""
+        return self.execute_tool("create_part", CREATE_PART_DEFAULT_PARAMS, timeout)
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -652,7 +813,7 @@ def repl(rbx, console, prompt="RBXForge> "):
         elif command == "help":
             print("commands:")
             print("  ping        - send a ping to the connected plugin and wait for pong")
-            print("  create_part - create a test Part in Studio via the plugin")
+            print("  create_part - run the create_part tool (creates a test Part in Studio)")
             print("  status      - show connection status")
             print("  quit        - stop RBXForge")
         else:
@@ -662,8 +823,8 @@ def repl(rbx, console, prompt="RBXForge> "):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="rbxforge",
-        description="RBXForge local process. Phase 1: local WebSocket connection "
-                    "with the RBXForge Studio plugin.",
+        description="RBXForge local process. Phase 2B: local WebSocket connection "
+                    "with the RBXForge Studio plugin plus a formal tool layer.",
     )
     parser.add_argument(
         "--host", default=DEFAULT_HOST,
@@ -701,6 +862,9 @@ def main(argv=None):
         return 1
     rbx.log("listening on ws://{0}:{1} (protocol v{2})".format(address[0], address[1], PROTOCOL_VERSION))
     rbx.log("load the RBXForge plugin in Roblox Studio and click 'Connect'.")
+    rbx.log("tools registered: {0}".format(
+        ", ".join(tool.name for tool in rbx.registry.list())
+    ))
 
     try:
         if args.ping_once:

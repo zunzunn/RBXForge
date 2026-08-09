@@ -1,8 +1,10 @@
 # RBXForge — Architecture
 
 > **Status:** Partially implemented. Phase 1 (the minimal local connection between the CLI and
-> the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) and the
-> Phase 3A AI provider layer are implemented. The agent loop remains planned.
+> the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) is
+> implemented; and the Phase 3A AI provider layer plus the Phase 3B minimal single-step agent
+> (`prompt → provider → tool call → execution`) are implemented. The multi-step agent loop
+> remains planned.
 
 ## Overview
 
@@ -48,7 +50,7 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 | Component | Status |
 | --- | --- |
 | CLI | **Implemented (Phases 1–2A)** — local WebSocket server, interactive REPL, `create_part` tool ([TOOLS.md](./TOOLS.md)) |
-| Interactive agent | **Planned** — not implemented |
+| Interactive agent | **Implemented (minimal, Phase 3B)** — single-step `prompt → provider → tool call → execution` in `cli/agent.py`; the full loop is planned |
 | AI provider layer | **Implemented (Phase 3A)** — `cli/providers.py`: provider interface, Ollama + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Planned** — not implemented |
 | Tool system | **Partially implemented (Phase 2B)** — `create_part` live end-to-end (CLI + plugin); more tools planned |
@@ -57,9 +59,9 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 | Studio plugin | **Implemented (Phases 1–2B)** — connects to RBXForge, answers ping/pong, executes `create_part`, see [PLUGIN.md](./PLUGIN.md) |
 | Verification system | **Planned** — future |
 
-Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), and the
-Phase 3A AI provider layer. The interactive agent, agent loop, and verification system are still
-planned.
+Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), the
+Phase 3A AI provider layer, and the Phase 3B minimal single-step agent. The multi-step agent
+loop and verification system are still planned.
 
 ## Components
 
@@ -89,6 +91,12 @@ The orchestration brain. It receives a user prompt and drives the full loop:
 5. **Verify** the result in Studio.
 6. **Fix** if necessary, then **verify again**.
 7. **Report** what changed.
+
+**Phase 3B (implemented, minimal):** `cli/agent.py` provides a single-step slice of this —
+`prompt → provider → structured tool call → ToolRegistry execution → result`. It gives the model
+the currently registered tool definitions, parses the model's JSON tool call, and executes it
+through the ToolRegistry only, rejecting unknown tools / invalid arguments safely. Multi-step
+autonomy (planning, verify, fix, loops) is not implemented yet.
 
 See [AGENT.md](./AGENT.md) for the full expected behavior.
 

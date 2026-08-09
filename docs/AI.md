@@ -1,13 +1,17 @@
 # RBXForge — AI / Provider Architecture
 
-> **Status:** Provider layer implemented (Phase 3A); the agent loop is not.
+> **Status:** Provider layer + minimal single-step agent implemented (Phases 3A–3B); the
+> multi-step agent loop is not.
 >
 > - **Implemented (Phase 3A):** a provider-agnostic chat/inference interface in
 >   `cli/providers.py`, an **Ollama** backend (local HTTP API), a **mock** backend for tests, and
 >   environment-based configuration. NVIDIA **NIM** is recognized by the design (decision D-009)
 >   but **not implemented**.
-> - **Not implemented yet:** the agent loop, tool calling, context management, and natural-language
->   → tool parsing.
+> - **Implemented (Phase 3B):** `cli/agent.py` — a minimal single-step agent that connects the
+>   provider layer to the tool layer: natural-language prompt → provider → structured JSON tool
+>   call → validation + execution through the `ToolRegistry`.
+> - **Not implemented yet:** the multi-step agent loop, conversation history, context management,
+>   provider-native tool calling, and project inspection.
 
 ## Purpose
 
@@ -78,17 +82,41 @@ Agent  ──►  AI Provider Layer  ──►  Model (Ollama / NIM / future)
 Generation parameters (temperature, max tokens, ...) are passed through provider-specific
 `chat()` options (e.g. Ollama's `"options"`).
 
-## Agent / Tool Calling
+## Agent / Tool Calling (Implemented — Phase 3B, single step)
 
-> **Not implemented yet (future).** Phase 3A deliberately does **not** connect AI to Roblox tools.
+> **Implemented (Phase 3B):** `cli/agent.py` connects the provider layer to the Phase 2B tool
+> layer. This is a **minimal single-step** agent — no autonomous loop yet. It performs one
+> `prompt → provider → tool call → execution` pass and returns.
 
-- The provider must eventually support the agent calling RBXForge tools (see [TOOLS.md](./TOOLS.md)).
-- The agent flow: model produces a plan and tool calls → tool system executes → results feed
-  back to the model → loop continues until done.
-- Provider-specific tool-calling formats must be normalized behind the provider abstraction so
-  the agent logic stays provider-independent.
-- Model capability for reliable tool calling is a practical constraint; which models to target
-  is an open decision (U-006).
+The flow (`Agent.run(prompt) -> AgentResult`, all failures returned, never raised):
+
+1. **Give the AI the currently registered tool definitions.** The agent serializes
+   `registry.list()` into the system prompt — each tool's `name`, `description`, and
+   `parameters` (its `input_schema`) — and appends the user prompt. The model is instructed to
+   reply with exactly one JSON object: `{"tool": "<name>", "arguments": { ... }}`.
+2. **Provider.** `provider.chat(messages)` is called (Ollama in real use, mock in tests). Any
+   `ProviderError` (timeout/connection/response/…) becomes a safe `provider_error` result.
+3. **Parse.** The reply is parsed into a structured tool call (`parse_tool_call`). The parser
+   accepts the JSON object anywhere in the output (including inside a ```json fenced block) and
+   uses the first object found. Malformed output (no JSON, non-object JSON, missing/incorrect
+   `tool`/`arguments`) becomes a safe `malformed_output` result.
+4. **Validate + execute through the `ToolRegistry` only.** `registry.execute(...)` is the sole
+   execution path — the same call used by the CLI tool layer. `UnknownToolError` → `unknown_tool`
+   result; `InvalidParamsError` → `invalid_arguments` result. Both are rejected before anything
+   is sent to the plugin.
+5. **Result.** `AgentResult` carries `ok`, the parsed `tool`, the tool layer's `output`, an
+   `error` dict (`code`/`message`/`type`), and the raw `provider_text` for diagnostics.
+
+- `Agent(provider, registry=..., rbx=..., timeout=...)` — `registry` defaults to the built-in
+  tool registry (`create_part`); `rbx` is the connection object handed to the registry when
+  executing a tool (an `RBXForge` instance in real use, a fake in tests).
+- `agent_from_env()` builds the agent with the provider configured from the environment (defaults
+  to Ollama, see Configuration above).
+- Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet: Phase 3B
+  relies on plain `chat` output parsed as JSON. Normalizing provider-specific tool-call formats
+  behind the provider abstraction is future work.
+- **Explicitly out of scope now (future):** multi-step autonomous loops, conversation history,
+  plan → tool select → execute → verify cycling, and project inspection.
 
 ## Context Management
 
@@ -104,7 +132,7 @@ Generation parameters (temperature, max tokens, ...) are passed through provider
   selectively, rather than dumping the entire project into the prompt.
 - This is a long-term, phased capability (Phase 4 in [ROADMAP.md](./ROADMAP.md)).
 
-## Failure Handling (Implemented at the provider layer)
+## Failure Handling (Implemented at the provider + agent layers)
 
 - Provider failures (connection, timeout, invalid response) are surfaced as typed errors so the
   agent can retry, degrade, or report:
@@ -113,14 +141,19 @@ Generation parameters (temperature, max tokens, ...) are passed through provider
   - `ProviderTimeoutError` — request exceeded the timeout
   - `ProviderResponseError` — invalid/unexpected response
   - `ProviderNotImplementedError` — recognized but not implemented (currently `nim`)
-- The agent loop already handles operation failures via diagnose/fix (see [AGENT.md](./AGENT.md));
-  provider-layer failures are a distinct class the agent must also handle gracefully.
+- The Phase 3B agent converts provider errors into `provider_error` results, malformed model
+  output into `malformed_output` results, and registry rejections into `unknown_tool` /
+  `invalid_arguments` results — none of these crash the caller.
+- The agent loop (diagnose/fix, see [AGENT.md](./AGENT.md)) is **not** implemented yet;
+  Phase 3B stops at one execution pass.
 - Exact retry/backoff behavior is not yet defined.
 
 ## Open Questions
 
 - Concrete model selection and required tool-calling capabilities for Ollama vs NIM (U-006).
-- Context window budget and trimming strategy.
+- Whether to adopt provider-native tool calling (e.g. OpenAI-style `tool_calls`) behind the
+  provider abstraction instead of JSON-in-text parsing (Phase 3B uses JSON-in-text).
+- Context window budget and trimming strategy; conversation history for multi-turn sessions.
 - Whether the agent runs inside the CLI process or as a separate service.
 - Configuration mechanism and file format (environment variables are the Phase 3A mechanism;
   a config file may be added later).

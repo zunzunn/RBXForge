@@ -1,7 +1,7 @@
 # RBXForge — AI / Provider Architecture
 
-> **Status:** Provider layer + minimal single-step agent implemented (Phases 3A–3B); the
-> multi-step agent loop is not.
+> **Status:** Provider layer + minimal single-step agent implemented; interactive AI REPL wired
+> in (Phases 3A–3C). The multi-step agent loop is not.
 >
 > - **Implemented (Phase 3A):** a provider-agnostic chat/inference interface in
 >   `cli/providers.py`, an **Ollama** backend (local HTTP API), a **mock** backend for tests, and
@@ -10,6 +10,8 @@
 > - **Implemented (Phase 3B):** `cli/agent.py` — a minimal single-step agent that connects the
 >   provider layer to the tool layer: natural-language prompt → provider → structured JSON tool
 >   call → validation + execution through the `ToolRegistry`.
+> - **Implemented (Phase 3C):** the interactive REPL treats ordinary text as an AI prompt —
+>   `RBXForge> create a red cube` reaches Studio via the agent → ToolRegistry → plugin pipeline.
 > - **Not implemented yet:** the multi-step agent loop, conversation history, context management,
 >   provider-native tool calling, and project inspection.
 
@@ -78,9 +80,44 @@ Agent  ──►  AI Provider Layer  ──►  Model (Ollama / NIM / future)
 | `RBXFORGE_BASE_URL` | Endpoint / base URL (e.g. Ollama server)                     | Ollama default URL   |
 | `RBXFORGE_API_KEY`  | API key (auth; never hard-coded in code)                     | *(empty)*            |
 | `RBXFORGE_TIMEOUT`  | Request timeout in seconds                                   | `30`                 |
+| `RBXFORGE_MOCK_RESPONSE` | Mock-only: what the mock provider returns verbatim (e.g. `{"tool": "create_part", ...}`) | `""`    |
+| `RBXFORGE_MOCK_FAIL` | Mock-only: force a provider failure (`timeout`/`connection`/`response`) | *(empty)* |
 
 Generation parameters (temperature, max tokens, ...) are passed through provider-specific
 `chat()` options (e.g. Ollama's `"options"`).
+
+## Interactive REPL (Implemented — Phase 3C)
+
+`RBXForge> <text>` is now a real prompt-to-Studio pipeline:
+
+```
+RBXForge> create a red cube
+   ↓
+Agent.run(prompt)   ← plain REPL text is an AI prompt
+   ↓
+provider.chat(tool definitions + prompt)     (env-configured provider)
+   ↓
+parse + validate structured tool call        (unknown-tool / invalid-args rejected safely)
+   ↓
+ToolRegistry.execute  →  request over the existing WebSocket protocol
+   ↓
+Studio plugin           →   concise "[rbxforge] AI OK: called 'create_part' -> True"
+```
+
+- **Plain text = AI prompt.** Anything that is not a recognized command (`ping`, `create_part`,
+  `status`, `help`, `quit`) is sent to `Agent.run` via `RBXForge.ask()`.
+- **`ask <prompt>`** runs the agent explicitly (same path); a bare `ask` prints a gentle hint.
+- **Results are concise**: one `[rbxforge] AI OK: called <tool> -> <output>` line on success, or
+  one `[rbxforge] AI failed: <code>: <message>` line on any failure
+  (`provider_error` / `malformed_output` / `unknown_tool` / `invalid_arguments` /
+  `execution_failed`).
+- **The REPL never crashes.** Provider errors, malformed output, unknown tools, and invalid
+  arguments are all condensed into a log line; the prompt survives.
+- **Prompt stability**: `ask` logs through the same `REPLConsole` as WebSocket events, so the
+  prompt is re-drawn after any background log (Phase 2A behavior preserved).
+- **Agent lifecycle**: the agent+provider are built lazily on the first prompt from the
+  environment (`agent_from_env`, registry + connection wired to the running RBXForge) and
+  reused afterwards.
 
 ## Agent / Tool Calling (Implemented — Phase 3B, single step)
 

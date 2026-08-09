@@ -2,9 +2,9 @@
 
 > **Status:** Partially implemented. Phase 1 (the minimal local connection between the CLI and
 > the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) is
-> implemented; and the Phase 3A AI provider layer plus the Phase 3B minimal single-step agent
-> (`prompt → provider → tool call → execution`) are implemented. The multi-step agent loop
-> remains planned.
+> implemented; and the Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and
+> the Phase 3C interactive AI REPL (plain text → AI → tool call → Studio) are implemented. The
+> multi-step agent loop remains planned.
 
 ## Overview
 
@@ -49,7 +49,7 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–2A)** — local WebSocket server, interactive REPL, `create_part` tool ([TOOLS.md](./TOOLS.md)) |
+| CLI | **Implemented (Phases 1–3C)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`help`/`quit` + plain text sent to the agent), `create_part` tool ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Implemented (minimal, Phase 3B)** — single-step `prompt → provider → tool call → execution` in `cli/agent.py`; the full loop is planned |
 | AI provider layer | **Implemented (Phase 3A)** — `cli/providers.py`: provider interface, Ollama + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Planned** — not implemented |
@@ -60,8 +60,8 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 | Verification system | **Planned** — future |
 
 Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), the
-Phase 3A AI provider layer, and the Phase 3B minimal single-step agent. The multi-step agent
-loop and verification system are still planned.
+Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and the Phase 3C interactive
+AI REPL. The multi-step agent loop and verification system are still planned.
 
 ## Components
 
@@ -95,8 +95,12 @@ The orchestration brain. It receives a user prompt and drives the full loop:
 **Phase 3B (implemented, minimal):** `cli/agent.py` provides a single-step slice of this —
 `prompt → provider → structured tool call → ToolRegistry execution → result`. It gives the model
 the currently registered tool definitions, parses the model's JSON tool call, and executes it
-through the ToolRegistry only, rejecting unknown tools / invalid arguments safely. Multi-step
-autonomy (planning, verify, fix, loops) is not implemented yet.
+through the ToolRegistry only, rejecting unknown tools / invalid arguments safely.
+
+**Phase 3C (implemented):** the interactive REPL feeds `Agent.run` with any non-command input
+(`RBXForge> create a red cube` → AI → tool call → Studio), plus an explicit `ask` command, and
+logs one concise line per run. Multi-step autonomy (planning, verify, fix, loops) is not
+implemented yet.
 
 See [AGENT.md](./AGENT.md) for the full expected behavior.
 

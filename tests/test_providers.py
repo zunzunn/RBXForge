@@ -331,6 +331,36 @@ def scenario_ollama_response_errors():
     print("OK  ollama error payload and HTTP error -> ProviderResponseError")
 
 
+def scenario_mock_runtime_env():
+    """build_provider must honor RBXFORGE_MOCK_RESPONSE / RBXFORGE_MOCK_FAIL so
+    subprocess/REPL tests can drive the mock deterministically."""
+    mod = load_providers()
+    saved = {key: os.environ.get(key) for key in ("RBXFORGE_MOCK_RESPONSE", "RBXFORGE_MOCK_FAIL")}
+    try:
+        os.environ["RBXFORGE_MOCK_RESPONSE"] = '{"tool": "create_part", "arguments": {}}'
+        os.environ.pop("RBXFORGE_MOCK_FAIL", None)
+        provider = mod.build_provider(mod.ProviderSettings(provider="mock", model="mock-m"))
+        response = provider.chat([mod.message("user", "make a cube")])
+        assert response.text == '{"tool": "create_part", "arguments": {}}', response
+
+        os.environ.pop("RBXFORGE_MOCK_RESPONSE", None)
+        os.environ["RBXFORGE_MOCK_FAIL"] = "timeout"
+        provider = mod.build_provider(mod.ProviderSettings(provider="mock", model="mock-m"))
+        try:
+            provider.chat([mod.message("user", "make a cube")])
+        except mod.ProviderTimeoutError:
+            pass
+        else:
+            raise AssertionError("RBXFORGE_MOCK_FAIL=timeout should make the mock time out")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("OK  build_provider mock honors RBXFORGE_MOCK_RESPONSE / RBXFORGE_MOCK_FAIL")
+
+
 def scenario_cli_smoke():
     """cli/providers.py --provider mock must select the mock provider and exit 0."""
     env = dict(os.environ)
@@ -356,6 +386,7 @@ def main():
     scenario_ollama_timeout()
     scenario_ollama_connection_error()
     scenario_ollama_response_errors()
+    scenario_mock_runtime_env()
     scenario_cli_smoke()
     print("\nAll provider scenarios passed.")
 

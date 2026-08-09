@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RBXForge CLI - Phase 2B: local connection plus a formal tool layer.
+"""RBXForge CLI - Phase 3C: local connection, tool layer, interactive AI REPL.
 
 Runs a local WebSocket server on 127.0.0.1. The RBXForge Studio plugin (see
 plugin/rbxforge.lua) connects to this process. This milestone implements:
@@ -10,6 +10,12 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
 - a tool registry (name, description, input schema) that validates arguments
   before sending a request; create_part is the first registered tool
   (request/response over the same socket)
+- an interactive AI REPL: ordinary text input is sent to the AI agent
+  (cli/agent.py, Phase 3B), which asks the provider for a structured tool call,
+  validates it against the ToolRegistry, and executes it - a real prompt like
+  "create a red cube" reaches Studio via create_part. Existing commands
+  (ping / status / create_part / help / quit) still work, and 'ask' runs the
+  agent explicitly.
 
 Standard library only; no external dependencies.
 
@@ -18,6 +24,10 @@ Usage:
     rbxforge --ping-once [--host HOST] [--port PORT] [--timeout SEC]
     rbxforge --create-part-once [--host HOST] [--port PORT] [--timeout SEC]
                                   [--request-timeout SEC]
+
+AI configuration comes from the environment (see cli/providers.py): set
+RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
+prompt input.
 
 Protocol details: see docs/PROTOCOL.md.
 """
@@ -38,6 +48,18 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7676
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 RECV_TIMEOUT = 5.0
+
+# When this file runs as the CLI script the interpreter registers it only as
+# "__main__". cli/agent.py imports "rbxforge" to reach the tool layer; without
+# the alias below it would load a second copy and get distinct classes (its
+# except-clauses would then never match this module's UnknownToolError /
+# InvalidParamsError). Registering this module under "rbxforge" makes the agent
+# use the same class objects.
+# The manual importlib loader used by tests does not register this module in
+# sys.modules, so only alias when the module is actually registered under its
+# own name (real import / __main__ paths) and "rbxforge" is not taken.
+if sys.modules.get("rbxforge") is None and sys.modules.get(__name__) is not None:
+    sys.modules["rbxforge"] = sys.modules[__name__]
 
 # --------------------------------------------------------------------------- #
 # Minimal RFC 6455 WebSocket framing. Only text frames plus the control frames
@@ -504,6 +526,32 @@ def default_registry():
     return registry
 
 
+def _import_agent():
+    """Lazily import cli/agent.py and return the module (or None).
+
+    cli/ is not a package, so this mirrors agent.py's own sibling bootstrap:
+    it works both when this file is run as a script (cli/ already on sys.path)
+    and when it is loaded in-process by tests (cli/ not on sys.path). The import
+    is lazy so plain CLI use never needs the agent/provider layers.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    try:
+        import agent
+        return agent
+    except ImportError:
+        here = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        try:
+            import agent  # reload after cli/ was added to sys.path
+            return agent
+        except ImportError:
+            return None
+
+
 # --------------------------------------------------------------------------- #
 # RBXForge protocol layer (see docs/PROTOCOL.md)
 # --------------------------------------------------------------------------- #
@@ -525,6 +573,7 @@ class RBXForge:
         self.request_events = {}
         self.request_lock = threading.Lock()
         self._next_id = 0
+        self._agent = None
 
     # -- logging ----------------------------------------------------------- #
 
@@ -738,6 +787,38 @@ class RBXForge:
         """Create the test part in Studio via the registered create_part tool."""
         return self.execute_tool("create_part", CREATE_PART_DEFAULT_PARAMS, timeout)
 
+    def ask(self, prompt):
+        """Run one natural-language prompt through the AI agent (Phase 3B/3C).
+
+        The agent (cli/agent.py) uses the environment-configured provider, sends
+        the registered tool definitions along with the prompt, parses the
+        model's structured tool call, and executes it through this instance's
+        ToolRegistry (this RBXForge acts as the connection handed to the tools).
+
+        Provider errors, malformed output, unknown tools, and invalid arguments
+        are condensed into a short "[rbxforge] AI failed: ..." log line; nothing
+        here raises, so the interactive REPL always survives an AI/agent failure.
+        Returns True when a tool call executed successfully, else False.
+        """
+        agent_mod = _import_agent()
+        if agent_mod is None:
+            self.log("AI agent unavailable: cli/agent.py could not be imported")
+            return False
+        if self._agent is None:
+            try:
+                self._agent = agent_mod.agent_from_env(registry=self.registry, rbx=self)
+            except agent_mod.providers.ProviderError as exc:
+                self.log("AI agent unavailable: {0}".format(exc))
+                return False
+        result = self._agent.run(prompt)
+        if result.ok:
+            self.log("AI OK: called {0!r} -> {1!r}".format(result.tool.name, result.output))
+            return True
+        code = (result.error or {}).get("code", "error")
+        detail = (result.error or {}).get("message", "unknown error")
+        self.log("AI failed: {0}: {1}".format(code, detail))
+        return False
+
     # -- lifecycle --------------------------------------------------------- #
 
     def start(self):
@@ -815,16 +896,26 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("  ping        - send a ping to the connected plugin and wait for pong")
             print("  create_part - run the create_part tool (creates a test Part in Studio)")
             print("  status      - show connection status")
+            print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
+            print("any other input is sent to the AI agent as a prompt")
+        elif command == "ask":
+            parts = line.split(None, 1)
+            prompt = parts[1] if len(parts) > 1 else ""
+            if not prompt:
+                rbx.log("ask: no prompt given (e.g. 'ask create a red cube')")
+            else:
+                rbx.ask(prompt)
         else:
-            print("unknown command: {0} (try 'help')".format(command))
+            rbx.ask(line)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="rbxforge",
-        description="RBXForge local process. Phase 2B: local WebSocket connection "
-                    "with the RBXForge Studio plugin plus a formal tool layer.",
+        description="RBXForge local process. Phase 3C: local WebSocket connection "
+                    "with the RBXForge Studio plugin, a formal tool layer, and an "
+                    "interactive AI REPL (plain text input goes to the AI agent).",
     )
     parser.add_argument(
         "--host", default=DEFAULT_HOST,

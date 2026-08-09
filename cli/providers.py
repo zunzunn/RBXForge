@@ -306,13 +306,18 @@ class MockProvider(Provider):
 DEFAULT_PROVIDER = "ollama"
 DEFAULT_TIMEOUT = 30.0
 
-#: Environment variables consumed by :func:`ProviderSettings.from_env`.
+#: Environment variables consumed by :func:`ProviderSettings.from_env`, plus the
+#: mock-only testing knobs (:data:`RBXFORGE_MOCK_RESPONSE` / :data:`RBXFORGE_MOCK_FAIL`
+#: are read by :func:`build_provider` for the mock provider so end-to-end/REPL tests
+#: can drive a deterministic subprocess without a real model).
 CONFIG_ENV_VARS = (
     "RBXFORGE_PROVIDER",
     "RBXFORGE_MODEL",
     "RBXFORGE_BASE_URL",
     "RBXFORGE_API_KEY",
     "RBXFORGE_TIMEOUT",
+    "RBXFORGE_MOCK_RESPONSE",
+    "RBXFORGE_MOCK_FAIL",
 )
 
 
@@ -411,6 +416,10 @@ def build_provider(settings=None):
             base_url=settings.base_url,
             api_key=settings.api_key,
             timeout=settings.timeout,
+            # RBXFORGE_MOCK_RESPONSE / RBXFORGE_MOCK_FAIL let end-to-end tests
+            # (interactive REPL, subprocess) drive the mock deterministically.
+            response_text=os.environ.get("RBXFORGE_MOCK_RESPONSE", ""),
+            fail=os.environ.get("RBXFORGE_MOCK_FAIL") or None,
         )
     raise ProviderConfigError(
         "unknown provider: {0!r}. Supported providers: ollama, nim (not "

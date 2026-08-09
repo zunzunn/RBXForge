@@ -2,11 +2,11 @@
 
 > **Status:** Partially implemented.
 >
-> - **Current / Implemented (Phase 2B):** the transport and the message types below are
+> - **Current / Implemented:** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. One Studio operation (`create_part`) is implemented as a registered
->   tool, dispatched through registries on both sides, with CLI-side argument validation before
->   any `request` is sent.
+>   `plugin/rbxforge.lua`. Two Studio operations are implemented as registered tools, dispatched
+>   through registries on both sides, with CLI-side argument validation before any `request` is
+>   sent: `create_part` (Phase 2B) and `inspect_hierarchy` (Phase 4A).
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -191,6 +191,58 @@ Implemented tools and their `params`:
 | Tool | Params | Result |
 | --- | --- | --- |
 | `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; `"red"` supported) | `{ name, position, size, color }` |
+| `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
+
+`inspect_hierarchy` example request:
+
+```json
+{
+  "type": "request",
+  "id": "req-2",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "tool": "inspect_hierarchy",
+    "params": { "depth": 2 }
+  }
+}
+```
+
+Its success result is a **bounded** tree of instances (each node is only `{ name, className,
+children }`; property values are deliberately not serialized):
+
+```json
+{
+  "type": "response",
+  "id": "req-2",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "ok": true,
+    "result": {
+      "root": "Workspace",
+      "depth": 2,
+      "count": 2,
+      "truncated": false,
+      "tree": [
+        {
+          "name": "Workspace",
+          "className": "Workspace",
+          "children": [
+            { "name": "Baseplate", "className": "Part", "children": [] }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+When the depth limit stops the descent (or the input depth is invalid on the plugin side), the
+plugin reports it instead of serializing the whole tree: a truncated response carries
+`"truncated": true` with only the nodes up to the limit; an invalid `depth` yields `ok: false`
+with `error.code = "invalid_params"`. The response is always JSON and stays bounded regardless
+of the size of the project.
 
 Tool error codes (in `response.payload.error.code`):
 
@@ -239,7 +291,7 @@ Implemented error codes:
    `PLUGIN DISCONNECTED` and forgets the connection. The server keeps running.
 5. RBXForge terminates cleanly on `quit` (it sends no frames; TCP close is the signal).
 
-## Tool Execution (Implemented — Phase 2B)
+## Tool Execution (Implemented)
 
 Each RBXForge tool call maps to one `request` message (see [TOOLS.md](./TOOLS.md)); the tool
 `params` are defined in "Implemented tools and their `params`" above. Before any `request` is
@@ -247,10 +299,11 @@ sent, the CLI **validates the arguments against the tool's input schema**
 (cli/rbxforge.py `ToolRegistry`). Invalid arguments are rejected locally — no `request` is sent —
 and reported to the caller. On the plugin side, incoming `request`s are dispatched through a
 **tool-handler registry** (`plugin/rbxforge.lua` `toolHandlers` / `registerTool`), not a
-hard-coded branch. Exactly one tool is implemented: `create_part` (creates a Part in `workspace`
-with the given name, position, size, and color). Every `request` gets a `response` — never
-silence; the CLI-side validation failure replaces the request/response round trip with a local
-rejection before anything is sent.
+hard-coded branch. Implemented tools: `create_part` (creates a Part in `workspace` with the given
+name, position, size, and color) and `inspect_hierarchy` (returns a bounded Name/ClassName tree of
+`workspace`, honoring the depth limit and marking truncation). Every `request` gets a `response` —
+never silence; the CLI-side validation failure replaces the request/response round trip with a
+local rejection before anything is sent.
 
 ## Future Streaming / Events (Planned)
 
@@ -263,6 +316,10 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only one Studio operation (`create_part`). Other object operations are planned.
+- Only two Studio operations (`create_part`, `inspect_hierarchy`). Other object operations are
+  planned.
+- No arbitrary Instance property serialization (only Name and ClassName are returned by
+  `inspect_hierarchy`); no search, indexing, spatial reasoning, or caching — inspection is a
+  bounded one-off snapshot.
 - No authentication/encryption (connection is local only).
 - No binary frames (rejected with a log line and ignored).

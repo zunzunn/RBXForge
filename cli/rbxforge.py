@@ -8,7 +8,8 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
 - a hello/welcome handshake
 - a test message: ping -> pong
 - a tool registry (name, description, input schema) that validates arguments
-  before sending a request; create_part is the first registered tool
+  before sending a request; create_part is the first registered tool and
+  inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree
   (request/response over the same socket)
 - an interactive AI REPL: ordinary text input is sent to the AI agent
   (cli/agent.py, Phase 3B), which asks the provider for a structured tool call,
@@ -24,6 +25,8 @@ Usage:
     rbxforge --ping-once [--host HOST] [--port PORT] [--timeout SEC]
     rbxforge --create-part-once [--host HOST] [--port PORT] [--timeout SEC]
                                   [--request-timeout SEC]
+    rbxforge --inspect-hierarchy-once [--host HOST] [--port PORT]
+                  [--depth N] [--timeout SEC] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
@@ -416,6 +419,12 @@ def _validate_value(value, spec, path):
     elif kind == "number":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return path + " must be a number"
+        if spec.get("integer") and value != int(value):
+            return path + " must be an integer"
+        if "minimum" in spec and value < spec["minimum"]:
+            return path + " must be at least {0}".format(spec["minimum"])
+        if "maximum" in spec and value > spec["maximum"]:
+            return path + " must be at most {0}".format(spec["maximum"])
     else:
         return path + " uses an unsupported schema type: {0!r}".format(kind)
     return None
@@ -519,10 +528,66 @@ def create_part_tool():
     )
 
 
+# Hierarchy snapshot schema. `depth` is optional (the CLI applies the default
+# below when omitted); when given it must be a whole number in [1, 50] so the
+# plugin response stays bounded.
+DEFAULT_HIERARCHY_DEPTH = 3
+MAX_HIERARCHY_DEPTH = 50
+
+INSPECT_HIERARCHY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "depth": {"type": "number", "integer": True, "minimum": 1, "maximum": MAX_HIERARCHY_DEPTH},
+    },
+    "required": [],
+}
+
+
+def inspect_hierarchy_tool():
+    """Build the inspect_hierarchy tool (Phase 4A).
+
+    Requests a snapshot of the Workspace instance tree from the plugin and logs
+    a one-line summary (instance count, depth, truncation). The plugin returns a
+    bounded tree of ``{name, className, children}`` nodes; the CLI keeps the
+    default depth small so responses cannot balloon.
+    """
+
+    def run(rbx, params, timeout):
+        request_params = dict(params)
+        request_params.setdefault("depth", DEFAULT_HIERARCHY_DEPTH)
+        response = rbx.send_request("inspect_hierarchy", request_params, timeout)
+        if response is None:
+            rbx.log("inspect_hierarchy failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            result = response.get("result") or {}
+            summary = "inspect_hierarchy OK: {0} instance(s) at depth {1}".format(
+                result.get("count", "?"), result.get("depth", "?")
+            )
+            if result.get("truncated"):
+                summary += " (truncated - children omitted beyond the depth limit)"
+            rbx.log(summary)
+            return True
+        error = response.get("error") or {}
+        rbx.log("inspect_hierarchy FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "inspect_hierarchy",
+        "Return a snapshot of the Workspace instance tree (each instance's Name and "
+        "ClassName) up to a maximum depth.",
+        INSPECT_HIERARCHY_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
     registry.register(create_part_tool())
+    registry.register(inspect_hierarchy_tool())
     return registry
 
 
@@ -787,6 +852,16 @@ class RBXForge:
         """Create the test part in Studio via the registered create_part tool."""
         return self.execute_tool("create_part", CREATE_PART_DEFAULT_PARAMS, timeout)
 
+    def inspect_hierarchy(self, depth=None, timeout=10.0):
+        """Snapshot the Studio Workspace hierarchy via the inspect_hierarchy tool.
+
+        ``depth`` defaults to the plugin/CLI default (3) when omitted.
+        """
+        params = {}
+        if depth is not None:
+            params["depth"] = depth
+        return self.execute_tool("inspect_hierarchy", params, timeout)
+
     def ask(self, prompt):
         """Run one natural-language prompt through the AI agent (Phase 3B/3C).
 
@@ -877,6 +952,15 @@ def repl(rbx, console, prompt="RBXForge> "):
             rbx.send_ping()
         elif command == "create_part":
             rbx.create_part()
+        elif command == "inspect_hierarchy":
+            parts = line.split(None, 1)
+            depth = None
+            if len(parts) > 1:
+                try:
+                    depth = int(parts[1])
+                except ValueError:
+                    rbx.log("inspect_hierarchy: ignoring invalid depth {0!r}".format(parts[1]))
+            rbx.inspect_hierarchy(depth)
         elif command == "status":
             with rbx.connection_lock:
                 client = rbx.connection
@@ -895,6 +979,8 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("commands:")
             print("  ping        - send a ping to the connected plugin and wait for pong")
             print("  create_part - run the create_part tool (creates a test Part in Studio)")
+            print("  inspect_hierarchy [depth]")
+            print("              - snapshot the Workspace tree (default depth: 3)")
             print("  status      - show connection status")
             print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
@@ -934,8 +1020,18 @@ def main(argv=None):
         help="wait for the plugin to connect, create one test part, report, then exit",
     )
     parser.add_argument(
+        "--inspect-hierarchy-once", action="store_true",
+        help="wait for the plugin to connect, snapshot the Workspace hierarchy, "
+             "report, then exit",
+    )
+    parser.add_argument(
+        "--depth", type=int, default=None,
+        help="maximum hierarchy depth for --inspect-hierarchy-once (default: 3; "
+             "must be a whole number in 1..{0})".format(MAX_HIERARCHY_DEPTH),
+    )
+    parser.add_argument(
         "--timeout", type=float, default=30.0,
-        help="seconds to wait for the plugin in --ping-once/--create-part-once mode "
+        help="seconds to wait for the plugin in the --*-once modes "
              "(default: 30)",
     )
     parser.add_argument(
@@ -966,6 +1062,10 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.create_part(args.request_timeout) else 4
+        if args.inspect_hierarchy_once:
+            if not wait_for_plugin(rbx, args.timeout):
+                return 2
+            return 0 if rbx.inspect_hierarchy(args.depth, args.request_timeout) else 4
         repl(rbx, console)
     finally:
         rbx.stop()

@@ -52,6 +52,26 @@ def load_cli_module():
     return _CLI_MODULE
 
 
+class FakeRBX:
+    """Stand-in for the RBXForge connection given to tools in-process.
+
+    ``response_payload`` is what ``send_request`` returns (the plugin's reply).
+    Every request is recorded so tests can prove what was actually sent.
+    """
+
+    def __init__(self, response_payload=None):
+        self.response_payload = response_payload
+        self.requests = []
+        self.logs = []
+
+    def send_request(self, tool, params, timeout):
+        self.requests.append((tool, params))
+        return self.response_payload
+
+    def log(self, message):
+        self.logs.append(message)
+
+
 # --------------------------------------------------------------------------- #
 # Minimal WebSocket client (the tests act as the Studio plugin)
 # --------------------------------------------------------------------------- #
@@ -129,6 +149,171 @@ def recv_json(sock, timeout=10.0):
     if opcode != 0x1:
         raise AssertionError("expected text frame, got opcode {}".format(opcode))
     return json.loads(payload.decode("utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4A: inspect_hierarchy scenarios
+# --------------------------------------------------------------------------- #
+
+
+def hierarchy_response(count=2, depth=2, truncated=False):
+    return {
+        "ok": True,
+        "result": {
+            "root": "Workspace",
+            "depth": depth,
+            "count": count,
+            "truncated": truncated,
+            "tree": [
+                {
+                    "name": "Workspace",
+                    "className": "Workspace",
+                    "children": [
+                        {"name": "Baseplate", "className": "Part", "children": []},
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def scenario_inspect_hierarchy_mock_response():
+    """inspect_hierarchy must be executable through the ToolRegistry and accept
+    a mock (in-process) hierarchy response, reporting it in a log summary."""
+    mod = load_cli_module()
+    rbx = FakeRBX(hierarchy_response(count=2, depth=2))
+    registry = mod.default_registry()
+    result = registry.execute(rbx, "inspect_hierarchy", {"depth": 2}, timeout=5.0)
+    assert result is True, result
+    assert rbx.requests == [("inspect_hierarchy", {"depth": 2})], rbx.requests
+    assert any("inspect_hierarchy OK: 2 instance(s) at depth 2" in line for line in rbx.logs), \
+        rbx.logs
+    print("OK  inspect_hierarchy executes through the ToolRegistry with a mock response")
+
+
+def scenario_inspect_hierarchy_depth_semantics():
+    """Depth is optional (default 3) and passed through exactly."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+
+    rbx = FakeRBX(hierarchy_response(count=3, depth=3))
+    assert registry.execute(rbx, "inspect_hierarchy", {}, timeout=5.0) is True
+    assert rbx.requests == [("inspect_hierarchy", {"depth": 3})], rbx.requests
+
+    rbx = FakeRBX(hierarchy_response(count=5, depth=1))
+    assert registry.execute(rbx, "inspect_hierarchy", {"depth": 1}, timeout=5.0) is True
+    assert rbx.requests == [("inspect_hierarchy", {"depth": 1})], rbx.requests
+
+    # A truncated response is called out in the summary.
+    rbx = FakeRBX(hierarchy_response(count=5, depth=1, truncated=True))
+    assert registry.execute(rbx, "inspect_hierarchy", {"depth": 1}, timeout=5.0) is True
+    assert any("(truncated" in line for line in rbx.logs), rbx.logs
+    print("OK  depth defaults to 3, is passed through, and truncation is reported")
+
+
+def scenario_inspect_hierarchy_empty_hierarchy():
+    """A leaf-only Workspace (no children) is a valid, empty hierarchy."""
+    mod = load_cli_module()
+    rbx = FakeRBX(hierarchy_response(count=1, depth=3))
+    registry = mod.default_registry()
+    result = registry.execute(rbx, "inspect_hierarchy", {}, timeout=5.0)
+    assert result is True, result
+    assert rbx.requests == [("inspect_hierarchy", {"depth": 3})], rbx.requests
+    assert any("inspect_hierarchy OK: 1 instance(s) at depth 3" in line for line in rbx.logs), \
+        rbx.logs
+    print("OK  empty (leaf-only) hierarchy handled as a success")
+
+
+def scenario_inspect_hierarchy_invalid_depth():
+    """Depth must be a whole number in [1, MAX] or the call is rejected with no
+    request sent (validation is not weakened)."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("inspect_hierarchy")
+    assert tool is not None
+
+    good = [None, 1, 2, mod.DEFAULT_HIERARCHY_DEPTH, mod.MAX_HIERARCHY_DEPTH]
+    for depth in good:
+        params = {} if depth is None else {"depth": depth}
+        tool.validate(params)  # must not raise
+
+    bad = [
+        (0, "depth must be at least 1"),
+        (-3, "depth must be at least 1"),
+        (mod.MAX_HIERARCHY_DEPTH + 1, "depth must be at most"),
+        (2.5, "depth must be an integer"),
+        ("3", "depth must be a number"),
+    ]
+    for depth, fragment in bad:
+        try:
+            tool.validate({"depth": depth})
+        except mod.InvalidParamsError as exc:
+            assert fragment in str(exc), (depth, exc)
+        else:
+            raise AssertionError("inspect_hierarchy accepted invalid depth: {0!r}".format(depth))
+
+    # execute rejects invalid depth up front: a validation error is raised and
+    # nothing is sent (the same contract as the other tools).
+    rbx = FakeRBX(hierarchy_response())
+    registry = mod.default_registry()
+    for depth in (0, -3, 2.5):
+        try:
+            registry.execute(rbx, "inspect_hierarchy", {"depth": depth}, timeout=5.0)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("execute accepted invalid depth: {0!r}".format(depth))
+    assert rbx.requests == [], rbx.requests
+    print("OK  invalid hierarchy depth rejected before sending (0/-1/>max/float/string)")
+
+
+def scenario_inspect_hierarchy_roundtrip():
+    """--inspect-hierarchy-once must wait for the plugin, send an inspect_hierarchy
+    request with the given depth, accept a bounded tree response, and exit 0."""
+    proc = Proc("--inspect-hierarchy-once", "--depth", "2", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "inspect_hierarchy", req
+        assert req["payload"]["params"] == {"depth": 2}, req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": True,
+                "result": {
+                    "root": "Workspace",
+                    "depth": 2,
+                    "count": 2,
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "name": "Workspace",
+                            "className": "Workspace",
+                            "children": [
+                                {"name": "Baseplate", "className": "Part", "children": []},
+                            ],
+                        }
+                    ],
+                },
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("inspect_hierarchy OK: 2 instance(s) at depth 2"), \
+            proc._output()
+        print("OK  inspect_hierarchy round-trip through the protocol; clean exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
 
 
 # --------------------------------------------------------------------------- #
@@ -421,11 +606,13 @@ def scenario_interactive_create_part_registered():
 
 
 def scenario_tool_registry_metadata():
-    """The tool registry must expose create_part with name/description/schema."""
+    """The tool registry must expose create_part and inspect_hierarchy with
+    name/description/schema."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
-    assert [t.name for t in tools] == ["create_part"], tools
+    assert [t.name for t in tools] == ["create_part", "inspect_hierarchy"], tools
+
     tool = registry.get("create_part")
     assert tool is not None
     assert isinstance(tool.description, str) and tool.description
@@ -433,7 +620,17 @@ def scenario_tool_registry_metadata():
     assert tool.input_schema["type"] == "object"
     assert "name" in tool.input_schema["properties"]
     assert set(tool.input_schema["required"]) == {"name", "position", "size", "color"}
-    print("OK  registry registers create_part with name, description, and input schema")
+
+    hierarchy = registry.get("inspect_hierarchy")
+    assert hierarchy is not None
+    assert isinstance(hierarchy.description, str) and hierarchy.description
+    assert hierarchy.input_schema["type"] == "object"
+    depth_prop = hierarchy.input_schema["properties"]["depth"]
+    assert depth_prop["type"] == "number"
+    assert depth_prop["integer"] is True
+    assert depth_prop["minimum"] == 1
+    assert depth_prop["maximum"] == mod.MAX_HIERARCHY_DEPTH
+    print("OK  registry registers create_part and inspect_hierarchy with metadata")
 
 
 def scenario_tool_validation():
@@ -702,11 +899,16 @@ def main():
     scenario_tool_registry_metadata()
     scenario_tool_validation()
     scenario_tool_invalid_rejected_before_send()
+    scenario_inspect_hierarchy_mock_response()
+    scenario_inspect_hierarchy_depth_semantics()
+    scenario_inspect_hierarchy_empty_hierarchy()
+    scenario_inspect_hierarchy_invalid_depth()
     scenario_connect_hello_ping_pong()
     scenario_disconnect_and_reconnect()
     scenario_errors()
     scenario_create_part_success()
     scenario_create_part_failure()
+    scenario_inspect_hierarchy_roundtrip()
     scenario_interactive_create_part_registered()
     scenario_repl_run_after_connection()
     scenario_repl_after_plugin_connect_pty()

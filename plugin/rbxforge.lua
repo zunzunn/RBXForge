@@ -1,9 +1,9 @@
 --!nonstrict
--- RBXForge Studio Plugin - Phase 2A
+-- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and one Studio operation: create_part (request/response).
+-- and two Studio operations: create_part and inspect_hierarchy (request/response).
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -181,6 +181,94 @@ local function handleCreatePart(id, params)
 	})
 end
 
+-- Builds a bounded snapshot of the Workspace instance tree (Phase 4A).
+--
+-- Returns (node, count, truncated) where:
+--   node      - { name, className, children = { node, ... } } ; children is {}
+--               either for a real leaf or (signalled by `truncated`) when the
+--               depth limit stopped the descent.
+--   count     - total number of instance nodes serialized
+--   truncated - true if any instance had children that were omitted because the
+--               depth limit was reached
+--
+-- A `maxDepth` of 1 serializes just `instance` itself (its children, if any,
+-- are the truncation).
+local function buildTree(instance, maxDepth)
+	local out = { name = instance.Name, className = instance.ClassName }
+	local children = instance:GetChildren()
+	local count = 1
+	local truncated = false
+	if maxDepth <= 1 then
+		out.children = {}
+		if #children > 0 then
+			truncated = true
+		end
+	else
+		local nodes = {}
+		for _, child in ipairs(children) do
+			local childNode, childCount, childTrunc = buildTree(child, maxDepth - 1)
+			table.insert(nodes, childNode)
+			count = count + childCount
+			if childTrunc then
+				truncated = true
+			end
+		end
+		out.children = nodes
+	end
+	return out, count, truncated
+end
+
+local function handleInspectHierarchy(id, params)
+	params = params or {}
+	local depth = params.depth
+	local maxDepth
+	if depth == nil then
+		maxDepth = 3
+	elseif type(depth) ~= "number" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.depth must be a number",
+		})
+	else
+		maxDepth = math.floor(depth)
+	end
+	if maxDepth < 1 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.depth must be at least 1",
+		})
+	end
+	if maxDepth > 50 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.depth must be at most 50",
+		})
+	end
+
+	local ok, tree, count, truncated = pcall(buildTree, workspace, maxDepth)
+	if not ok then
+		log("hierarchy snapshot error: " .. tostring(tree))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = tostring(tree),
+		})
+	end
+
+	log(string.format(
+		"inspected workspace hierarchy (depth=%d): %d instances%s",
+		maxDepth,
+		count,
+		truncated and " (truncated)" or ""
+	))
+	return sendResponse(id, true, {
+		root = "Workspace",
+		depth = maxDepth,
+		count = count,
+		truncated = truncated,
+		tree = { tree },
+	})
+end
+
 -- Tool handler registry: incoming request messages are dispatched through this
 -- table rather than hard-coded branches. Each handler is registered by name with
 -- registerTool(); handleRequest looks the tool up here.
@@ -196,6 +284,7 @@ end
 
 -- Registered tool handlers (dispatch happens in handleRequest).
 registerTool("create_part", handleCreatePart)
+registerTool("inspect_hierarchy", handleInspectHierarchy)
 
 local function handleRequest(id, payload)
 	local tool = payload.tool

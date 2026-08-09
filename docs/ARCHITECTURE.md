@@ -2,9 +2,10 @@
 
 > **Status:** Partially implemented. Phase 1 (the minimal local connection between the CLI and
 > the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) is
-> implemented; and the Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and
-> the Phase 3C interactive AI REPL (plain text → AI → tool call → Studio) are implemented. The
-> multi-step agent loop remains planned.
+> implemented; the Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and
+> the Phase 3C interactive AI REPL (plain text → AI → tool call → Studio) are implemented; and
+> the Phase 4A basic project inspection (`inspect_hierarchy`) is implemented. The multi-step
+> agent loop remains planned.
 
 ## Overview
 
@@ -49,19 +50,20 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–3C)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`help`/`quit` + plain text sent to the agent), `create_part` tool ([TOOLS.md](./TOOLS.md)) |
+| CLI | **Implemented (Phases 1–4A)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` tools ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Implemented (minimal, Phase 3B)** — single-step `prompt → provider → tool call → execution` in `cli/agent.py`; the full loop is planned |
 | AI provider layer | **Implemented (Phase 3A)** — `cli/providers.py`: provider interface, Ollama + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Planned** — not implemented |
-| Tool system | **Partially implemented (Phase 2B)** — `create_part` live end-to-end (CLI + plugin); more tools planned |
-| Project inspection / index | **Planned** — long-term |
+| Tool system | **Partially implemented (Phase 2B + Phase 4A)** — `create_part` (Phase 2B) and `inspect_hierarchy` (Phase 4A) live end-to-end (CLI + plugin); more tools planned |
+| Project inspection / index | **Started (Phase 4A)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); search/indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
-| Studio plugin | **Implemented (Phases 1–2B)** — connects to RBXForge, answers ping/pong, executes `create_part`, see [PLUGIN.md](./PLUGIN.md) |
+| Studio plugin | **Implemented (Phases 1–2B + Phase 4A)** — connects to RBXForge, answers ping/pong, executes `create_part` and `inspect_hierarchy`, see [PLUGIN.md](./PLUGIN.md) |
 | Verification system | **Planned** — future |
 
 Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), the
-Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and the Phase 3C interactive
-AI REPL. The multi-step agent loop and verification system are still planned.
+Phase 3A AI provider layer, the Phase 3B minimal single-step agent, the Phase 3C interactive
+AI REPL, and the Phase 4A basic project inspection (inspect_hierarchy). The multi-step agent
+loop and verification system are still planned.
 
 ## Components
 
@@ -167,13 +169,21 @@ Conceptual tool examples (planned):
 - `run_luau`
 - `verify`
 
-See [TOOLS.md](./TOOLS.md). `create_part` is implemented end-to-end (Phase 2B); the rest are
-conceptual at this stage.
+See [TOOLS.md](./TOOLS.md). `create_part` is implemented end-to-end (Phase 2B) and
+`inspect_hierarchy` (Phase 4A) snapshots the current `workspace` instance tree as a bounded
+Name/ClassName structure — the first read-only "inspection" tool and the concrete start of the
+Project Inspection component. The remaining conceptual tools are not implemented.
 
 ### Project Inspection / Index
 
 RBXForge should understand the existing Roblox project rather than blindly creating duplicate
 systems. Long-term, this uses intelligent project inspection and indexing.
+
+- **Phase 4A (implemented):** `inspect_hierarchy` returns a bounded tree of the current
+  `workspace` — every node is `{ name, className, children }`, the depth is configurable
+  (default 3, max 50), and truncation is flagged rather than serializing everything. This gives
+  the agent a small, structured view of what exists before it acts. There is deliberately **no**
+  search, indexing, spatial reasoning, caching, or arbitrary property serialization yet.
 
 Example:
 
@@ -189,7 +199,8 @@ RBXForge should be able to:
 4. Check existing shop / currency / inventory systems.
 5. Plan around the existing architecture.
 
-It should load only relevant project context into the AI whenever possible.
+It should load only relevant project context into the AI whenever possible. The full index and
+search (future `search_instances` / `get_instance` tools) build on the Phase 4A snapshot.
 
 ### Local Communication Layer
 
@@ -211,6 +222,8 @@ performs the corresponding Studio operations, and returns results.
   WebSocket, announces itself with `hello`, and answers `ping` with `pong`.
 - **Phase 2 (implemented):** Studio operations for `create_part` (creates a part and returns ok
   or an error).
+- **Phase 4A (implemented):** Studio operation for `inspect_hierarchy` (walks `workspace`,
+  returning a bounded Name/ClassName tree honoring a depth limit and flagging truncation).
 
 See [PLUGIN.md](./PLUGIN.md).
 

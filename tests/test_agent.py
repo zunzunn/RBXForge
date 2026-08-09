@@ -126,13 +126,16 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["create_part"], names
+    assert names == ["create_part", "inspect_hierarchy"], names
     create_part = defs[0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"
     assert set(create_part["parameters"]["required"]) == {
         "name", "position", "size", "color",
     }, create_part
+    hierarchy = defs[1]
+    assert hierarchy["parameters"]["properties"]["depth"]["type"] == "number"
+    assert hierarchy["parameters"]["properties"]["depth"]["minimum"] == 1, hierarchy
 
     result = agent.run("create a red cube")
     assert result.ok is False  # provider produced no output, but messages were sent

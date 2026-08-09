@@ -1,6 +1,7 @@
 # RBXForge — Tool System
 
-> **Status:** One tool implemented (Phase 2B); the rest is conceptual.
+> **Status:** Two tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A);
+> the rest is conceptual.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -8,6 +9,9 @@
 >   request is sent**. The Studio plugin (`plugin/rbxforge.lua`) dispatches incoming `request`
 >   messages through its own tool-handler registry. See [PROTOCOL.md](./PROTOCOL.md) for the wire
 >   format.
+> - **Implemented (Phase 4A):** `inspect_hierarchy` snapshots the Workspace instance tree
+>   (Name + ClassName per node), bounded by a configurable depth. It uses the same registry,
+>   validation, and request/response flow as `create_part`.
 > - **Planned:** everything else below is conceptual only. **No other tools are implemented.**
 >   Final APIs are deliberately **not invented yet.**
 
@@ -24,7 +28,7 @@ AI Model
 Agent  ── calls ──►  RBXForge Tool System  ──►  Studio Plugin  ──►  Roblox Studio
 ```
 
-## Implemented Tool (Phase 2B)
+## Implemented Tools
 
 ### create_part
 
@@ -42,6 +46,30 @@ Agent  ── calls ──►  RBXForge Tool System  ──►  Studio Plugin  �
 The CLI exposes one command, `create_part`, which runs this tool with its fixed test defaults.
 The tool layer is generic: any argument set that passes the input schema can be executed via the
 registry (`ToolRegistry.execute`).
+
+### inspect_hierarchy (Phase 4A)
+
+- **Purpose:** Snapshot the current `workspace` instance tree so the agent can see what exists
+  before acting. This is the first **inspection** (read-only) tool; everything before it modified
+  the project.
+- **Inputs (schema, validated by the CLI before sending):**
+  - `depth` — optional whole number (`1..50`, default `3`). Bound on how many levels of
+    children are serialized.
+- **Expected output:** `ok: true` with a `result` containing:
+  - `root` — `"Workspace"`
+  - `depth` — the depth actually used (default filled in when omitted)
+  - `count` — total number of instance nodes serialized (bounded)
+  - `truncated` — `true` if any node had children that were omitted by the depth limit
+  - `tree` — array with one node: `{ name, className, children: [ ... ] }`
+  Each node carries only **Name and ClassName** (deliberately minimal; property serialization is
+  out of scope). Leaf nodes have `children: []`; when the limit is hit, the omitted children are
+  not serialized and `truncated` is set instead.
+- **Why the agent might use it:** orienting before creating/moving objects; checking whether an
+  expected instance exists (the future `search_instances` / `get_instance` tools build on this).
+
+The CLI exposes `inspect_hierarchy [depth]` as a REPL command and
+`--inspect-hierarchy-once [--depth N]` as a one-shot flag. Depth is validated to be a whole
+number in `1..50`; anything else is rejected before a request is sent.
 
 ## Conceptual Tool List
 
@@ -81,10 +109,10 @@ Each tool is described conceptually by:
 - **Expected output:** What the agent can expect back (success/failure, plus data).
 - **Why the agent might use it:** Typical situations where the tool is the right choice.
 
-> **Implemented tool anatomy (Phase 2B):** every registered tool carries machine-readable
+> **Implemented tool anatomy (Phase 2B/4A):** every registered tool carries machine-readable
 > metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
-> against that schema before sending a `request`. `create_part` is the first such tool; the
-> conceptual entries below are still being designed.
+> against that schema before sending a `request`. `create_part` (Phase 2B) and `inspect_hierarchy`
+> (Phase 4A) are the implemented tools; the conceptual entries below are still being designed.
 
 ---
 
@@ -196,10 +224,12 @@ Each tool is described conceptually by:
 ## Design Notes
 
 - The list above is **conceptual**. Exact names, arguments, and schemas are open questions.
-- **Implemented registry (Phase 2B):** the CLI keeps a `ToolRegistry` keyed by tool name; each
-  `Tool` carries `name`, `description`, and `input_schema` and knows how to turn validated
+- **Implemented registry (Phase 2B/4A):** the CLI keeps a `ToolRegistry` keyed by tool name;
+  each `Tool` carries `name`, `description`, and `input_schema` and knows how to turn validated
   arguments into a protocol request/response exchange. Adding a tool later means registering one
-  more `Tool` — no protocol changes required.
+  more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A) demonstrates this:
+  it shipped with no protocol changes, only a new client-side `Tool` and a matching plugin-side
+  handler.
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

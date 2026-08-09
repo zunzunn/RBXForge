@@ -120,9 +120,15 @@ AI agent.
 
 **Goal:** Inspect and understand the existing project.
 
-**Deliverables:**
+**Phase 4A (done):** basic project inspection — the `inspect_hierarchy` tool snapshots the
+current `workspace` as a bounded Name/ClassName tree (configurable depth, default 3, max 50,
+with truncation flagged). Implemented end-to-end (CLI registry + validation, plugin handler,
+protocol, docs, tests). Deliberately minimal: **no** search, indexing, spatial reasoning,
+caching, or arbitrary property serialization.
 
-- Project inspection tooling (e.g. inspect the tree, search instances).
+**Remaining deliverables:**
+
+- Project inspection tooling (e.g. search instances).
 - Indexing that loads only relevant context into the AI.
 - Behavior that avoids duplicate systems where possible.
 
@@ -219,7 +225,7 @@ estimates are avoided until the system is real and measurable.
 | Phase 1 — Studio Connection | **In progress** |
 | Phase 2 — Basic Studio Tools | **In progress** |
 | Phase 3 — First Agent Loop | **In progress** (3A provider layer + 3B single-step agent + 3C AI REPL done) |
-| Phase 4 — Project Awareness | Not started |
+| Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`) |
 | Phase 5 — Building Systems | Not started |
 | Phase 6 — Gameplay Logic | Not started |
 | Phase 7 — Autonomous Game Development | Not started |

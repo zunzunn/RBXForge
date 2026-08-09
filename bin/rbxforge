@@ -1,0 +1,5 @@
+#!/bin/sh
+# RBXForge launcher. Runs the CLI with the Python standard library only.
+# Requires Python 3.8+.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$DIR/../cli/rbxforge.py" "$@"

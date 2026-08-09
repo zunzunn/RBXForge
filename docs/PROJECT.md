@@ -1,6 +1,7 @@
 # RBXForge — Project
 
-> **Status:** Documentation only. No implementation exists yet.
+> **Status:** Implementation in progress (Phases 1–2 done; Phase 3 provider layer done;
+> agent loop pending).
 >
 > **Scope:** This document is the high-level source of truth for RBXForge. It is intentionally
 > architectural and product-focused. Implementation details live in the other `/docs` files.
@@ -128,15 +129,16 @@ work in Roblox Studio**.
 
 | Stage | Status |
 | --- | --- |
-| Project definition and documentation | **In progress (this step)** |
-| CLI | Planned — not implemented |
-| AI agent | Planned — not implemented |
-| Studio plugin | Planned — not implemented |
-| Communication protocol | Draft — not implemented |
-| Tool system | Planned — not implemented |
+| Project definition and documentation | **Done** (Phases 0–2A) |
+| CLI | **Implemented (minimal)** — local WebSocket server, interactive REPL, `create_part` tool |
+| Studio plugin | **Implemented (minimal)** — connects to RBXForge, echoes/ping-pong, executes `create_part` |
+| Communication protocol | **Implemented** — connection, ping/pong, tool requests/responses |
+| Tool system | **Partially implemented** — `create_part` live end-to-end; more tools planned |
+| AI provider layer | **Implemented (Phase 3A)** — Ollama + mock backends, env config |
+| AI agent | **Planned** — not implemented |
 
-At this stage, **no implementation code exists**. Everything described in this documentation is
-either *current* (the project definition itself), *planned*, or *future*.
+Implementation exists for the connection, tool layer, and provider layer. The **agent loop** that
+ties them together is the next phase and is **not** implemented yet.
 
 ## What RBXForge Is NOT
 

@@ -1,8 +1,8 @@
 # RBXForge — Studio Plugin
 
-> **Status:** Phase 1 (minimal) implemented in `plugin/rbxforge.lua`. It connects to the local
-> RBXForge process over WebSocket, announces itself, and answers `ping`/`pong`. Studio object
-> operations are **not** implemented yet.
+> **Status:** Phases 1–2 implemented in `plugin/rbxforge.lua`. It connects to the local RBXForge
+> process over WebSocket, announces itself, answers `ping`/`pong`, and executes the `create_part`
+> tool (with tool-handler dispatch). Additional Studio operations are **not** implemented yet.
 
 ## Purpose
 

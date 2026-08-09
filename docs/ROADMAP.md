@@ -91,6 +91,11 @@ AI agent.
 
 ## Phase 3 — First Agent Loop
 
+> **Status:** In progress. Phase 3A (the provider layer) is **Done**: a provider-agnostic
+> inference interface (`cli/providers.py`) with an implemented Ollama backend, a mock backend,
+> environment-based configuration, typed error handling, and automated tests
+> (see [AI.md](./AI.md)). The agent loop itself is **not** implemented yet.
+
 **Goal:** Prompt → tool selection → execution → verification.
 
 **Deliverables:**
@@ -210,8 +215,8 @@ estimates are avoided until the system is real and measurable.
 | --- | --- |
 | Phase 0 — Project Definition | **Done** |
 | Phase 1 — Studio Connection | **In progress** |
-| Phase 2 — Basic Studio Tools | Not started |
-| Phase 3 — First Agent Loop | Not started |
+| Phase 2 — Basic Studio Tools | **In progress** |
+| Phase 3 — First Agent Loop | **In progress** (3A provider layer done) |
 | Phase 4 — Project Awareness | Not started |
 | Phase 5 — Building Systems | Not started |
 | Phase 6 — Gameplay Logic | Not started |

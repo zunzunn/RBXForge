@@ -1,7 +1,8 @@
 # RBXForge — Architecture
 
 > **Status:** Partially implemented. Phase 1 (the minimal local connection between the CLI and
-> the Studio plugin) is implemented; everything else remains planned.
+> the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) and the
+> Phase 3A AI provider layer are implemented. The agent loop remains planned.
 
 ## Overview
 
@@ -46,18 +47,19 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phase 1, minimal)** — starts the local WebSocket server and a command prompt (`ping`, `status`, `quit`) |
+| CLI | **Implemented (Phases 1–2A)** — local WebSocket server, interactive REPL, `create_part` tool ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Planned** — not implemented |
-| AI provider layer | **Planned** — not implemented |
+| AI provider layer | **Implemented (Phase 3A)** — `cli/providers.py`: provider interface, Ollama + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Planned** — not implemented |
-| Tool system | **Planned** — conceptual only |
+| Tool system | **Partially implemented (Phase 2B)** — `create_part` live end-to-end (CLI + plugin); more tools planned |
 | Project inspection / index | **Planned** — long-term |
-| Local communication layer | **Implemented (Phase 1, minimal)** — local WebSocket transport + ping/pong, see [PROTOCOL.md](./PROTOCOL.md) |
-| Studio plugin | **Implemented (Phase 1, minimal)** — connects to RBXForge and answers ping/pong, see [PLUGIN.md](./PLUGIN.md) |
+| Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
+| Studio plugin | **Implemented (Phases 1–2B)** — connects to RBXForge, answers ping/pong, executes `create_part`, see [PLUGIN.md](./PLUGIN.md) |
 | Verification system | **Planned** — future |
 
-At this point, **only the Phase 1 local connection exists.** The AI agent, tool system, and
-everything else are still planned.
+Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), and the
+Phase 3A AI provider layer. The interactive agent, agent loop, and verification system are still
+planned.
 
 ## Components
 
@@ -153,7 +155,8 @@ Conceptual tool examples (planned):
 - `run_luau`
 - `verify`
 
-See [TOOLS.md](./TOOLS.md). Tools are conceptual at this stage; no final APIs exist.
+See [TOOLS.md](./TOOLS.md). `create_part` is implemented end-to-end (Phase 2B); the rest are
+conceptual at this stage.
 
 ### Project Inspection / Index
 
@@ -194,7 +197,8 @@ performs the corresponding Studio operations, and returns results.
 
 - **Phase 1 (implemented):** a minimal plugin that connects to the local RBXForge process over
   WebSocket, announces itself with `hello`, and answers `ping` with `pong`.
-- **Phase 2+ (planned):** Studio operations (create/modify instances, etc.).
+- **Phase 2 (implemented):** Studio operations for `create_part` (creates a part and returns ok
+  or an error).
 
 See [PLUGIN.md](./PLUGIN.md).
 

@@ -1,7 +1,7 @@
 # RBXForge — Tool System
 
-> **Status:** Two tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A);
-> the rest is conceptual.
+> **Status:** Three tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> find_instances in Phase 4B); the rest is conceptual.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -12,6 +12,9 @@
 > - **Implemented (Phase 4A):** `inspect_hierarchy` snapshots the Workspace instance tree
 >   (Name + ClassName per node), bounded by a configurable depth. It uses the same registry,
 >   validation, and request/response flow as `create_part`.
+> - **Implemented (Phase 4B):** `find_instances` searches the live Workspace hierarchy by
+>   instance name (case-insensitive substring match) and returns each match's Name, ClassName,
+>   and full Instance path, bounded by `max_results`. Same registry/validation/protocol flow.
 > - **Planned:** everything else below is conceptual only. **No other tools are implemented.**
 >   Final APIs are deliberately **not invented yet.**
 
@@ -71,6 +74,35 @@ The CLI exposes `inspect_hierarchy [depth]` as a REPL command and
 `--inspect-hierarchy-once [--depth N]` as a one-shot flag. Depth is validated to be a whole
 number in `1..50`; anything else is rejected before a request is sent.
 
+### find_instances (Phase 4B)
+
+- **Purpose:** Search the live Workspace hierarchy by instance name and return the matching
+  instances with their full Instance paths. This is the first real **search** tool (the
+  Phase 4A snapshot plus this query together form the practical start of Project Awareness);
+  it reads the hierarchy on every request — no caching or indexing yet.
+- **Inputs (schema, validated by the CLI before sending):**
+  - `query` — required string, at least one character. Matched against instance **Name**
+    case-insensitively (substring match: "baseplate", "BasePlate", and "plate" all find
+    `Baseplate`).
+  - `max_results` — optional whole number (`1..100`, default `20`). Bounds how many matches
+    are returned so the response stays bounded on large projects.
+- **Expected output:** `ok: true` with a `result` containing:
+  - `query` — the query as sent
+  - `max_results` — the result cap actually used (default filled in when omitted)
+  - `total` — total number of matches found in the live hierarchy
+  - `count` — number of matches returned (`min(total, max_results)`)
+  - `truncated` — `true` when more matches exist than were returned (`total > count`)
+  - `matches` — array of `{ name, className, path }`. `path` is the full Instance path from
+    Workspace down, e.g. `"Workspace/Shop/Door"`. Deliberately minimal (Name, ClassName, path
+    only — no arbitrary property inspection).
+- **Why the agent might use it:** locating "Town", an existing shop, or a folder to extend
+  before acting; answering "what exists in the project" (Phase 4 goal).
+
+The CLI exposes `find_instances <query> [max_results]` as a REPL command (a trailing integer
+token is parsed as `max_results`) and `--find-instances-once --query <text> [--max-results N]`
+as a one-shot flag. The query must be a non-empty string and `max_results` a whole number in
+`1..100`; anything else is rejected before a request is sent.
+
 ## Conceptual Tool List
 
 This is a starting list, not a final API. Tools will be added, removed, and refined during
@@ -109,10 +141,11 @@ Each tool is described conceptually by:
 - **Expected output:** What the agent can expect back (success/failure, plus data).
 - **Why the agent might use it:** Typical situations where the tool is the right choice.
 
-> **Implemented tool anatomy (Phase 2B/4A):** every registered tool carries machine-readable
+> **Implemented tool anatomy (Phase 2B/4A/4B):** every registered tool carries machine-readable
 > metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
-> against that schema before sending a `request`. `create_part` (Phase 2B) and `inspect_hierarchy`
-> (Phase 4A) are the implemented tools; the conceptual entries below are still being designed.
+> against that schema before sending a `request`. `create_part` (Phase 2B), `inspect_hierarchy`
+> (Phase 4A), and `find_instances` (Phase 4B) are the implemented tools; the conceptual entries
+> below are still being designed.
 
 ---
 
@@ -126,6 +159,10 @@ Each tool is described conceptually by:
   to place a new object.
 
 ### search_instances
+
+> **Note:** the name-search subset of this idea is now **implemented as `find_instances`
+> (Phase 4B)**. This entry remains conceptual for the full version (search by class type /
+> property value, parent scope).
 
 - **Purpose:** Find specific instances by name, class type, or property value.
 - **Inputs (conceptual):** Search query (name/type/property), optional parent scope.
@@ -224,12 +261,12 @@ Each tool is described conceptually by:
 ## Design Notes
 
 - The list above is **conceptual**. Exact names, arguments, and schemas are open questions.
-- **Implemented registry (Phase 2B/4A):** the CLI keeps a `ToolRegistry` keyed by tool name;
+- **Implemented registry (Phase 2B/4A/4B):** the CLI keeps a `ToolRegistry` keyed by tool name;
   each `Tool` carries `name`, `description`, and `input_schema` and knows how to turn validated
   arguments into a protocol request/response exchange. Adding a tool later means registering one
-  more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A) demonstrates this:
-  it shipped with no protocol changes, only a new client-side `Tool` and a matching plugin-side
-  handler.
+  more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A) and `find_instances`
+  (Phase 4B) demonstrate this: each shipped with no protocol changes, only a new client-side
+  `Tool` and a matching plugin-side handler.
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

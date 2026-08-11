@@ -1,9 +1,11 @@
 --!nonstrict
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
+-- + Phase 4B (find_instances)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and two Studio operations: create_part and inspect_hierarchy (request/response).
+-- and three Studio operations: create_part, inspect_hierarchy, and
+-- find_instances (request/response).
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -269,6 +271,114 @@ local function handleInspectHierarchy(id, params)
 	})
 end
 
+-- Builds the full Instance path for `instance`, from Workspace down to the
+-- instance itself (e.g. "Workspace/Shop/Door"). Path segments are Names joined
+-- with "/".
+local function buildPath(instance)
+	local parts = {}
+	local current = instance
+	while current do
+		table.insert(parts, 1, current.Name)
+		if current == workspace then
+			break
+		end
+		current = current.Parent
+	end
+	return table.concat(parts, "/")
+end
+
+-- Searches the live Workspace hierarchy by name (Phase 4B).
+--
+-- Returns (matches, total, truncated) where:
+--   matches   - up to `limit` tables of { name, className, path }; always a list
+--   total     - the total number of matches in the live hierarchy
+--   truncated - true if more matches exist than were returned (total > #matches)
+--
+-- The search is a case-insensitive substring match on instance Name and reads
+-- the live hierarchy on every request (no caching/indexing). The returned list
+-- is bounded by `limit` (max 100 in the handler), so the response is bounded
+-- even when the project has many matches.
+local function searchWorkspace(query, limit)
+	local lowerQuery = string.lower(query)
+	local matches = {}
+	local total = 0
+	for _, instance in ipairs(workspace:GetDescendants()) do
+		if string.find(string.lower(instance.Name), lowerQuery, 1, true) then
+			total = total + 1
+			if #matches < limit then
+				table.insert(matches, {
+					name = instance.Name,
+					className = instance.ClassName,
+					path = buildPath(instance),
+				})
+			end
+		end
+	end
+	return matches, total, total > #matches
+end
+
+local DEFAULT_FIND_MAX_RESULTS = 20
+local MAX_FIND_RESULTS = 100
+
+local function handleFindInstances(id, params)
+	params = params or {}
+	local query = params.query
+	if type(query) ~= "string" or query == "" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.query must be a non-empty string",
+		})
+	end
+	local maxResults = params.max_results
+	local limit
+	if maxResults == nil then
+		limit = DEFAULT_FIND_MAX_RESULTS
+	elseif type(maxResults) ~= "number" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.max_results must be a number",
+		})
+	else
+		limit = math.floor(maxResults)
+	end
+	if limit < 1 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.max_results must be at least 1",
+		})
+	end
+	if limit > MAX_FIND_RESULTS then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.max_results must be at most " .. tostring(MAX_FIND_RESULTS),
+		})
+	end
+
+	local ok, matches, total, truncated = pcall(searchWorkspace, query, limit)
+	if not ok then
+		log("find_instances search error: " .. tostring(matches))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = tostring(matches),
+		})
+	end
+
+	log(string.format(
+		"find_instances '%s': %d match(es)%s",
+		query,
+		total,
+		truncated and " (truncated)" or ""
+	))
+	return sendResponse(id, true, {
+		query = query,
+		max_results = limit,
+		total = total,
+		count = #matches,
+		truncated = truncated,
+		matches = matches,
+	})
+end
+
 -- Tool handler registry: incoming request messages are dispatched through this
 -- table rather than hard-coded branches. Each handler is registered by name with
 -- registerTool(); handleRequest looks the tool up here.
@@ -285,6 +395,7 @@ end
 -- Registered tool handlers (dispatch happens in handleRequest).
 registerTool("create_part", handleCreatePart)
 registerTool("inspect_hierarchy", handleInspectHierarchy)
+registerTool("find_instances", handleFindInstances)
 
 local function handleRequest(id, payload)
 	local tool = payload.tool

@@ -8,8 +8,9 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
 - a hello/welcome handshake
 - a test message: ping -> pong
 - a tool registry (name, description, input schema) that validates arguments
-  before sending a request; create_part is the first registered tool and
-  inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree
+  before sending a request; create_part is the first registered tool,
+  inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree, and
+  find_instances (Phase 4B) searches the live Workspace hierarchy by name
   (request/response over the same socket)
 - an interactive AI REPL: ordinary text input is sent to the AI agent
   (cli/agent.py, Phase 3B), which asks the provider for a structured tool call,
@@ -27,6 +28,8 @@ Usage:
                                   [--request-timeout SEC]
     rbxforge --inspect-hierarchy-once [--host HOST] [--port PORT]
                   [--depth N] [--timeout SEC] [--request-timeout SEC]
+    rbxforge --find-instances-once --query TEXT [--host HOST] [--port PORT]
+                  [--max-results N] [--timeout SEC] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
@@ -583,11 +586,73 @@ def inspect_hierarchy_tool():
     )
 
 
+# Instance search (Phase 4B). `query` is required and must be a non-empty
+# string; `max_results` is optional (the CLI applies the default below when
+# omitted) and must be a whole number in [1, 100] so the plugin response stays
+# bounded even when the live hierarchy has many matches.
+DEFAULT_FIND_MAX_RESULTS = 20
+MAX_FIND_RESULTS = 100
+
+FIND_INSTANCES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "min_length": 1},
+        "max_results": {
+            "type": "number", "integer": True, "minimum": 1, "maximum": MAX_FIND_RESULTS,
+        },
+    },
+    "required": ["query"],
+}
+
+
+def find_instances_tool():
+    """Build the find_instances tool (Phase 4B).
+
+    Requests a case-insensitive name search over the live Workspace hierarchy
+    from the plugin and logs a one-line summary (match count, truncation). The
+    plugin returns a bounded list of ``{name, className, path}`` matches plus a
+    total count; the CLI keeps the default max_results small so responses
+    cannot balloon.
+    """
+
+    def run(rbx, params, timeout):
+        request_params = dict(params)
+        request_params.setdefault("max_results", DEFAULT_FIND_MAX_RESULTS)
+        response = rbx.send_request("find_instances", request_params, timeout)
+        if response is None:
+            rbx.log("find_instances failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            result = response.get("result") or {}
+            summary = "find_instances OK: {0} match(es) for query {1!r}".format(
+                result.get("total", "?"), result.get("query", "?")
+            )
+            if result.get("truncated"):
+                summary += " (truncated - more matches exist beyond max_results)"
+            rbx.log(summary)
+            return True
+        error = response.get("error") or {}
+        rbx.log("find_instances FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "find_instances",
+        "Search the live Workspace hierarchy for instances whose Name contains "
+        "the query (case-insensitive) and return each match's Name, ClassName, "
+        "and full Instance path.",
+        FIND_INSTANCES_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
     registry.register(create_part_tool())
     registry.register(inspect_hierarchy_tool())
+    registry.register(find_instances_tool())
     return registry
 
 
@@ -862,6 +927,16 @@ class RBXForge:
             params["depth"] = depth
         return self.execute_tool("inspect_hierarchy", params, timeout)
 
+    def find_instances(self, query, max_results=None, timeout=10.0):
+        """Search the Studio Workspace hierarchy via the find_instances tool.
+
+        ``max_results`` defaults to the plugin/CLI default (20) when omitted.
+        """
+        params = {"query": query}
+        if max_results is not None:
+            params["max_results"] = max_results
+        return self.execute_tool("find_instances", params, timeout)
+
     def ask(self, prompt):
         """Run one natural-language prompt through the AI agent (Phase 3B/3C).
 
@@ -961,6 +1036,22 @@ def repl(rbx, console, prompt="RBXForge> "):
                 except ValueError:
                     rbx.log("inspect_hierarchy: ignoring invalid depth {0!r}".format(parts[1]))
             rbx.inspect_hierarchy(depth)
+        elif command == "find_instances":
+            after = line.strip()[len(command):].strip()
+            if not after:
+                rbx.log("find_instances: no query given (e.g. 'find_instances Baseplate')")
+            else:
+                max_results = None
+                words = after.split()
+                if len(words) >= 2:
+                    try:
+                        parsed = int(words[-1])
+                    except ValueError:
+                        pass
+                    else:
+                        max_results = parsed
+                        after = " ".join(words[:-1])
+                rbx.find_instances(after, max_results)
         elif command == "status":
             with rbx.connection_lock:
                 client = rbx.connection
@@ -981,6 +1072,9 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("  create_part - run the create_part tool (creates a test Part in Studio)")
             print("  inspect_hierarchy [depth]")
             print("              - snapshot the Workspace tree (default depth: 3)")
+            print("  find_instances <query> [max_results]")
+            print("              - search the Workspace for instances whose name matches")
+            print("                <query>, case-insensitively (default max_results: 20)")
             print("  status      - show connection status")
             print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
@@ -1025,9 +1119,23 @@ def main(argv=None):
              "report, then exit",
     )
     parser.add_argument(
+        "--find-instances-once", action="store_true",
+        help="wait for the plugin to connect, search the Workspace hierarchy for "
+             "--query, report, then exit",
+    )
+    parser.add_argument(
         "--depth", type=int, default=None,
         help="maximum hierarchy depth for --inspect-hierarchy-once (default: 3; "
              "must be a whole number in 1..{0})".format(MAX_HIERARCHY_DEPTH),
+    )
+    parser.add_argument(
+        "--query", default=None,
+        help="instance name query for --find-instances-once",
+    )
+    parser.add_argument(
+        "--max-results", type=int, default=None,
+        help="maximum matches for --find-instances-once (default: {0}; must be a "
+             "whole number in 1..{1})".format(DEFAULT_FIND_MAX_RESULTS, MAX_FIND_RESULTS),
     )
     parser.add_argument(
         "--timeout", type=float, default=30.0,
@@ -1066,6 +1174,13 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.inspect_hierarchy(args.depth, args.request_timeout) else 4
+        if args.find_instances_once:
+            if not args.query:
+                rbx.error("--find-instances-once requires --query <text>")
+                return 2
+            if not wait_for_plugin(rbx, args.timeout):
+                return 2
+            return 0 if rbx.find_instances(args.query, args.max_results, args.request_timeout) else 4
         repl(rbx, console)
     finally:
         rbx.stop()

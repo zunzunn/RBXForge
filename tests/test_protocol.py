@@ -317,6 +317,238 @@ def scenario_inspect_hierarchy_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4B: find_instances scenarios
+# --------------------------------------------------------------------------- #
+
+
+def find_instances_response(total=1, count=None, truncated=None, query="Baseplate",
+                            max_results=20, matches=None):
+    """A canned find_instances success result. ``count`` and ``truncated``
+    default to consistent values for the given ``total`` / ``matches``."""
+    if matches is None:
+        matches = [
+            {"name": "Match {0}".format(i), "className": "Part",
+             "path": "Workspace/Match {0}".format(i)}
+            for i in range(total if count is None else count)
+        ]
+    count = count if count is not None else len(matches)
+    truncated = truncated if truncated is not None else (total > count)
+    return {
+        "ok": True,
+        "result": {
+            "query": query,
+            "max_results": max_results,
+            "total": total,
+            "count": count,
+            "truncated": truncated,
+            "matches": matches,
+        },
+    }
+
+
+def scenario_find_instances_mock_response():
+    """find_instances must run through the ToolRegistry, send the query with the
+    default max_results (20), and report the match count in a log summary."""
+    mod = load_cli_module()
+    rbx = FakeRBX(find_instances_response(total=2, count=2))
+    registry = mod.default_registry()
+    result = registry.execute(rbx, "find_instances", {"query": "Baseplate"}, timeout=5.0)
+    assert result is True, result
+    assert rbx.requests == [("find_instances", {"query": "Baseplate", "max_results": 20})], \
+        rbx.requests
+    assert any("find_instances OK: 2 match(es) for query 'Baseplate'" in line
+               for line in rbx.logs), rbx.logs
+    print("OK  find_instances executes through the ToolRegistry with a mock response")
+
+
+def scenario_find_instances_max_results_and_truncation():
+    """max_results is optional (default 20) and passed through exactly; a
+    truncated response is called out, and a zero-match result is a success."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+
+    rbx = FakeRBX(find_instances_response(total=3, count=2, truncated=True, max_results=2))
+    assert registry.execute(rbx, "find_instances", {"query": "shop", "max_results": 2},
+                            timeout=5.0) is True
+    assert rbx.requests == [("find_instances", {"query": "shop", "max_results": 2})], \
+        rbx.requests
+    assert any("(truncated" in line for line in rbx.logs), rbx.logs
+
+    rbx = FakeRBX(find_instances_response(total=0, count=0, truncated=False, query="zzz_none"))
+    assert registry.execute(rbx, "find_instances", {"query": "zzz_none"}, timeout=5.0) is True
+    assert rbx.requests == [("find_instances", {"query": "zzz_none", "max_results": 20})], \
+        rbx.requests
+    assert any("find_instances OK: 0 match(es) for query 'zzz_none'" in line
+               for line in rbx.logs), rbx.logs
+    print("OK  max_results passed through; truncation and no-match results reported")
+
+
+def scenario_find_instances_validation():
+    """query must be a non-empty string and max_results must be a whole number in
+    [1, MAX], or the call is rejected with no request sent."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("find_instances")
+    assert tool is not None
+
+    good = [
+        {"query": "a"},
+        {"query": "Baseplate", "max_results": 1},
+        {"query": "Shop Door", "max_results": mod.MAX_FIND_RESULTS},
+    ]
+    for params in good:
+        tool.validate(params)  # must not raise
+
+    bad = [
+        ("missing query", {}),
+        ("empty query", {"query": ""}),
+        ("query not a string", {"query": 42}),
+        ("query not a string (list)", {"query": ["a"]}),
+        ("max_results 0", {"query": "a", "max_results": 0}),
+        ("max_results negative", {"query": "a", "max_results": -3}),
+        ("max_results too high", {"query": "a", "max_results": mod.MAX_FIND_RESULTS + 1}),
+        ("max_results float", {"query": "a", "max_results": 2.5}),
+        ("max_results string", {"query": "a", "max_results": "5"}),
+        ("max_results bool", {"query": "a", "max_results": True}),
+    ]
+    for label, params in bad:
+        try:
+            tool.validate(params)
+        except mod.InvalidParamsError as exc:
+            assert "params" in str(exc), (label, exc)
+        else:
+            raise AssertionError("find_instances accepted invalid params: " + label)
+
+    # execute rejects invalid params up front: nothing is sent to the plugin.
+    rbx = FakeRBX(find_instances_response())
+    registry = mod.default_registry()
+    for params in ({"query": ""}, {"query": "a", "max_results": 0}, {"max_results": 5}):
+        try:
+            registry.execute(rbx, "find_instances", params, timeout=5.0)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("execute accepted invalid find_instances params: {0!r}"
+                                 .format(params))
+    assert rbx.requests == [], rbx.requests
+    print("OK  invalid find_instances params rejected before sending "
+          "(missing/empty query, bad max_results)")
+
+
+def scenario_find_instances_failure():
+    """A failed find_instances (plugin replies ok:false) must be reported and
+    yield a non-zero exit code."""
+    proc = Proc("--find-instances-once", "--query", "Baseplate", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": False,
+                "error": {"code": "execution_failed", "message": "boom"},
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 4, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("find_instances FAILED"), proc._output()
+        assert proc.reader.contains("execution_failed"), proc._output()
+        print("OK  find_instances failure response reported; non-zero exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_find_instances_roundtrip():
+    """--find-instances-once must wait for the plugin, send a find_instances
+    request with the query and max_results (default 20), accept a bounded match
+    response, and exit 0."""
+    proc = Proc("--find-instances-once", "--query", "Baseplate", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "find_instances", req
+        assert req["payload"]["params"] == {"query": "Baseplate", "max_results": 20}, req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": find_instances_response(
+                total=2, count=2, query="Baseplate", max_results=20,
+                matches=[
+                    {"name": "Baseplate", "className": "Part", "path": "Workspace/Baseplate"},
+                    {"name": "Baseplate2", "className": "Part", "path": "Workspace/Folder/Baseplate2"},
+                ],
+            ),
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("find_instances OK: 2 match(es) for query 'Baseplate'"), \
+            proc._output()
+        print("OK  find_instances round-trip through the protocol; clean exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_find_instances_roundtrip_truncated():
+    """--find-instances-once --max-results N must pass N through and report a
+    truncated result (in the log) when the plugin says more matches exist."""
+    proc = Proc("--find-instances-once", "--query", "Part", "--max-results", "2", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "find_instances", req
+        assert req["payload"]["params"] == {"query": "Part", "max_results": 2}, req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": find_instances_response(
+                total=5, count=2, truncated=True, query="Part", max_results=2,
+                matches=[
+                    {"name": "Part1", "className": "Part", "path": "Workspace/Part1"},
+                    {"name": "Part2", "className": "Part", "path": "Workspace/Part2"},
+                ],
+            ),
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("find_instances OK: 5 match(es) for query 'Part'"), \
+            proc._output()
+        assert proc.reader.contains("(truncated"), proc._output()
+        print("OK  --max-results passed through and truncation reported (log + exit 0)")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+# --------------------------------------------------------------------------- #
 # Subprocess helpers
 # --------------------------------------------------------------------------- #
 
@@ -606,12 +838,12 @@ def scenario_interactive_create_part_registered():
 
 
 def scenario_tool_registry_metadata():
-    """The tool registry must expose create_part and inspect_hierarchy with
-    name/description/schema."""
+    """The tool registry must expose create_part, inspect_hierarchy, and
+    find_instances with name/description/schema."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
-    assert [t.name for t in tools] == ["create_part", "inspect_hierarchy"], tools
+    assert [t.name for t in tools] == ["create_part", "find_instances", "inspect_hierarchy"], tools
 
     tool = registry.get("create_part")
     assert tool is not None
@@ -630,7 +862,22 @@ def scenario_tool_registry_metadata():
     assert depth_prop["integer"] is True
     assert depth_prop["minimum"] == 1
     assert depth_prop["maximum"] == mod.MAX_HIERARCHY_DEPTH
-    print("OK  registry registers create_part and inspect_hierarchy with metadata")
+
+    finder = registry.get("find_instances")
+    assert finder is not None
+    assert isinstance(finder.description, str) and finder.description
+    assert finder.input_schema["type"] == "object"
+    query_prop = finder.input_schema["properties"]["query"]
+    assert query_prop["type"] == "string"
+    assert query_prop["min_length"] == 1
+    assert set(finder.input_schema["required"]) == {"query"}
+    max_prop = finder.input_schema["properties"]["max_results"]
+    assert max_prop["type"] == "number"
+    assert max_prop["integer"] is True
+    assert max_prop["minimum"] == 1
+    assert max_prop["maximum"] == mod.MAX_FIND_RESULTS
+    print("OK  registry registers create_part, find_instances, and inspect_hierarchy "
+          "with metadata")
 
 
 def scenario_tool_validation():
@@ -903,12 +1150,18 @@ def main():
     scenario_inspect_hierarchy_depth_semantics()
     scenario_inspect_hierarchy_empty_hierarchy()
     scenario_inspect_hierarchy_invalid_depth()
+    scenario_find_instances_mock_response()
+    scenario_find_instances_max_results_and_truncation()
+    scenario_find_instances_validation()
     scenario_connect_hello_ping_pong()
     scenario_disconnect_and_reconnect()
     scenario_errors()
     scenario_create_part_success()
     scenario_create_part_failure()
     scenario_inspect_hierarchy_roundtrip()
+    scenario_find_instances_roundtrip()
+    scenario_find_instances_roundtrip_truncated()
+    scenario_find_instances_failure()
     scenario_interactive_create_part_registered()
     scenario_repl_run_after_connection()
     scenario_repl_after_plugin_connect_pty()

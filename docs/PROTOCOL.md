@@ -4,9 +4,10 @@
 >
 > - **Current / Implemented:** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. Two Studio operations are implemented as registered tools, dispatched
->   through registries on both sides, with CLI-side argument validation before any `request` is
->   sent: `create_part` (Phase 2B) and `inspect_hierarchy` (Phase 4A).
+>   `plugin/rbxforge.lua`. Three Studio operations are implemented as registered tools,
+>   dispatched through registries on both sides, with CLI-side argument validation before any
+>   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), and
+>   `find_instances` (Phase 4B).
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -192,6 +193,7 @@ Implemented tools and their `params`:
 | --- | --- | --- |
 | `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; `"red"` supported) | `{ name, position, size, color }` |
 | `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
+| `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
 
 `inspect_hierarchy` example request:
 
@@ -243,6 +245,56 @@ plugin reports it instead of serializing the whole tree: a truncated response ca
 `"truncated": true` with only the nodes up to the limit; an invalid `depth` yields `ok: false`
 with `error.code = "invalid_params"`. The response is always JSON and stays bounded regardless
 of the size of the project.
+
+`find_instances` example request (searches the live Workspace for instances whose **Name**
+contains `"shop"`, case-insensitively):
+
+```json
+{
+  "type": "request",
+  "id": "req-3",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "tool": "find_instances",
+    "params": { "query": "shop", "max_results": 20 }
+  }
+}
+```
+
+Its success result is a **bounded** list of matches. Each match is only `{ name, className,
+path }` (property values are deliberately not serialized); `path` is the full Instance path
+from Workspace down:
+
+```json
+{
+  "type": "response",
+  "id": "req-3",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "ok": true,
+    "result": {
+      "query": "shop",
+      "max_results": 20,
+      "total": 2,
+      "count": 2,
+      "truncated": false,
+      "matches": [
+        { "name": "Shop", "className": "Model", "path": "Workspace/Shop" },
+        { "name": "ShopSign", "className": "Part", "path": "Workspace/Shop/ShopSign" }
+      ]
+    }
+  }
+}
+```
+
+`total` is how many matches exist in the live hierarchy; `count` is how many were returned
+(`min(total, max_results)`). When `total > count` the plugin sets `"truncated": true` (and
+`max_results` reflects the cap actually used when the caller omitted it). An invalid `query` /
+`max_results` yields `ok: false` with `error.code = "invalid_params"`. The search reads the live
+hierarchy on every request — no caching or indexing — and stays bounded regardless of project
+size.
 
 Tool error codes (in `response.payload.error.code`):
 
@@ -300,8 +352,11 @@ sent, the CLI **validates the arguments against the tool's input schema**
 and reported to the caller. On the plugin side, incoming `request`s are dispatched through a
 **tool-handler registry** (`plugin/rbxforge.lua` `toolHandlers` / `registerTool`), not a
 hard-coded branch. Implemented tools: `create_part` (creates a Part in `workspace` with the given
-name, position, size, and color) and `inspect_hierarchy` (returns a bounded Name/ClassName tree of
-`workspace`, honoring the depth limit and marking truncation). Every `request` gets a `response` —
+name, position, size, and color), `inspect_hierarchy` (returns a bounded Name/ClassName tree of
+`workspace`, honoring the depth limit and marking truncation), and `find_instances` (searches the
+live `workspace` hierarchy by instance name — case-insensitive substring match — returning a
+bounded list of `{ name, className, path }` matches plus a total count and a truncation flag).
+Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.
 
@@ -316,10 +371,12 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only two Studio operations (`create_part`, `inspect_hierarchy`). Other object operations are
+- Only three Studio operations (`create_part`, `inspect_hierarchy`, `find_instances`). Other
+  object operations and generalized search (class type / property value / parent scope) are
   planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
-  `inspect_hierarchy`); no search, indexing, spatial reasoning, or caching — inspection is a
-  bounded one-off snapshot.
+  `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`); no indexing,
+  spatial reasoning, or caching — inspection is a bounded one-off snapshot and search reads the
+  live hierarchy on every request.
 - No authentication/encryption (connection is local only).
 - No binary frames (rejected with a log line and ignored).

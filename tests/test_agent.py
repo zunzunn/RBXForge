@@ -126,16 +126,22 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["create_part", "inspect_hierarchy"], names
+    assert names == ["create_part", "find_instances", "inspect_hierarchy"], names
     create_part = defs[0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"
     assert set(create_part["parameters"]["required"]) == {
         "name", "position", "size", "color",
     }, create_part
-    hierarchy = defs[1]
+    hierarchy = next(d for d in defs if d["name"] == "inspect_hierarchy")
     assert hierarchy["parameters"]["properties"]["depth"]["type"] == "number"
     assert hierarchy["parameters"]["properties"]["depth"]["minimum"] == 1, hierarchy
+
+    finder = next(d for d in defs if d["name"] == "find_instances")
+    assert finder["parameters"]["required"] == ["query"], finder
+    assert finder["parameters"]["properties"]["query"]["type"] == "string"
+    assert finder["parameters"]["properties"]["max_results"]["type"] == "number"
+    assert finder["parameters"]["properties"]["max_results"]["maximum"] == 100, finder
 
     result = agent.run("create a red cube")
     assert result.ok is False  # provider produced no output, but messages were sent

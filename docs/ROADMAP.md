@@ -133,6 +133,15 @@ flag. Implemented end-to-end (same CLI registry + validation, plugin handler, pr
 tests). No protocol changes were needed. Deliberately minimal: it reads the live hierarchy on
 every request — **no** caching or indexing yet — and does not do arbitrary property inspection.
 
+**Phase 4C (done):** single-instance inspection — the `inspect_instance` tool resolves one
+instance by its full path and returns its identity (`name`, `className`), full path, parent
+path, and a small **allowlisted** set of safe properties (BasePart / SpawnLocation / Model /
+GuiObject; see [TOOLS.md](./TOOLS.md)). Implemented end-to-end (same CLI registry + validation,
+plugin handler, protocol, docs, tests). No protocol changes were needed beyond one new `not_found`
+error code. Deliberately minimal: strict path validation, **no** arbitrary property reflection,
+**no** recursive descendant inspection, and **no** caching/indexing — each path is resolved
+against the live hierarchy per request.
+
 **Remaining deliverables:**
 
 - Project inspection tooling (e.g. generalized search by class type / property).
@@ -232,7 +241,7 @@ estimates are avoided until the system is real and measurable.
 | Phase 1 — Studio Connection | **In progress** |
 | Phase 2 — Basic Studio Tools | **In progress** |
 | Phase 3 — First Agent Loop | **In progress** (3A provider layer + 3B single-step agent + 3C AI REPL done) |
-| Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`) |
+| Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`) |
 | Phase 5 — Building Systems | Not started |
 | Phase 6 — Gameplay Logic | Not started |
 | Phase 7 — Autonomous Game Development | Not started |

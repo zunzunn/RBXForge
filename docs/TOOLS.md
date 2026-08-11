@@ -1,7 +1,7 @@
 # RBXForge — Tool System
 
-> **Status:** Three tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
-> find_instances in Phase 4B); the rest is conceptual.
+> **Status:** Four tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> find_instances in Phase 4B, inspect_instance in Phase 4C); the rest is conceptual.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -15,6 +15,9 @@
 > - **Implemented (Phase 4B):** `find_instances` searches the live Workspace hierarchy by
 >   instance name (case-insensitive substring match) and returns each match's Name, ClassName,
 >   and full Instance path, bounded by `max_results`. Same registry/validation/protocol flow.
+> - **Implemented (Phase 4C):** `inspect_instance` inspects one live instance by its full
+>   path and returns its identity plus a small **allowlisted** set of safe properties. Same
+>   registry/validation/protocol flow.
 > - **Planned:** everything else below is conceptual only. **No other tools are implemented.**
 >   Final APIs are deliberately **not invented yet.**
 
@@ -103,6 +106,46 @@ token is parsed as `max_results`) and `--find-instances-once --query <text> [--m
 as a one-shot flag. The query must be a non-empty string and `max_results` a whole number in
 `1..100`; anything else is rejected before a request is sent.
 
+### inspect_instance (Phase 4C)
+
+- **Purpose:** Inspect one live instance by its full path and return its identity plus a small,
+  **allowlisted** set of safe properties. This is the complement to `find_instances`: search
+  locates candidates, inspect reads the details of one of them (the practical start of
+  `get_instance` in the conceptual list).
+- **Inputs (schema, validated by the CLI before sending):**
+  - `path` — required non-empty string, the full path from Workspace down, e.g.
+    `"Workspace.SpawnLocation"`, `"Workspace/Shop/Door"`. Dot (`.`) or slash (`/`) segment
+    separators; must name an instance **inside** Workspace (at least two segments), must start
+    with the `Workspace` root, and must not contain empty segments (e.g. `"Workspace..Part"` or
+    a trailing separator).
+- **Expected output:** `ok: true` with a `result` containing:
+  - `name` — the instance's Name
+  - `className` — the instance's ClassName
+  - `path` — the full path from Workspace (normalized to `/` separators)
+  - `parent_path` — the parent's full path (e.g. `"Workspace"` for a direct child)
+  - `properties` — a serialized object of safe properties (empty for unlisted classes)
+- **Property allowlist (deliberately minimal — no arbitrary property reflection):**
+  - `BasePart` (and subclasses, e.g. `Part`, `WedgePart`): `Position`, `Size`, `Anchored`,
+    `CanCollide`, `Transparency`
+  - `SpawnLocation` (a `BasePart` subclass): the five above plus `Enabled`, `Duration`,
+    `Neutral`, `TeamColor`
+  - `Model`: `PrimaryPart`
+  - `GuiObject` (and subclasses): `Position`, `Size`, `Visible`
+  - Any other class → `properties: {}` (identity/path only)
+- **Serialized property types:** string, number, boolean pass through; `Vector3` → `{x,y,z}`;
+  `Color3` → `{r,g,b}`; `EnumItem` → `{name, value}`; `UDim2` → `{x:{scale,offset},
+  y:{scale,offset}}` (GuiObject Position/Size); `BrickColor` → `{name, number}` (TeamColor);
+  `Instance` → its full path (Model PrimaryPart). Anything else is omitted.
+- **Why the agent might use it:** reading the actual state of a found instance (a part's
+  Anchored/flags, a SpawnLocation's settings) before deciding whether/how to modify it.
+- **Non-goals:** no reading of arbitrary/sensitive properties, no recursive descendant
+  inspection, no caching/indexing (the hierarchy is traversed live per request).
+
+The CLI exposes `inspect_instance <path>` as a REPL command and
+`--inspect-instance-once --path <path>` as a one-shot flag. The path must be a non-empty string;
+format and existence are checked by the plugin, which returns a `not_found` error for paths that
+don't resolve.
+
 ## Conceptual Tool List
 
 This is a starting list, not a final API. Tools will be added, removed, and refined during
@@ -141,11 +184,11 @@ Each tool is described conceptually by:
 - **Expected output:** What the agent can expect back (success/failure, plus data).
 - **Why the agent might use it:** Typical situations where the tool is the right choice.
 
-> **Implemented tool anatomy (Phase 2B/4A/4B):** every registered tool carries machine-readable
+> **Implemented tool anatomy (Phase 2B/4A/4B/4C):** every registered tool carries machine-readable
 > metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
 > against that schema before sending a `request`. `create_part` (Phase 2B), `inspect_hierarchy`
-> (Phase 4A), and `find_instances` (Phase 4B) are the implemented tools; the conceptual entries
-> below are still being designed.
+> (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) are the implemented
+> tools; the conceptual entries below are still being designed.
 
 ---
 
@@ -170,6 +213,10 @@ Each tool is described conceptually by:
 - **Why the agent might use it:** Locating "Town", an existing shop, or a folder to extend.
 
 ### get_instance
+
+> **Note:** a minimal, allowlisted single-instance read is now **implemented as
+> `inspect_instance` (Phase 4C)** — identity, full path, and a small safe-property set. This
+> entry remains conceptual for the full version (arbitrary/requested properties).
 
 - **Purpose:** Read full details of a single instance.
 - **Inputs (conceptual):** Reference to the instance.
@@ -261,12 +308,12 @@ Each tool is described conceptually by:
 ## Design Notes
 
 - The list above is **conceptual**. Exact names, arguments, and schemas are open questions.
-- **Implemented registry (Phase 2B/4A/4B):** the CLI keeps a `ToolRegistry` keyed by tool name;
+- **Implemented registry (Phase 2B/4A/4B/4C):** the CLI keeps a `ToolRegistry` keyed by tool name;
   each `Tool` carries `name`, `description`, and `input_schema` and knows how to turn validated
   arguments into a protocol request/response exchange. Adding a tool later means registering one
-  more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A) and `find_instances`
-  (Phase 4B) demonstrate this: each shipped with no protocol changes, only a new client-side
-  `Tool` and a matching plugin-side handler.
+  more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A), `find_instances`
+  (Phase 4B), and `inspect_instance` (Phase 4C) demonstrate this: each shipped with no protocol
+  changes, only a new client-side `Tool` and a matching plugin-side handler.
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

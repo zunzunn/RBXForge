@@ -1,11 +1,11 @@
 --!nonstrict
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
--- + Phase 4B (find_instances)
+-- + Phase 4B (find_instances) + Phase 4C (inspect_instance)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and three Studio operations: create_part, inspect_hierarchy, and
--- find_instances (request/response).
+-- and four Studio operations: create_part, inspect_hierarchy, find_instances,
+-- and inspect_instance (request/response).
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -379,6 +379,172 @@ local function handleFindInstances(id, params)
 	})
 end
 
+-- Splits a path into segments on "." or "/", preserving empty segments so the
+-- handler can reject malformed paths like "Workspace..Part" or "Workspace/Part/".
+local function splitPathSegments(path)
+	local segments = {}
+	local index = 1
+	while index <= #path do
+		local separator = path:find("[%.%/]", index)
+		if separator then
+			table.insert(segments, path:sub(index, separator - 1))
+			index = separator + 1
+		else
+			table.insert(segments, path:sub(index))
+			break
+		end
+	end
+	return segments
+end
+
+-- Resolves a validated, Workspace-rooted list of segments to the live instance
+-- by walking from workspace with exact child Name lookups. Returns nil when
+-- any segment does not exist.
+local function resolveSegments(segments)
+	local current = workspace
+	for index = 2, #segments do
+		local child = current:FindFirstChild(segments[index])
+		if not child then
+			return nil
+		end
+		current = child
+	end
+	return current
+end
+
+-- Serializes one property value for the wire. Supported types:
+--   string / number / boolean - passed through as-is
+--   Vector3                    - { x, y, z }
+--   Color3                     - { r, g, b }
+--   EnumItem                   - { name, value }
+--   UDim2 (GuiObject Position/Size) - { x = { scale, offset }, y = { scale, offset } }
+--   BrickColor (SpawnLocation TeamColor) - { name, number }
+--   Instance (Model PrimaryPart)      - its full path, e.g. "Workspace/Part"
+-- Any other type (e.g. CFrame, Ray) is not supported and serializes to nil
+-- (the property is omitted). nil values are also omitted by the JSON encoder.
+local function serializeValue(value)
+	if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then
+		return value
+	end
+	if typeof(value) == "Vector3" then
+		return { x = value.X, y = value.Y, z = value.Z }
+	elseif typeof(value) == "Color3" then
+		return { r = value.R, g = value.G, b = value.B }
+	elseif typeof(value) == "EnumItem" then
+		return { name = value.Name, value = value.Value }
+	elseif typeof(value) == "UDim2" then
+		return {
+			x = { scale = value.X.Scale, offset = value.X.Offset },
+			y = { scale = value.Y.Scale, offset = value.Y.Offset },
+		}
+	elseif typeof(value) == "BrickColor" then
+		return { name = value.Name, number = value.Number }
+	elseif typeof(value) == "Instance" then
+		return buildPath(value)
+	end
+	return nil
+end
+
+-- Builds the small explicit allowlist of safe properties for `instance`
+-- (Phase 4C). Only these class hierarchies are recognized; everything else
+-- returns an empty table (identity/path only, no arbitrary reflection).
+local function buildProperties(instance)
+	local out = {}
+	if instance:IsA("SpawnLocation") then
+		out.Position = serializeValue(instance.Position)
+		out.Size = serializeValue(instance.Size)
+		out.Anchored = serializeValue(instance.Anchored)
+		out.CanCollide = serializeValue(instance.CanCollide)
+		out.Transparency = serializeValue(instance.Transparency)
+		out.Enabled = serializeValue(instance.Enabled)
+		out.Duration = serializeValue(instance.Duration)
+		out.Neutral = serializeValue(instance.Neutral)
+		out.TeamColor = serializeValue(instance.TeamColor)
+	elseif instance:IsA("BasePart") then
+		out.Position = serializeValue(instance.Position)
+		out.Size = serializeValue(instance.Size)
+		out.Anchored = serializeValue(instance.Anchored)
+		out.CanCollide = serializeValue(instance.CanCollide)
+		out.Transparency = serializeValue(instance.Transparency)
+	elseif instance:IsA("Model") then
+		out.PrimaryPart = serializeValue(instance.PrimaryPart)
+	elseif instance:IsA("GuiObject") then
+		out.Position = serializeValue(instance.Position)
+		out.Size = serializeValue(instance.Size)
+		out.Visible = serializeValue(instance.Visible)
+	end
+	return out
+end
+
+local function handleInspectInstance(id, params)
+	params = params or {}
+	local path = params.path
+	if type(path) ~= "string" or path == "" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must be a non-empty string",
+		})
+	end
+	local segments = splitPathSegments(path)
+	if #segments < 2 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must name an instance inside Workspace "
+				.. "(e.g. \"Workspace.SpawnLocation\")",
+		})
+	end
+	if segments[1] ~= "Workspace" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must start with the Workspace root "
+				.. "(e.g. \"Workspace.SpawnLocation\")",
+		})
+	end
+	for _, segment in ipairs(segments) do
+		if segment == "" then
+			return sendResponse(id, false, {
+				code = "invalid_params",
+				message = "params.path contains an empty segment "
+					.. "(e.g. \"Workspace..Part\" or a trailing separator)",
+			})
+		end
+	end
+
+	local ok, target, properties = pcall(function()
+		local instance = resolveSegments(segments)
+		if not instance then
+			return nil
+		end
+		return instance, buildProperties(instance)
+	end)
+	if not ok then
+		log("inspect_instance error: " .. tostring(target))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = tostring(target),
+		})
+	end
+	if not target then
+		return sendResponse(id, false, {
+			code = "not_found",
+			message = "instance not found at path: " .. path,
+		})
+	end
+
+	log(string.format(
+		"inspected instance %s (%s)",
+		target.Name,
+		target.ClassName
+	))
+	return sendResponse(id, true, {
+		name = target.Name,
+		className = target.ClassName,
+		path = buildPath(target),
+		parent_path = buildPath(target.Parent),
+		properties = properties,
+	})
+end
+
 -- Tool handler registry: incoming request messages are dispatched through this
 -- table rather than hard-coded branches. Each handler is registered by name with
 -- registerTool(); handleRequest looks the tool up here.
@@ -396,6 +562,7 @@ end
 registerTool("create_part", handleCreatePart)
 registerTool("inspect_hierarchy", handleInspectHierarchy)
 registerTool("find_instances", handleFindInstances)
+registerTool("inspect_instance", handleInspectInstance)
 
 local function handleRequest(id, payload)
 	local tool = payload.tool

@@ -4,10 +4,10 @@
 >
 > - **Current / Implemented:** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. Three Studio operations are implemented as registered tools,
+>   `plugin/rbxforge.lua`. Four Studio operations are implemented as registered tools,
 >   dispatched through registries on both sides, with CLI-side argument validation before any
->   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), and
->   `find_instances` (Phase 4B).
+>   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A),
+>   `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C).
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -194,6 +194,7 @@ Implemented tools and their `params`:
 | `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; `"red"` supported) | `{ name, position, size, color }` |
 | `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
 | `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
+| `inspect_instance` | `path` (non-empty string, full path from Workspace) | `{ name, className, path, parent_path, properties }` |
 
 `inspect_hierarchy` example request:
 
@@ -296,12 +297,71 @@ from Workspace down:
 hierarchy on every request — no caching or indexing — and stays bounded regardless of project
 size.
 
+`inspect_instance` example request (reads one instance by its full path):
+
+```json
+{
+  "type": "request",
+  "id": "req-4",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "tool": "inspect_instance",
+    "params": { "path": "Workspace.SpawnLocation" }
+  }
+}
+```
+
+Its success result carries the instance's identity, its full path (dot or slash separators are
+accepted; the path is returned normalized to `/`), its parent's path, and a serialized object of
+**allowlisted** safe properties:
+
+```json
+{
+  "type": "response",
+  "id": "req-4",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "ok": true,
+    "result": {
+      "name": "SpawnLocation",
+      "className": "SpawnLocation",
+      "path": "Workspace/SpawnLocation",
+      "parent_path": "Workspace",
+      "properties": {
+        "Position": { "x": 0, "y": 7.5, "z": 0 },
+        "Size": { "x": 8, "y": 1.2, "z": 8 },
+        "Anchored": true,
+        "CanCollide": true,
+        "Transparency": 0,
+        "Enabled": true,
+        "Duration": 5,
+        "Neutral": true,
+        "TeamColor": { "name": "Bright red", "number": 21 }
+      }
+    }
+  }
+}
+```
+
+The property set is a fixed allowlist per class (see [TOOLS.md](./TOOLS.md)); unlisted classes
+return `"properties": {}` (identity/path only). Value serialization: string / number / boolean
+pass through; `Vector3` → `{x,y,z}`; `Color3` → `{r,g,b}`; `EnumItem` → `{name, value}`;
+`UDim2` → `{x:{scale,offset}, y:{scale,offset}}`; `BrickColor` → `{name, number}`; an `Instance`
+value (Model `PrimaryPart`) → its full path. A path that does not resolve to an instance yields
+`ok: false` with `error.code = "not_found"`; an invalid path (empty, fewer than two segments,
+not rooted at Workspace, or with an empty segment) yields `ok: false` with
+`error.code = "invalid_params"`. Non-goals: no arbitrary/sensitive property reflection, no
+recursive descendant inspection, no caching/indexing.
+
 Tool error codes (in `response.payload.error.code`):
 
 | Code | Meaning |
 | --- | --- |
 | `invalid_params` | A `params` value failed validation (missing/wrong type/unsupported value). |
 | `unknown_tool` | `payload.tool` is not implemented by the plugin. |
+| `not_found` | The requested target does not exist in Studio (e.g. `inspect_instance` path does not resolve). |
 | `execution_failed` | The operation ran but failed in Studio (e.g. could not parent to workspace). |
 
 ### `error` — either direction
@@ -353,9 +413,11 @@ and reported to the caller. On the plugin side, incoming `request`s are dispatch
 **tool-handler registry** (`plugin/rbxforge.lua` `toolHandlers` / `registerTool`), not a
 hard-coded branch. Implemented tools: `create_part` (creates a Part in `workspace` with the given
 name, position, size, and color), `inspect_hierarchy` (returns a bounded Name/ClassName tree of
-`workspace`, honoring the depth limit and marking truncation), and `find_instances` (searches the
+`workspace`, honoring the depth limit and marking truncation), `find_instances` (searches the
 live `workspace` hierarchy by instance name — case-insensitive substring match — returning a
-bounded list of `{ name, className, path }` matches plus a total count and a truncation flag).
+bounded list of `{ name, className, path }` matches plus a total count and a truncation flag),
+and `inspect_instance` (resolves one instance by full path and returns its identity, full path,
+parent path, and allowlisted safe properties).
 Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.
@@ -371,12 +433,13 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only three Studio operations (`create_part`, `inspect_hierarchy`, `find_instances`). Other
-  object operations and generalized search (class type / property value / parent scope) are
-  planned.
+- Only four Studio operations (`create_part`, `inspect_hierarchy`, `find_instances`,
+  `inspect_instance`). Other object operations and generalized search (class type / property
+  value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
-  `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`); no indexing,
-  spatial reasoning, or caching — inspection is a bounded one-off snapshot and search reads the
-  live hierarchy on every request.
+  `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`; only identity,
+  path, and a small allowlisted property set by `inspect_instance`); no indexing, spatial
+  reasoning, or caching — inspection is a bounded one-off snapshot, search reads the live
+  hierarchy on every request, and instance inspection resolves the path per request.
 - No authentication/encryption (connection is local only).
 - No binary frames (rejected with a log line and ignored).

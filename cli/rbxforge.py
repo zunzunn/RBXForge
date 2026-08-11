@@ -9,8 +9,9 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
 - a test message: ping -> pong
 - a tool registry (name, description, input schema) that validates arguments
   before sending a request; create_part is the first registered tool,
-  inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree, and
-  find_instances (Phase 4B) searches the live Workspace hierarchy by name
+  inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree,
+  find_instances (Phase 4B) searches the live Workspace hierarchy by name, and
+  inspect_instance (Phase 4C) inspects one instance by its full path
   (request/response over the same socket)
 - an interactive AI REPL: ordinary text input is sent to the AI agent
   (cli/agent.py, Phase 3B), which asks the provider for a structured tool call,
@@ -30,6 +31,8 @@ Usage:
                   [--depth N] [--timeout SEC] [--request-timeout SEC]
     rbxforge --find-instances-once --query TEXT [--host HOST] [--port PORT]
                   [--max-results N] [--timeout SEC] [--request-timeout SEC]
+    rbxforge --inspect-instance-once --path PATH [--host HOST] [--port PORT]
+                  [--timeout SEC] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
@@ -647,12 +650,65 @@ def find_instances_tool():
     )
 
 
+# Instance inspection (Phase 4C). `path` is required and must be a non-empty
+# string naming one instance inside Workspace, e.g. "Workspace.SpawnLocation"
+# (dot or slash separators are accepted; the plugin enforces the full format
+# and returns `not_found` when the path does not resolve).
+INSPECT_INSTANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "min_length": 1},
+    },
+    "required": ["path"],
+}
+
+
+def inspect_instance_tool():
+    """Build the inspect_instance tool (Phase 4C).
+
+    Requests one live instance, addressed by its full path, and logs its name,
+    className, full path, parent path, and the small allowlisted set of safe
+    properties the plugin serialized. The plugin decides which properties (if
+    any) an instance exposes; the CLI just renders what came back.
+    """
+
+    def run(rbx, params, timeout):
+        response = rbx.send_request("inspect_instance", params, timeout)
+        if response is None:
+            rbx.log("inspect_instance failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            result = response.get("result") or {}
+            summary = "inspect_instance OK: {0} ({1}): {2}".format(
+                result.get("path", "?"),
+                result.get("className", "?"),
+                json.dumps(result.get("properties") or {}),
+            )
+            rbx.log(summary)
+            return True
+        error = response.get("error") or {}
+        rbx.log("inspect_instance FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "inspect_instance",
+        "Inspect one instance in the live Workspace by its full path "
+        "(e.g. 'Workspace.SpawnLocation'); returns its Name, ClassName, "
+        "parent path, and a small allowlisted set of safe properties.",
+        INSPECT_INSTANCE_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
     registry.register(create_part_tool())
     registry.register(inspect_hierarchy_tool())
     registry.register(find_instances_tool())
+    registry.register(inspect_instance_tool())
     return registry
 
 
@@ -937,6 +993,13 @@ class RBXForge:
             params["max_results"] = max_results
         return self.execute_tool("find_instances", params, timeout)
 
+    def inspect_instance(self, path, timeout=10.0):
+        """Inspect one Studio Workspace instance via the inspect_instance tool.
+
+        ``path`` names the instance, e.g. "Workspace.SpawnLocation".
+        """
+        return self.execute_tool("inspect_instance", {"path": path}, timeout)
+
     def ask(self, prompt):
         """Run one natural-language prompt through the AI agent (Phase 3B/3C).
 
@@ -1052,6 +1115,13 @@ def repl(rbx, console, prompt="RBXForge> "):
                         max_results = parsed
                         after = " ".join(words[:-1])
                 rbx.find_instances(after, max_results)
+        elif command == "inspect_instance":
+            after = line.strip()[len(command):].strip()
+            if not after:
+                rbx.log("inspect_instance: no path given (e.g. "
+                        "'inspect_instance Workspace.SpawnLocation')")
+            else:
+                rbx.inspect_instance(after)
         elif command == "status":
             with rbx.connection_lock:
                 client = rbx.connection
@@ -1075,6 +1145,9 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("  find_instances <query> [max_results]")
             print("              - search the Workspace for instances whose name matches")
             print("                <query>, case-insensitively (default max_results: 20)")
+            print("  inspect_instance <path>")
+            print("              - inspect one Workspace instance by its full path")
+            print("                (e.g. Workspace.SpawnLocation)")
             print("  status      - show connection status")
             print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
@@ -1124,6 +1197,11 @@ def main(argv=None):
              "--query, report, then exit",
     )
     parser.add_argument(
+        "--inspect-instance-once", action="store_true",
+        help="wait for the plugin to connect, inspect the Workspace instance at "
+             "--path, report, then exit",
+    )
+    parser.add_argument(
         "--depth", type=int, default=None,
         help="maximum hierarchy depth for --inspect-hierarchy-once (default: 3; "
              "must be a whole number in 1..{0})".format(MAX_HIERARCHY_DEPTH),
@@ -1131,6 +1209,11 @@ def main(argv=None):
     parser.add_argument(
         "--query", default=None,
         help="instance name query for --find-instances-once",
+    )
+    parser.add_argument(
+        "--path", default=None,
+        help="full instance path for --inspect-instance-once, e.g. "
+             "'Workspace.SpawnLocation'",
     )
     parser.add_argument(
         "--max-results", type=int, default=None,
@@ -1181,6 +1264,13 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.find_instances(args.query, args.max_results, args.request_timeout) else 4
+        if args.inspect_instance_once:
+            if not args.path:
+                rbx.error("--inspect-instance-once requires --path <text>")
+                return 2
+            if not wait_for_plugin(rbx, args.timeout):
+                return 2
+            return 0 if rbx.inspect_instance(args.path, args.request_timeout) else 4
         repl(rbx, console)
     finally:
         rbx.stop()

@@ -549,6 +549,231 @@ def scenario_find_instances_roundtrip_truncated():
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4C: inspect_instance scenarios
+# --------------------------------------------------------------------------- #
+
+
+def inspect_instance_response(name="Baseplate", className="Part",
+                              path="Workspace/Baseplate", parent_path="Workspace",
+                              properties=None):
+    """A canned inspect_instance success result."""
+    return {
+        "ok": True,
+        "result": {
+            "name": name,
+            "className": className,
+            "path": path,
+            "parent_path": parent_path,
+            "properties": properties if properties is not None else {},
+        },
+    }
+
+
+BASE_PART_PROPERTIES = {
+    "Position": {"x": 0, "y": 5, "z": 0},
+    "Size": {"x": 4, "y": 4, "z": 4},
+    "Anchored": True,
+    "CanCollide": True,
+    "Transparency": 0.0,
+}
+
+SPAWN_LOCATION_PROPERTIES = {
+    "Position": {"x": 0, "y": 7.5, "z": 0},
+    "Size": {"x": 8, "y": 1.2, "z": 8},
+    "Anchored": True,
+    "CanCollide": True,
+    "Transparency": 0.0,
+    "Enabled": True,
+    "Duration": 5.0,
+    "Neutral": True,
+    "TeamColor": {"name": "Bright red", "number": 21},
+}
+
+
+def scenario_inspect_instance_mock_response():
+    """inspect_instance must run through the ToolRegistry, send the given path,
+    and report the returned identity + serialized properties in the log."""
+    mod = load_cli_module()
+    rbx = FakeRBX(inspect_instance_response(properties=BASE_PART_PROPERTIES))
+    registry = mod.default_registry()
+    result = registry.execute(rbx, "inspect_instance", {"path": "Workspace.Baseplate"},
+                              timeout=5.0)
+    assert result is True, result
+    assert rbx.requests == [("inspect_instance", {"path": "Workspace.Baseplate"})], rbx.requests
+    expected = "inspect_instance OK: Workspace/Baseplate (Part): " + \
+        json.dumps(BASE_PART_PROPERTIES)
+    assert any(expected in line for line in rbx.logs), rbx.logs
+    print("OK  inspect_instance executes through the ToolRegistry with a mock response")
+
+
+def scenario_inspect_instance_spawn_location():
+    """A SpawnLocation inspection carries the extended property set and the
+    BrickColor (TeamColor) serialization through untouched."""
+    mod = load_cli_module()
+    rbx = FakeRBX(inspect_instance_response(
+        className="SpawnLocation", path="Workspace/SpawnLocation",
+        properties=SPAWN_LOCATION_PROPERTIES,
+    ))
+    registry = mod.default_registry()
+    result = registry.execute(rbx, "inspect_instance", {"path": "Workspace.SpawnLocation"},
+                              timeout=5.0)
+    assert result is True, result
+    expected = "inspect_instance OK: Workspace/SpawnLocation (SpawnLocation): " + \
+        json.dumps(SPAWN_LOCATION_PROPERTIES)
+    assert any(expected in line for line in rbx.logs), rbx.logs
+    assert any('"TeamColor": {"name": "Bright red", "number": 21}' in line
+               for line in rbx.logs), rbx.logs
+    print("OK  SpawnLocation inspection: extended properties + TeamColor serialize")
+
+
+def scenario_inspect_instance_property_serialization():
+    """The wire contract for the supported value types (Vector3 / Color3 /
+    EnumItem) renders through the CLI, and unlisted classes have no properties."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+    props = {
+        "Position": {"x": 1, "y": 2, "z": 3},          # Vector3
+        "Color": {"r": 0.5, "g": 0.25, "b": 0.1},      # Color3
+        "SurfaceType": {"name": "RobloxLocked", "value": 2},  # EnumItem
+    }
+    rbx = FakeRBX(inspect_instance_response(properties=props))
+    assert registry.execute(rbx, "inspect_instance", {"path": "Workspace/Door"},
+                            timeout=5.0) is True
+    rendered = [line for line in rbx.logs if "inspect_instance OK" in line]
+    assert rendered, rbx.logs
+    assert '"Position": {"x": 1, "y": 2, "z": 3}' in rendered[0], rendered
+    assert '"Color": {"r": 0.5, "g": 0.25, "b": 0.1}' in rendered[0], rendered
+    assert '"SurfaceType": {"name": "RobloxLocked", "value": 2}' in rendered[0], rendered
+
+    # An unlisted class returns identity/path only (no properties).
+    rbx = FakeRBX(inspect_instance_response(
+        name="Folder", className="Folder", path="Workspace/Folder",
+    ))
+    assert registry.execute(rbx, "inspect_instance", {"path": "Workspace.Folder"},
+                            timeout=5.0) is True
+    assert any("inspect_instance OK: Workspace/Folder (Folder): {}" in line
+               for line in rbx.logs), rbx.logs
+    print("OK  Vector3/Color3/EnumItem shapes render; unlisted class has no properties")
+
+
+def scenario_inspect_instance_validation():
+    """path must be a non-empty string or the call is rejected with no request
+    sent (the plugin enforces the full path format and not-found lookups)."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("inspect_instance")
+    assert tool is not None
+
+    good = [
+        {"path": "Workspace.Baseplate"},
+        {"path": "Workspace/Shop/Door"},
+        {"path": "Workspace.Parts.Folder.Crystal"},
+    ]
+    for params in good:
+        tool.validate(params)  # must not raise
+
+    bad = [
+        ("missing path", {}),
+        ("empty path", {"path": ""}),
+        ("path not a string", {"path": 42}),
+        ("path not a string (list)", {"path": ["Workspace"]}),
+    ]
+    for label, params in bad:
+        try:
+            tool.validate(params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("inspect_instance accepted invalid params: " + label)
+
+    rbx = FakeRBX(inspect_instance_response())
+    registry = mod.default_registry()
+    for params in ({"path": ""}, {}):
+        try:
+            registry.execute(rbx, "inspect_instance", params, timeout=5.0)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("execute accepted invalid inspect_instance params: {0!r}"
+                                 .format(params))
+    assert rbx.requests == [], rbx.requests
+    print("OK  invalid inspect_instance paths rejected before sending (missing/empty/non-string)")
+
+
+def scenario_inspect_instance_not_found():
+    """A plugin 'not_found' reply is surfaced as a failed inspect_instance log
+    and a non-zero exit code."""
+    proc = Proc("--inspect-instance-once", "--path", "Workspace.NoSuch", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "inspect_instance", req
+        assert req["payload"]["params"] == {"path": "Workspace.NoSuch"}, req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": False,
+                "error": {"code": "not_found",
+                          "message": "instance not found at path: Workspace.NoSuch"},
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 4, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("inspect_instance FAILED"), proc._output()
+        assert proc.reader.contains("not_found"), proc._output()
+        print("OK  not-found inspect_instance reported (log + non-zero exit)")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_inspect_instance_roundtrip():
+    """--inspect-instance-once must wait for the plugin, send an inspect_instance
+    request with the given path, accept identity + properties, and exit 0."""
+    proc = Proc("--inspect-instance-once", "--path", "Workspace.SpawnLocation", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "inspect_instance", req
+        assert req["payload"]["params"] == {"path": "Workspace.SpawnLocation"}, req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": inspect_instance_response(
+                className="SpawnLocation", path="Workspace/SpawnLocation",
+                properties=SPAWN_LOCATION_PROPERTIES,
+            ),
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("inspect_instance OK: Workspace/SpawnLocation "
+                                    "(SpawnLocation)"), proc._output()
+        assert proc.reader.contains('"Enabled": true'), proc._output()
+        print("OK  inspect_instance round-trip through the protocol; clean exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+# --------------------------------------------------------------------------- #
 # Subprocess helpers
 # --------------------------------------------------------------------------- #
 
@@ -838,12 +1063,14 @@ def scenario_interactive_create_part_registered():
 
 
 def scenario_tool_registry_metadata():
-    """The tool registry must expose create_part, inspect_hierarchy, and
-    find_instances with name/description/schema."""
+    """The tool registry must expose create_part, find_instances,
+    inspect_hierarchy, and inspect_instance with name/description/schema."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
-    assert [t.name for t in tools] == ["create_part", "find_instances", "inspect_hierarchy"], tools
+    assert [t.name for t in tools] == [
+        "create_part", "find_instances", "inspect_hierarchy", "inspect_instance",
+    ], tools
 
     tool = registry.get("create_part")
     assert tool is not None
@@ -876,8 +1103,17 @@ def scenario_tool_registry_metadata():
     assert max_prop["integer"] is True
     assert max_prop["minimum"] == 1
     assert max_prop["maximum"] == mod.MAX_FIND_RESULTS
-    print("OK  registry registers create_part, find_instances, and inspect_hierarchy "
-          "with metadata")
+
+    inspector = registry.get("inspect_instance")
+    assert inspector is not None
+    assert isinstance(inspector.description, str) and inspector.description
+    assert inspector.input_schema["type"] == "object"
+    path_prop = inspector.input_schema["properties"]["path"]
+    assert path_prop["type"] == "string"
+    assert path_prop["min_length"] == 1
+    assert set(inspector.input_schema["required"]) == {"path"}
+    print("OK  registry registers create_part, find_instances, inspect_hierarchy, "
+          "and inspect_instance with metadata")
 
 
 def scenario_tool_validation():
@@ -1153,6 +1389,10 @@ def main():
     scenario_find_instances_mock_response()
     scenario_find_instances_max_results_and_truncation()
     scenario_find_instances_validation()
+    scenario_inspect_instance_mock_response()
+    scenario_inspect_instance_spawn_location()
+    scenario_inspect_instance_property_serialization()
+    scenario_inspect_instance_validation()
     scenario_connect_hello_ping_pong()
     scenario_disconnect_and_reconnect()
     scenario_errors()
@@ -1162,6 +1402,8 @@ def main():
     scenario_find_instances_roundtrip()
     scenario_find_instances_roundtrip_truncated()
     scenario_find_instances_failure()
+    scenario_inspect_instance_roundtrip()
+    scenario_inspect_instance_not_found()
     scenario_interactive_create_part_registered()
     scenario_repl_run_after_connection()
     scenario_repl_after_plugin_connect_pty()

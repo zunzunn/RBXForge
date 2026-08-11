@@ -4,8 +4,9 @@
 > the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) is
 > implemented; the Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and
 > the Phase 3C interactive AI REPL (plain text → AI → tool call → Studio) are implemented; and
-> the Phase 4A basic project inspection (`inspect_hierarchy`) plus the Phase 4B hierarchy
-> search (`find_instances`) are implemented. The multi-step agent loop remains planned.
+> the Phase 4A basic project inspection (`inspect_hierarchy`), the Phase 4B hierarchy search
+> (`find_instances`), and the Phase 4C single-instance inspection (`inspect_instance`) are
+> implemented. The multi-step agent loop remains planned.
 
 ## Overview
 
@@ -50,20 +51,21 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–4B)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` tools ([TOOLS.md](./TOOLS.md)) |
+| CLI | **Implemented (Phases 1–4C)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` tools ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Implemented (minimal, Phase 3B)** — single-step `prompt → provider → tool call → execution` in `cli/agent.py`; the full loop is planned |
 | AI provider layer | **Implemented (Phase 3A)** — `cli/providers.py`: provider interface, Ollama + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Planned** — not implemented |
-| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), and `find_instances` (Phase 4B) live end-to-end (CLI + plugin); more tools planned |
-| Project inspection / index | **Started (Phase 4A + Phase 4B)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); indexing/temporal tracking still planned |
+| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) live end-to-end (CLI + plugin); more tools planned |
+| Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
-| Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, and `find_instances`, see [PLUGIN.md](./PLUGIN.md) |
+| Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, and `inspect_instance`, see [PLUGIN.md](./PLUGIN.md) |
 | Verification system | **Planned** — future |
 
 Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), the
 Phase 3A AI provider layer, the Phase 3B minimal single-step agent, the Phase 3C interactive
-AI REPL, the Phase 4A basic project inspection (inspect_hierarchy), and the Phase 4B hierarchy
-search (find_instances). The multi-step agent loop and verification system are still planned.
+AI REPL, the Phase 4A basic project inspection (inspect_hierarchy), the Phase 4B hierarchy
+search (find_instances), and the Phase 4C single-instance inspection (inspect_instance). The
+multi-step agent loop and verification system are still planned.
 
 ## Components
 
@@ -172,9 +174,11 @@ Conceptual tool examples (planned):
 See [TOOLS.md](./TOOLS.md). `create_part` is implemented end-to-end (Phase 2B),
 `inspect_hierarchy` (Phase 4A) snapshots the current `workspace` instance tree as a bounded
 Name/ClassName structure — the first read-only "inspection" tool and the concrete start of the
-Project Inspection component — and `find_instances` (Phase 4B) searches the live `workspace` by
+Project Inspection component — `find_instances` (Phase 4B) searches the live `workspace` by
 instance name (case-insensitive substring match) and returns each match's Name, ClassName, and
-full Instance path, bounded by `max_results`. The remaining conceptual tools are not implemented.
+full Instance path, bounded by `max_results`, and `inspect_instance` (Phase 4C) reads one
+instance by its full path and returns its identity, full path, parent path, and an allowlisted
+safe-property set. The remaining conceptual tools are not implemented.
 
 ### Project Inspection / Index
 
@@ -189,6 +193,11 @@ systems. Long-term, this uses intelligent project inspection and indexing.
   instance name (case-insensitive substring match) and returns a bounded list of `{ name,
   className, path }` matches (default 20, max 100) with a total match count and a truncation
   flag. It reads the hierarchy on every request — deliberately **no** caching or indexing yet.
+- **Phase 4C (implemented):** `inspect_instance` resolves one instance by its full path and
+  returns its identity, full path, parent path, and a small **allowlisted** set of safe
+  properties (BasePart/SpawnLocation/Model/GuiObject; see [TOOLS.md](./TOOLS.md)). Non-goals:
+  no arbitrary property reflection, no recursive descendant inspection, no caching — each path
+  is resolved live.
 - Yet still planned: indexing, spatial reasoning, temporal tracking, and arbitrary property
   serialization.
 
@@ -235,6 +244,10 @@ performs the corresponding Studio operations, and returns results.
 - **Phase 4B (implemented):** Studio operation for `find_instances` (searches the live
   `workspace` by instance name — case-insensitive substring match — returning a bounded list of
   `{ name, className, path }` matches with a total count and truncation flag).
+- **Phase 4C (implemented):** Studio operation for `inspect_instance` (resolves a full path
+  from `workspace`, validating the path format strictly, and returns the instance's identity,
+  full path, parent path, and an allowlisted safe-property set; `not_found` when the path does
+  not resolve).
 
 See [PLUGIN.md](./PLUGIN.md).
 

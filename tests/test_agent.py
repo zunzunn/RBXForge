@@ -126,7 +126,7 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["create_part", "find_instances", "inspect_hierarchy"], names
+    assert names == ["create_part", "find_instances", "inspect_hierarchy", "inspect_instance"], names
     create_part = defs[0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"

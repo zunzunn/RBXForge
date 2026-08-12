@@ -53,11 +53,16 @@ Agent  ── calls ──►  RBXForge Tool System  ──►  Studio Plugin  �
     `"black"`, `"gray"`
   - `anchored` — optional boolean, default `true`
   - `can_collide` — optional boolean, default `true`
+  - `material` — optional string, default `"Plastic"`, one of:
+    `"Plastic"`, `"SmoothPlastic"`, `"Neon"`, `"Wood"`, `"WoodPlanks"`, `"Metal"`,
+    `"DiamondPlate"`, `"Concrete"`, `"Brick"`, `"Glass"`, `"Granite"`, `"Marble"`,
+    `"Slate"`, `"Sand"`, `"Fabric"`, `"Grass"`, `"Ice"`
 - **Expected output:** `ok: true` with the created part's `{ name, position, size, color,
-  anchored, can_collide }`, or `ok: false` with `error.code` / `error.message`.
+  material, anchored, can_collide }`, or `ok: false` with `error.code` / `error.message`.
 - **Why the agent might use it:** "create a red cube" (prototype for the future, general
   `create_instance` tool). "Anchored"/"CanCollide" control physics: parts are created
-  anchored and collidable by default, matching existing behavior.
+  anchored and collidable by default, matching existing behavior. Unsupported/case-mismatched
+  materials are rejected with `invalid_params` before execution.
 
 The CLI exposes one command, `create_part`, which runs this tool with its fixed test defaults.
 The tool layer is generic: any argument set that passes the input schema can be executed via the

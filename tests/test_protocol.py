@@ -1003,8 +1003,9 @@ def scenario_create_part_success():
 
 def scenario_create_part_physics_round_trip():
     """Phase 5B real protocol round-trip: the create_part request sent over the
-    WebSocket must carry the default ``anchored``/``can_collide`` booleans, and
-    the plugin echo of those properties is accepted end-to-end."""
+    WebSocket must carry the default ``anchored``/``can_collide`` booleans and
+    the default Phase 5C ``material`` ("Plastic"), and the plugin echo of those
+    properties is accepted end-to-end."""
     proc = Proc("--create-part-once", "--port", "0")
     try:
         host, port = proc.listening_addr()
@@ -1019,6 +1020,7 @@ def scenario_create_part_physics_round_trip():
         assert params["name"] == "RBXForgeTestPart", params
         assert params["anchored"] is True, params
         assert params["can_collide"] is True, params
+        assert params["material"] == "Plastic", params
         assert params["color"] == "red", params
 
         send_json(sock, {
@@ -1033,6 +1035,7 @@ def scenario_create_part_physics_round_trip():
                     "position": {"x": 0, "y": 5, "z": 0},
                     "size": {"x": 4, "y": 4, "z": 4},
                     "color": "red",
+                    "material": "Plastic",
                     "anchored": True,
                     "can_collide": True,
                 },
@@ -1042,7 +1045,7 @@ def scenario_create_part_physics_round_trip():
         rc = proc.wait()
         assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
         assert proc.reader.contains("create_part OK"), proc._output()
-        print("OK  create_part physics flags round-trip over the protocol (defaults sent+echoed)")
+        print("OK  create_part physics + material round-trip over the protocol (defaults sent+echoed)")
     finally:
         if proc.proc.poll() is None:
             proc.proc.kill()
@@ -1298,6 +1301,110 @@ def scenario_create_part_physics_validation():
     print("OK  create_part physics: default true, explicit combos, wrong types rejected")
 
 
+def scenario_create_part_material_validation():
+    """Phase 5C: ``material`` is optional, defaults to Plastic, is validated as
+    a strict string enum, and invalid values are rejected before any send."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("create_part")
+
+    expected = [
+        "Plastic",
+        "SmoothPlastic",
+        "Neon",
+        "Wood",
+        "WoodPlanks",
+        "Metal",
+        "DiamondPlate",
+        "Concrete",
+        "Brick",
+        "Glass",
+        "Granite",
+        "Marble",
+        "Slate",
+        "Sand",
+        "Fabric",
+        "Grass",
+        "Ice",
+    ]
+
+    base = {
+        "name": "MatPart",
+        "position": {"x": 0, "y": 1, "z": 0},
+        "size": {"x": 2, "y": 2, "z": 2},
+        "color": "red",
+    }
+
+    # Single source of truth is exactly this enum, mirrored in the schema.
+    assert mod.CREATE_PART_MATERIALS == expected, mod.CREATE_PART_MATERIALS
+    material_prop = tool.input_schema["properties"]["material"]
+    assert material_prop["type"] == "string", material_prop
+    assert material_prop["enum"] == expected, material_prop
+    assert material_prop["default"] == "Plastic", material_prop
+    assert "material" not in tool.input_schema["required"], tool.input_schema["required"]
+    assert mod.CREATE_PART_DEFAULT_PARAMS["material"] == "Plastic", mod.CREATE_PART_DEFAULT_PARAMS
+
+    # Existing calls that omit material remain valid.
+    validated = tool.validate(dict(base))
+    assert "material" not in validated, validated
+
+    # Every supported material validates and can execute through the registry.
+    for material in expected:
+        params = dict(base)
+        params["material"] = material
+        params["anchored"] = False
+        params["can_collide"] = False
+        validated = tool.validate(params)
+        assert validated["material"] == material, validated
+        rbx = FakeRBX({"ok": True, "result": {"name": "MatPart", "material": material}})
+        ok = mod.default_registry().execute(rbx, "create_part", params)
+        assert ok is True, ok
+        assert rbx.requests == [("create_part", params)], rbx.requests
+
+    # Unsupported/case-mismatched spellings are rejected.
+    for material in ("WoodPlank", "plastic", "Plastic ", "Granitee", "NEON"):
+        try:
+            tool.validate(dict(base, material=material))
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_part accepted unsupported material: {0!r}".format(material))
+
+    # Non-string materials are rejected.
+    for material in (42, None, {}, True):
+        try:
+            tool.validate(dict(base, material=material))
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_part accepted non-string material: {0!r}".format(material))
+
+    # Invalid material is rejected before anything is sent.
+    rbx = FakeRBX({"ok": True, "result": {"name": "NeverSent"}})
+    for material in ("plastic", 42, None, {}, True):
+        params = dict(base)
+        params["material"] = material
+        try:
+            mod.default_registry().execute(rbx, "create_part", params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_part sent invalid material: {0!r}".format(material))
+    assert rbx.requests == [], rbx.requests
+
+    # Existing colors and physics flags still validate alongside material.
+    for color in mod.CREATE_PART_COLORS:
+        tool.validate({
+            "name": "CompatibilityPart",
+            "position": {"x": 0, "y": 0, "z": 0},
+            "size": {"x": 1, "y": 1, "z": 1},
+            "color": color,
+            "material": "Neon",
+            "anchored": False,
+            "can_collide": True,
+        })
+    print("OK  create_part material: enum/default/optional + compatibility validation")
+
+
 def scenario_tool_invalid_rejected_before_send():
     """execute_tool must reject invalid params before attempting to send."""
     mod = load_cli_module()
@@ -1529,6 +1636,7 @@ def main():
     scenario_tool_validation()
     scenario_create_part_all_colors()
     scenario_create_part_physics_validation()
+    scenario_create_part_material_validation()
     scenario_tool_invalid_rejected_before_send()
     scenario_inspect_hierarchy_mock_response()
     scenario_inspect_hierarchy_depth_semantics()

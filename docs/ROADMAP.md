@@ -199,6 +199,10 @@ speaks Groq's OpenAI-compatible chat API (`POST {base_url}/chat/completions`), s
 
 ## Phase 5 — Building Systems
 
+> **Status:** In progress. Phase 5A (create_part color enum), Phase 5B
+> (create_part physics flags: `anchored` / `can_collide`), and Phase 5C
+> (create_part material enum with default `"Plastic"`) are **Done**.
+
 **Goal:** Models, structures, and UI.
 
 **Deliverables:**
@@ -280,6 +284,6 @@ estimates are avoided until the system is real and measurable.
 | Phase 2 — Basic Studio Tools | **In progress** |
 | Phase 3 — First Agent Loop | **In progress** (3A provider layer + 3B single-step agent + 3C AI REPL done; bounded multi-step loop delivered in 4D, hosted Groq backend delivered in 4E) |
 | Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`; 4D AI project context / bounded multi-step agent loop done; 4E hosted Groq provider done) |
-| Phase 5 — Building Systems | Not started |
+| Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | Not started |
 | Phase 7 — Autonomous Game Development | Not started |

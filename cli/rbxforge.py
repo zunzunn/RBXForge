@@ -494,6 +494,29 @@ class ToolRegistry:
 
 CREATE_PART_COLORS = ["red", "blue", "green", "yellow", "white", "black", "gray"]
 
+# Single source of truth for the create_part material enum (Phase 5C). The CLI
+# validates this list first and the plugin validates it again; the model-facing
+# schema inherits it automatically through the schema conversion.
+CREATE_PART_MATERIALS = [
+    "Plastic",
+    "SmoothPlastic",
+    "Neon",
+    "Wood",
+    "WoodPlanks",
+    "Metal",
+    "DiamondPlate",
+    "Concrete",
+    "Brick",
+    "Glass",
+    "Granite",
+    "Marble",
+    "Slate",
+    "Sand",
+    "Fabric",
+    "Grass",
+    "Ice",
+]
+
 CREATE_PART_SCHEMA = {
     "type": "object",
     "properties": {
@@ -506,6 +529,10 @@ CREATE_PART_SCHEMA = {
         # create_part calls behave exactly as before.
         "anchored": {"type": "boolean", "default": True},
         "can_collide": {"type": "boolean", "default": True},
+        # Phase 5C: optional material. Omitted it defaults to Plastic (also
+        # applied independently by the plugin); case- and value-mismatches are
+        # rejected by the CLI enum before send.
+        "material": {"type": "string", "enum": CREATE_PART_MATERIALS, "default": "Plastic"},
     },
     "required": ["name", "position", "size", "color"],
 }
@@ -517,6 +544,7 @@ CREATE_PART_DEFAULT_PARAMS = {
     "color": "red",
     "anchored": True,
     "can_collide": True,
+    "material": "Plastic",
 }
 
 

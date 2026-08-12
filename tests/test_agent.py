@@ -146,6 +146,29 @@ def scenario_tool_definitions_sent_to_ai():
     assert create_part["parameters"]["properties"]["can_collide"] == {
         "type": "boolean", "default": True,
     }, create_part
+    assert create_part["parameters"]["properties"]["material"] == {
+        "type": "string",
+        "enum": [
+            "Plastic",
+            "SmoothPlastic",
+            "Neon",
+            "Wood",
+            "WoodPlanks",
+            "Metal",
+            "DiamondPlate",
+            "Concrete",
+            "Brick",
+            "Glass",
+            "Granite",
+            "Marble",
+            "Slate",
+            "Sand",
+            "Fabric",
+            "Grass",
+            "Ice",
+        ],
+        "default": "Plastic",
+    }, create_part
     assert create_part["parameters"]["required"] == ["name", "position", "size", "color"], \
         create_part
     hierarchy = next(d for d in defs if d["name"] == "inspect_hierarchy")

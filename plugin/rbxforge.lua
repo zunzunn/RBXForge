@@ -144,6 +144,29 @@ local PART_COLORS = {
 	gray   = Color3.new(0.5, 0.5, 0.5),
 }
 
+-- Supported create_part materials (Phase 5C). Keep this list aligned with
+-- cli/rbxforge.py CREATE_PART_MATERIALS (the CLI validates first; the plugin
+-- revalidates and maps to Enum.Material).
+local PART_MATERIALS = {
+	Plastic = Enum.Material.Plastic,
+	SmoothPlastic = Enum.Material.SmoothPlastic,
+	Neon = Enum.Material.Neon,
+	Wood = Enum.Material.Wood,
+	WoodPlanks = Enum.Material.WoodPlanks,
+	Metal = Enum.Material.Metal,
+	DiamondPlate = Enum.Material.DiamondPlate,
+	Concrete = Enum.Material.Concrete,
+	Brick = Enum.Material.Brick,
+	Glass = Enum.Material.Glass,
+	Granite = Enum.Material.Granite,
+	Marble = Enum.Material.Marble,
+	Slate = Enum.Material.Slate,
+	Sand = Enum.Material.Sand,
+	Fabric = Enum.Material.Fabric,
+	Grass = Enum.Material.Grass,
+	Ice = Enum.Material.Ice,
+}
+
 local function handleCreatePart(id, params)
 	params = params or {}
 	local name = params.name
@@ -191,11 +214,26 @@ local function handleCreatePart(id, params)
 		})
 	end
 
+	-- Phase 5C: optional material. Omitted inputs default to Plastic; any
+	-- supplied non-string/unsupported/case-mismatched value is rejected.
+	local material = params.material
+	if material == nil then
+		material = "Plastic"
+	end
+	local partMaterial = PART_MATERIALS[material]
+	if type(material) ~= "string" or not partMaterial then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "unsupported material: " .. tostring(material),
+		})
+	end
+
 	local part = Instance.new("Part")
 	part.Name = name
 	part.Position = position
 	part.Size = size
 	part.Color = partColor
+	part.Material = partMaterial
 	part.Anchored = anchored
 	part.CanCollide = canCollide
 
@@ -218,6 +256,7 @@ local function handleCreatePart(id, params)
 		position = { x = position.X, y = position.Y, z = position.Z },
 		size = { x = size.X, y = size.Y, z = size.Z },
 		color = params.color,
+		material = material,
 		anchored = anchored,
 		can_collide = canCollide,
 	})

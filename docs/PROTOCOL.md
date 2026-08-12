@@ -143,6 +143,7 @@ arguments. Always carries a unique `id` that the plugin must echo in its `respon
       "position": { "x": 0, "y": 5, "z": 0 },
       "size": { "x": 4, "y": 4, "z": 4 },
       "color": "red",
+      "material": "Plastic",
       "anchored": true,
       "can_collide": true
     }
@@ -169,6 +170,7 @@ The plugin's reply to a `request`. Echoes the request's `id`. On success
       "position": { "x": 0, "y": 5, "z": 0 },
       "size": { "x": 4, "y": 4, "z": 4 },
       "color": "red",
+      "material": "Plastic",
       "anchored": true,
       "can_collide": true
     }
@@ -195,7 +197,7 @@ Implemented tools and their `params`:
 
 | Tool | Params | Result |
 | --- | --- | --- |
-| `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"`), `anchored` (optional boolean, default `true`), `can_collide` (optional boolean, default `true`) | `{ name, position, size, color, anchored, can_collide }` |
+| `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"`), `anchored` (optional boolean, default `true`), `can_collide` (optional boolean, default `true`), `material` (optional string, default `"Plastic"`, one of `"Plastic"`, `"SmoothPlastic"`, `"Neon"`, `"Wood"`, `"WoodPlanks"`, `"Metal"`, `"DiamondPlate"`, `"Concrete"`, `"Brick"`, `"Glass"`, `"Granite"`, `"Marble"`, `"Slate"`, `"Sand"`, `"Fabric"`, `"Grass"`, `"Ice"`) | `{ name, position, size, color, material, anchored, can_collide }` |
 | `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
 | `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
 | `inspect_instance` | `path` (non-empty string, full path from Workspace) | `{ name, className, path, parent_path, properties }` |
@@ -416,12 +418,15 @@ sent, the CLI **validates the arguments against the tool's input schema**
 and reported to the caller. On the plugin side, incoming `request`s are dispatched through a
 **tool-handler registry** (`plugin/rbxforge.lua` `toolHandlers` / `registerTool`), not a
 hard-coded branch. Implemented tools: `create_part` (creates a Part in `workspace` with the given
-name, position, size, and color), `inspect_hierarchy` (returns a bounded Name/ClassName tree of
-`workspace`, honoring the depth limit and marking truncation), `find_instances` (searches the
+name, position, size, color, optional physics flags, and optional material), `inspect_hierarchy`
+(returns a bounded Name/ClassName tree of `workspace`, honoring the depth limit and marking
+truncation), `find_instances` (searches the
 live `workspace` hierarchy by instance name — case-insensitive substring match — returning a
 bounded list of `{ name, className, path }` matches plus a total count and a truncation flag),
 and `inspect_instance` (resolves one instance by full path and returns its identity, full path,
 parent path, and allowlisted safe properties).
+For `create_part`, unsupported/case-mismatched materials are rejected as `invalid_params` with
+an `unsupported material: <value>` message.
 Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.

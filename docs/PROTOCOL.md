@@ -142,7 +142,9 @@ arguments. Always carries a unique `id` that the plugin must echo in its `respon
       "name": "RBXForgeTestPart",
       "position": { "x": 0, "y": 5, "z": 0 },
       "size": { "x": 4, "y": 4, "z": 4 },
-      "color": "red"
+      "color": "red",
+      "anchored": true,
+      "can_collide": true
     }
   }
 }
@@ -166,7 +168,9 @@ The plugin's reply to a `request`. Echoes the request's `id`. On success
       "name": "RBXForgeTestPart",
       "position": { "x": 0, "y": 5, "z": 0 },
       "size": { "x": 4, "y": 4, "z": 4 },
-      "color": "red"
+      "color": "red",
+      "anchored": true,
+      "can_collide": true
     }
   }
 }
@@ -191,7 +195,7 @@ Implemented tools and their `params`:
 
 | Tool | Params | Result |
 | --- | --- | --- |
-| `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"`) | `{ name, position, size, color }` |
+| `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"`), `anchored` (optional boolean, default `true`), `can_collide` (optional boolean, default `true`) | `{ name, position, size, color, anchored, can_collide }` |
 | `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
 | `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
 | `inspect_instance` | `path` (non-empty string, full path from Workspace) | `{ name, className, path, parent_path, properties }` |

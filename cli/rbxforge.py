@@ -393,8 +393,8 @@ def _validate_value(value, spec, path):
 
     The schema is a small JSON-like object with a ``type`` key. Supported types:
     ``object`` (with ``properties`` and ``required``), ``vec3`` (an object with
-    numeric x, y, z), ``string`` (optionally ``min_length`` / ``enum``), and
-    ``number``.
+    numeric x, y, z), ``string`` (optionally ``min_length`` / ``enum``),
+    ``number``, and ``boolean``.
     """
     kind = spec.get("type")
     if kind == "object":
@@ -432,6 +432,9 @@ def _validate_value(value, spec, path):
             return path + " must be at least {0}".format(spec["minimum"])
         if "maximum" in spec and value > spec["maximum"]:
             return path + " must be at most {0}".format(spec["maximum"])
+    elif kind == "boolean":
+        if not isinstance(value, bool):
+            return path + " must be a boolean"
     else:
         return path + " uses an unsupported schema type: {0!r}".format(kind)
     return None
@@ -498,6 +501,11 @@ CREATE_PART_SCHEMA = {
         "position": {"type": "vec3"},
         "size": {"type": "vec3"},
         "color": {"type": "string", "enum": CREATE_PART_COLORS},
+        # Phase 5B: optional physics flags. Omitted by the model/CLI, they fall
+        # back to the defaults below (also applied by the plugin) so existing
+        # create_part calls behave exactly as before.
+        "anchored": {"type": "boolean", "default": True},
+        "can_collide": {"type": "boolean", "default": True},
     },
     "required": ["name", "position", "size", "color"],
 }
@@ -507,6 +515,8 @@ CREATE_PART_DEFAULT_PARAMS = {
     "position": {"x": 0, "y": 5, "z": 0},
     "size": {"x": 4, "y": 4, "z": 4},
     "color": "red",
+    "anchored": True,
+    "can_collide": True,
 }
 
 

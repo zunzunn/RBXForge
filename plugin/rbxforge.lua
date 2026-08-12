@@ -169,11 +169,35 @@ local function handleCreatePart(id, params)
 		})
 	end
 
+	-- Phase 5B: optional physics flags. Omitted inputs default to true so
+	-- existing create_part calls behave exactly as before; explicit values must
+	-- be booleans (the CLI validates first; the plugin revalidates).
+	local anchored = params.anchored
+	if anchored == nil then
+		anchored = true
+	elseif type(anchored) ~= "boolean" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.anchored must be a boolean, got " .. type(anchored),
+		})
+	end
+	local canCollide = params.can_collide
+	if canCollide == nil then
+		canCollide = true
+	elseif type(canCollide) ~= "boolean" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.can_collide must be a boolean, got " .. type(canCollide),
+		})
+	end
+
 	local part = Instance.new("Part")
 	part.Name = name
 	part.Position = position
 	part.Size = size
 	part.Color = partColor
+	part.Anchored = anchored
+	part.CanCollide = canCollide
 
 	local okParent, parentErr = pcall(function()
 		part.Parent = workspace
@@ -194,6 +218,8 @@ local function handleCreatePart(id, params)
 		position = { x = position.X, y = position.Y, z = position.Z },
 		size = { x = size.X, y = size.Y, z = size.Z },
 		color = params.color,
+		anchored = anchored,
+		can_collide = canCollide,
 	})
 end
 

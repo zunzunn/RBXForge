@@ -137,6 +137,17 @@ def scenario_tool_definitions_sent_to_ai():
         "type": "string",
         "enum": ["red", "blue", "green", "yellow", "white", "black", "gray"],
     }, create_part
+    # Phase 5B physics flags are exposed to the model automatically through the
+    # schema conversion, with their CLI defaults and marked optional (not listed
+    # in `required`).
+    assert create_part["parameters"]["properties"]["anchored"] == {
+        "type": "boolean", "default": True,
+    }, create_part
+    assert create_part["parameters"]["properties"]["can_collide"] == {
+        "type": "boolean", "default": True,
+    }, create_part
+    assert create_part["parameters"]["required"] == ["name", "position", "size", "color"], \
+        create_part
     hierarchy = next(d for d in defs if d["name"] == "inspect_hierarchy")
     assert hierarchy["parameters"]["properties"]["depth"]["type"] == "number"
     assert hierarchy["parameters"]["properties"]["depth"]["minimum"] == 1, hierarchy

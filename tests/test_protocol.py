@@ -1001,6 +1001,53 @@ def scenario_create_part_success():
             proc.proc.kill()
 
 
+def scenario_create_part_physics_round_trip():
+    """Phase 5B real protocol round-trip: the create_part request sent over the
+    WebSocket must carry the default ``anchored``/``can_collide`` booleans, and
+    the plugin echo of those properties is accepted end-to-end."""
+    proc = Proc("--create-part-once", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "create_part", req
+        params = req["payload"]["params"]
+        assert params["name"] == "RBXForgeTestPart", params
+        assert params["anchored"] is True, params
+        assert params["can_collide"] is True, params
+        assert params["color"] == "red", params
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": True,
+                "result": {
+                    "name": "RBXForgeTestPart",
+                    "position": {"x": 0, "y": 5, "z": 0},
+                    "size": {"x": 4, "y": 4, "z": 4},
+                    "color": "red",
+                    "anchored": True,
+                    "can_collide": True,
+                },
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("create_part OK"), proc._output()
+        print("OK  create_part physics flags round-trip over the protocol (defaults sent+echoed)")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
 def scenario_create_part_failure():
     """A failed create_part (plugin replies ok:false) must be reported and
     yield a non-zero exit code."""
@@ -1180,6 +1227,75 @@ def scenario_create_part_all_colors():
         else:
             raise AssertionError("create_part accepted unsupported color: {0!r}".format(color))
     print("OK  create_part accepts all 7 colors and rejects unsupported colors")
+
+
+def scenario_create_part_physics_validation():
+    """Phase 5B: ``anchored`` / ``can_collide`` are optional booleans defaulting
+    to true. The CLI exposes the defaults, keeps existing calls unchanged,
+    accepts every explicit true/false combination, still accepts all 7 colors,
+    and rejects wrong types before anything is sent."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("create_part")
+    base = {
+        "name": "PhysPart",
+        "position": {"x": 0, "y": 1, "z": 0},
+        "size": {"x": 2, "y": 2, "z": 2},
+        "color": "red",
+    }
+
+    # Schema: optional booleans with CLI defaults; not required.
+    assert tool.input_schema["properties"]["anchored"] == {"type": "boolean", "default": True}
+    assert tool.input_schema["properties"]["can_collide"] == {"type": "boolean", "default": True}
+    assert tool.input_schema["required"] == ["name", "position", "size", "color"]
+
+    # CLI defaults keep a freshly created part anchored and collidable by default.
+    asserted_default = mod.CREATE_PART_DEFAULT_PARAMS
+    assert asserted_default["anchored"] is True, asserted_default
+    assert asserted_default["can_collide"] is True, asserted_default
+
+    # Existing calls that omit the physics flags validate and send unchanged
+    # (the plugin applies the defaults on its side).
+    validated = tool.validate(dict(base))
+    assert "anchored" not in validated and "can_collide" not in validated, validated
+
+    # Every explicit combination validates and is executed through the registry
+    # with the exact parameters the caller supplied.
+    combos = [
+        {"anchored": False},
+        {"can_collide": False},
+        {"anchored": False, "can_collide": False},
+        {"anchored": True, "can_collide": True},
+    ]
+    for extra in combos:
+        params = dict(base)
+        params.update(extra)
+        rbx = FakeRBX({"ok": True, "result": {"name": "PhysPart"}})
+        ok = mod.default_registry().execute(rbx, "create_part", params)
+        assert ok is True, ok
+        assert rbx.requests == [("create_part", params)], rbx.requests
+
+    # All 7 colors still pass alongside the physics flags.
+    for color in mod.CREATE_PART_COLORS:
+        params = {"name": "ColorPart", "position": {"x": 0, "y": 0, "z": 0},
+                  "size": {"x": 1, "y": 1, "z": 1}, "color": color,
+                  "anchored": False, "can_collide": False}
+        tool.validate(params)
+
+    # Wrong types are rejected before sending (nothing hits the wire).
+    rbx = FakeRBX({"ok": True})
+    for key in ("anchored", "can_collide"):
+        for bad in ("yes", 1, 0, 2.5, None, [], {}, "false", "true"):
+            params = dict(base)
+            params[key] = bad
+            try:
+                mod.default_registry().execute(rbx, "create_part", params)
+            except mod.InvalidParamsError:
+                pass
+            else:
+                raise AssertionError(
+                    "create_part accepted {0}={1!r}".format(key, bad))
+    assert rbx.requests == [], rbx.requests
+    print("OK  create_part physics: default true, explicit combos, wrong types rejected")
 
 
 def scenario_tool_invalid_rejected_before_send():
@@ -1412,6 +1528,7 @@ def main():
     scenario_tool_registry_metadata()
     scenario_tool_validation()
     scenario_create_part_all_colors()
+    scenario_create_part_physics_validation()
     scenario_tool_invalid_rejected_before_send()
     scenario_inspect_hierarchy_mock_response()
     scenario_inspect_hierarchy_depth_semantics()
@@ -1428,6 +1545,7 @@ def main():
     scenario_disconnect_and_reconnect()
     scenario_errors()
     scenario_create_part_success()
+    scenario_create_part_physics_round_trip()
     scenario_create_part_failure()
     scenario_inspect_hierarchy_roundtrip()
     scenario_find_instances_roundtrip()

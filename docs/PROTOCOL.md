@@ -182,7 +182,7 @@ A failure response:
   "timestamp": 0.0,
   "payload": {
     "ok": false,
-    "error": { "code": "invalid_params", "message": "unsupported color: blue" }
+    "error": { "code": "invalid_params", "message": "unsupported color: purple" }
   }
 }
 ```
@@ -191,7 +191,7 @@ Implemented tools and their `params`:
 
 | Tool | Params | Result |
 | --- | --- | --- |
-| `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; `"red"` supported) | `{ name, position, size, color }` |
+| `create_part` | `name` (string), `position` / `size` (object with numeric `x`, `y`, `z`), `color` (string; one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"`) | `{ name, position, size, color }` |
 | `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
 | `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
 | `inspect_instance` | `path` (non-empty string, full path from Workspace) | `{ name, className, path, parent_path, properties }` |

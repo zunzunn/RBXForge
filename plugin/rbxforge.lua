@@ -131,6 +131,19 @@ local function validateVec3(value, what)
 	return Vector3.new(x, y, z)
 end
 
+-- Supported create_part colors (Phase 5A). The CLI schema validates the same
+-- set first; the plugin re-validates so it can never create a part with a color
+-- it does not know how to render.
+local PART_COLORS = {
+	red    = Color3.new(1, 0, 0),
+	blue   = Color3.new(0, 0, 1),
+	green  = Color3.new(0, 1, 0),
+	yellow = Color3.new(1, 1, 0),
+	white  = Color3.new(1, 1, 1),
+	black  = Color3.new(0, 0, 0),
+	gray   = Color3.new(0.5, 0.5, 0.5),
+}
+
 local function handleCreatePart(id, params)
 	params = params or {}
 	local name = params.name
@@ -148,7 +161,8 @@ local function handleCreatePart(id, params)
 	if not size then
 		return sendResponse(id, false, { code = "invalid_params", message = sizeErr })
 	end
-	if params.color ~= "red" then
+	local partColor = PART_COLORS[params.color]
+	if not partColor then
 		return sendResponse(id, false, {
 			code = "invalid_params",
 			message = "unsupported color: " .. tostring(params.color),
@@ -159,7 +173,7 @@ local function handleCreatePart(id, params)
 	part.Name = name
 	part.Position = position
 	part.Size = size
-	part.Color = Color3.new(1, 0, 0)
+	part.Color = partColor
 
 	local okParent, parentErr = pcall(function()
 		part.Parent = workspace
@@ -179,7 +193,7 @@ local function handleCreatePart(id, params)
 		name = name,
 		position = { x = position.X, y = position.Y, z = position.Z },
 		size = { x = size.X, y = size.Y, z = size.Z },
-		color = "red",
+		color = params.color,
 	})
 end
 

@@ -2,11 +2,14 @@
 
 > **Status:** Partially implemented. Phase 1 (the minimal local connection between the CLI and
 > the Studio plugin) is implemented; the Phase 2 tool layer (`create_part` end-to-end) is
-> implemented; the Phase 3A AI provider layer, the Phase 3B minimal single-step agent, and
-> the Phase 3C interactive AI REPL (plain text → AI → tool call → Studio) are implemented; and
+> implemented; the Phase 3A AI provider layer, the Phase 3B single-step agent, and
+> the Phase 3C interactive AI REPL (plain text → AI → tool call → Studio) are implemented;
 > the Phase 4A basic project inspection (`inspect_hierarchy`), the Phase 4B hierarchy search
-> (`find_instances`), and the Phase 4C single-instance inspection (`inspect_instance`) are
-> implemented. The multi-step agent loop remains planned.
+> (`find_instances`), the Phase 4C single-instance inspection (`inspect_instance`), the
+> **Phase 4D bounded multi-step agent loop** (the model inspects the live project via the
+> inspection tools, results are fed back bounded, and it then acts), and the **Phase 4E Groq
+> provider** (a second real AI backend via Groq's OpenAI-compatible chat API) are implemented.
+> A full verify → fix → report cycle remains planned.
 
 ## Overview
 
@@ -25,7 +28,7 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 └──────────────────────────┘
      ↓
 ┌──────────────────────────┐
-│    AI Provider Layer     │   Ollama (initial) / NVIDIA NIM (optional) / future providers
+│    AI Provider Layer     │   Ollama (initial) / Groq (hosted) / NIM (optional) / future
 └──────────────────────────┘
      ↓
 ┌──────────────────────────┐
@@ -51,21 +54,24 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–4C)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` tools ([TOOLS.md](./TOOLS.md)) |
-| Interactive agent | **Implemented (minimal, Phase 3B)** — single-step `prompt → provider → tool call → execution` in `cli/agent.py`; the full loop is planned |
-| AI provider layer | **Implemented (Phase 3A)** — `cli/providers.py`: provider interface, Ollama + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
-| Agent loop | **Planned** — not implemented |
+| CLI | **Implemented (Phases 1–4D)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` tools ([TOOLS.md](./TOOLS.md)) |
+| Interactive agent | **Implemented (bounded, Phase 3B → 4D)** — `prompt → provider → tool call → ... → action` multi-step loop in `cli/agent.py`: inspection tools feed bounded results back to the model (max 5 tool calls per request); single-step requests preserve the original behavior |
+| AI provider layer | **Implemented (Phase 3A + Phase 4E)** — `cli/providers.py`: provider interface, Ollama + Groq + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
+| Agent loop | **Partially implemented (Phase 4D)** — a bounded multi-step loop (inspect → act) is done; the full understand/plan/verify/fix cycle is planned |
 | Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) live end-to-end (CLI + plugin); more tools planned |
-| Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; indexing/temporal tracking still planned |
+| Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C + Phase 4D)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; the Phase 4D agent loop drives these live before acting; indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
 | Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, and `inspect_instance`, see [PLUGIN.md](./PLUGIN.md) |
 | Verification system | **Planned** — future |
 
 Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), the
-Phase 3A AI provider layer, the Phase 3B minimal single-step agent, the Phase 3C interactive
+Phase 3A AI provider layer, the Phase 3B single-step agent, the Phase 3C interactive
 AI REPL, the Phase 4A basic project inspection (inspect_hierarchy), the Phase 4B hierarchy
-search (find_instances), and the Phase 4C single-instance inspection (inspect_instance). The
-multi-step agent loop and verification system are still planned.
+search (find_instances), the Phase 4C single-instance inspection (inspect_instance), the
+Phase 4D bounded multi-step agent loop (the model inspects the live project, receives bounded
+tool results, and then acts through an action tool), and the Phase 4E Groq provider (hosted
+models via Groq's OpenAI-compatible chat API). A full verification system and a complete
+plan → verify → fix cycle are still planned.
 
 ## Components
 
@@ -96,15 +102,25 @@ The orchestration brain. It receives a user prompt and drives the full loop:
 6. **Fix** if necessary, then **verify again**.
 7. **Report** what changed.
 
-**Phase 3B (implemented, minimal):** `cli/agent.py` provides a single-step slice of this —
+**Phase 3B (implemented, single step):** `cli/agent.py` provides a single-step slice of this —
 `prompt → provider → structured tool call → ToolRegistry execution → result`. It gives the model
 the currently registered tool definitions, parses the model's JSON tool call, and executes it
 through the ToolRegistry only, rejecting unknown tools / invalid arguments safely.
 
 **Phase 3C (implemented):** the interactive REPL feeds `Agent.run` with any non-command input
 (`RBXForge> create a red cube` → AI → tool call → Studio), plus an explicit `ask` command, and
-logs one concise line per run. Multi-step autonomy (planning, verify, fix, loops) is not
-implemented yet.
+logs one concise line per run.
+
+**Phase 4D (implemented, bounded multi-step loop):** `Agent.run` now drives a short loop. The
+model may call the inspection tools (`find_instances` / `inspect_instance` / `inspect_hierarchy`)
+to gather live project context; each successful tool result is appended to the conversation as a
+**bounded, compacted** payload; the model can then call another inspection tool or an action tool
+(`create_part`). The loop stops after an action tool succeeds, on a final model report, on any
+hard rejection (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
+`execution_failed`), or after **5 executed tool calls** (`max_tool_calls`). Every call still goes
+through the `ToolRegistry`; no tool, validation, or plugin/protocol behavior changed. Simple
+requests behave exactly as under Phase 3B. A full plan → verify → fix autonomy is not implemented
+yet.
 
 See [AGENT.md](./AGENT.md) for the full expected behavior.
 
@@ -113,7 +129,10 @@ See [AGENT.md](./AGENT.md) for the full expected behavior.
 An abstraction over the underlying model, so the agent does not care which provider backs it.
 
 - **Initial preferred backend:** Ollama (local models).
-- **Optional backend:** NVIDIA NIM.
+- **Implemented hosted backend:** Groq (`RBXFORGE_PROVIDER=groq`) — Groq's OpenAI-compatible
+  chat API with `RBXFORGE_API_KEY`, same `Provider` interface and JSON-in-text tool calling as
+  Ollama, so the agent loop is unchanged (Phase 4E).
+- **Optional backend:** NVIDIA NIM (recognized placeholder, not implemented).
 - **Future:** additional providers without rewriting the agent.
 
 See [AI.md](./AI.md).
@@ -148,6 +167,10 @@ DONE  DIAGNOSE
 
 The goal is not merely to generate code. The goal is to **make the requested change actually
 work in Roblox Studio**.
+
+**Implemented (Phase 4D):** a bounded slice of this loop — the model inspects the live project
+via the inspection tools, receives bounded tool results, and then acts through an action tool
+(see [AI.md](./AI.md)). The full understand/plan/verify/fix autonomy is still planned.
 
 ### Tool System
 
@@ -198,8 +221,15 @@ systems. Long-term, this uses intelligent project inspection and indexing.
   properties (BasePart/SpawnLocation/Model/GuiObject; see [TOOLS.md](./TOOLS.md)). Non-goals:
   no arbitrary property reflection, no recursive descendant inspection, no caching — each path
   is resolved live.
-- Yet still planned: indexing, spatial reasoning, temporal tracking, and arbitrary property
-  serialization.
+- **Phase 4D (implemented):** the **bounded multi-step agent loop** now puts the inspection tools
+  to work. Before executing an action tool, the agent may call `find_instances` /
+  `inspect_instance` / `inspect_hierarchy` to gather live project context; **bounded, compacted
+  tool results are returned to the model** (capped lists, truncated strings, a hard serialized
+  character budget), and the model then acts. This is the concrete start of "inspect before
+  acting": it works against the live Workspace on every request, is capped at **5 tool calls per
+  request**, and never dumps unbounded hierarchy or property data into the prompt.
+- Yet still planned: indexing, spatial reasoning, temporal tracking, arbitrary property
+  serialization, and persistent / selective project-context loading.
 
 Example:
 
@@ -266,17 +296,23 @@ be built over time. It is not implemented.
 ```
  User prompt
    ↓
- CLI / Agent  ──►  AI Provider (model produces tool calls)
+ CLI / Agent (bounded multi-step loop, Phase 4D)
    ↓
-  Tool system  ──►  request message
-    ↓
-  Local communication (WebSocket, implemented for Phase 1)
+ AI Provider (model produces one JSON object per step: tool call or final report)
+   ↓
+  Tool system (every call validated + executed through the ToolRegistry)
+   ↓
+  request message
+   ↓
+ Local communication (WebSocket, implemented for Phase 1)
    ↓
  Studio plugin executes in Roblox Studio
    ↓
- Response message returns
+ Response message returns (bounded, compacted result fed back to the model)
    ↓
- Agent verifies → fixes if needed → reports
+  …inspection tools gather live context before the action tool…
+   ↓
+ agent reports concisely (AgentResult); full verify/fix/report is planned
 ```
 
 ## Design Principles

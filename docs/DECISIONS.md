@@ -225,6 +225,22 @@
 
 ---
 
+## D-019 — Second AI Backend: Groq (hosted)
+
+- **Decision:** Groq is implemented as a second real AI backend, behind the same provider
+  abstraction as Ollama, selected with `RBXFORGE_PROVIDER=groq`.
+- **Status:** Accepted.
+- **Reason:** Provides a hosted, higher-throughput option alongside local Ollama, exercising the
+  provider abstraction with a real non-Ollama API (Groq's OpenAI-compatible chat endpoint).
+- **Alternatives considered:** Only supporting Ollama; adding other hosted providers first.
+- **Consequences:** Groq uses the same `Provider` interface (`chat`, typed errors) and the
+  same JSON-in-text tool calling as Ollama, so the agent loop is unchanged. Groq needs an API key
+  (`RBXFORGE_API_KEY`, never hard-coded) and an OpenAI-compatible base URL
+  (default `https://api.groq.com/openai/v1`). NVIDIA NIM remains a recognized-but-not-implemented
+  placeholder (D-009).
+
+---
+
 ## Open / Unresolved Decisions
 
 These are not yet decided and must be resolved before (or during) implementation:

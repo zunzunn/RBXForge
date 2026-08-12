@@ -1,7 +1,9 @@
 # RBXForge — Tool System
 
 > **Status:** Four tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
-> find_instances in Phase 4B, inspect_instance in Phase 4C); the rest is conceptual.
+> find_instances in Phase 4B, inspect_instance in Phase 4C); the rest is conceptual. The
+> **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
+> of these inspection tools without adding any new tool.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -18,6 +20,10 @@
 > - **Implemented (Phase 4C):** `inspect_instance` inspects one live instance by its full
 >   path and returns its identity plus a small **allowlisted** set of safe properties. Same
 >   registry/validation/protocol flow.
+> - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
+>   model calls them for live project context, receives **bounded** results back, and then acts
+>   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
+>   (see [AI.md](./AI.md)).
 > - **Planned:** everything else below is conceptual only. **No other tools are implemented.**
 >   Final APIs are deliberately **not invented yet.**
 
@@ -43,7 +49,8 @@ Agent  ── calls ──►  RBXForge Tool System  ──►  Studio Plugin  �
   - `name` — string, at least one character
   - `position` — object with numeric `x`, `y`, `z`
   - `size` — object with numeric `x`, `y`, `z`
-  - `color` — string, one of `"red"`
+  - `color` — string, one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`,
+    `"black"`, `"gray"`
 - **Expected output:** `ok: true` with the created part's `{ name, position, size, color }`,
   or `ok: false` with `error.code` / `error.message`.
 - **Why the agent might use it:** "create a red cube" (prototype for the future, general
@@ -99,7 +106,9 @@ number in `1..50`; anything else is rejected before a request is sent.
     Workspace down, e.g. `"Workspace/Shop/Door"`. Deliberately minimal (Name, ClassName, path
     only — no arbitrary property inspection).
 - **Why the agent might use it:** locating "Town", an existing shop, or a folder to extend
-  before acting; answering "what exists in the project" (Phase 4 goal).
+  before acting; answering "what exists in the project" (Phase 4 goal). The Phase 4D multi-step
+  loop calls this tool for live context before deciding what to do, and feeds the bounded match
+  list back to the model.
 
 The CLI exposes `find_instances <query> [max_results]` as a REPL command (a trailing integer
 token is parsed as `max_results`) and `--find-instances-once --query <text> [--max-results N]`
@@ -137,9 +146,17 @@ as a one-shot flag. The query must be a non-empty string and `max_results` a who
   y:{scale,offset}}` (GuiObject Position/Size); `BrickColor` → `{name, number}` (TeamColor);
   `Instance` → its full path (Model PrimaryPart). Anything else is omitted.
 - **Why the agent might use it:** reading the actual state of a found instance (a part's
-  Anchored/flags, a SpawnLocation's settings) before deciding whether/how to modify it.
+  Anchored/flags, a SpawnLocation's settings) before deciding whether/how to modify it. In the
+  Phase 4D multi-step loop this is the "details of a candidate" step after `find_instances`.
 - **Non-goals:** no reading of arbitrary/sensitive properties, no recursive descendant
   inspection, no caching/indexing (the hierarchy is traversed live per request).
+
+> **Phase 4D note (agent context, not a new tool):** `find_instances`, `inspect_hierarchy`, and
+> `inspect_instance` are the only tools the agent is allowed to use for *gathering context* in
+> the multi-step loop. Their results are run through a bounded compactor before being shown to
+> the model (lists capped, strings truncated, a fixed character budget), so the model never sees
+> unbounded hierarchy/property data. `create_part` is the only current *action* tool; after it
+> reports success the loop stops (see [AI.md](./AI.md)).
 
 The CLI exposes `inspect_instance <path>` as a REPL command and
 `--inspect-instance-once --path <path>` as a one-shot flag. The path must be a non-empty string;
@@ -188,7 +205,8 @@ Each tool is described conceptually by:
 > metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
 > against that schema before sending a `request`. `create_part` (Phase 2B), `inspect_hierarchy`
 > (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) are the implemented
-> tools; the conceptual entries below are still being designed.
+> tools; the Phase 4D agent loop calls exactly these tools (no new tool) and the conceptual
+> entries below are still being designed.
 
 ---
 
@@ -313,7 +331,9 @@ Each tool is described conceptually by:
   arguments into a protocol request/response exchange. Adding a tool later means registering one
   more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A), `find_instances`
   (Phase 4B), and `inspect_instance` (Phase 4C) demonstrate this: each shipped with no protocol
-  changes, only a new client-side `Tool` and a matching plugin-side handler.
+  changes, only a new client-side `Tool` and a matching plugin-side handler. The Phase 4D
+  multi-step agent loop shipped with **no** registry/protocol changes at all — it reuses the four
+  existing tools.
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

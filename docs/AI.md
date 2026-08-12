@@ -1,7 +1,8 @@
 # RBXForge — AI / Provider Architecture
 
-> **Status:** Provider layer + minimal single-step agent implemented; interactive AI REPL wired
-> in (Phases 3A–3C). The multi-step agent loop is not.
+> **Status:** Provider layer + single-step agent + interactive AI REPL implemented
+> (Phases 3A–3C); the **bounded multi-step agent loop with project inspection** is
+> implemented in Phase 4D; a **second real provider (Groq, hosted)** is implemented in Phase 4E.
 >
 > - **Implemented (Phase 3A):** a provider-agnostic chat/inference interface in
 >   `cli/providers.py`, an **Ollama** backend (local HTTP API), a **mock** backend for tests, and
@@ -12,8 +13,17 @@
 >   call → validation + execution through the `ToolRegistry`.
 > - **Implemented (Phase 3C):** the interactive REPL treats ordinary text as an AI prompt —
 >   `RBXForge> create a red cube` reaches Studio via the agent → ToolRegistry → plugin pipeline.
-> - **Not implemented yet:** the multi-step agent loop, conversation history, context management,
->   provider-native tool calling, and project inspection.
+> - **Implemented (Phase 4D):** the agent is now a **bounded multi-step loop**. The model may
+>   call the inspection tools (`find_instances`, `inspect_instance`, `inspect_hierarchy`) to
+>   gather live project context, each tool result is returned to the model (bounded, compacted),
+>   and the model can then act (e.g. `create_part`). The loop is capped at **5 tool calls per
+>   request**, only executes through the existing `ToolRegistry`, and never exposes unbounded
+>   hierarchy/property data to the model.
+> - **Implemented (Phase 4E):** a **Groq** backend (`RBXFORGE_PROVIDER=groq`) using Groq's
+>   OpenAI-compatible chat API — same `chat` interface, same JSON-in-text tool calling, so the
+>   agent loop works unchanged against a hosted model.
+> - **Not implemented yet:** long-form conversation history / context management, provider-native
+>   tool calling, and a full plan → verify → fix loop.
 
 ## Purpose
 
@@ -24,7 +34,7 @@ model.
 ```
 User prompt
    ↓
-Agent  ──►  AI Provider Layer  ──►  Model (Ollama / NIM / future)
+Agent  ──►  AI Provider Layer  ──►  Model (Ollama / Groq / NIM / future)
                 ▲
                 │ model output (tool calls, text)
    Agent uses RBXForge tools
@@ -43,6 +53,10 @@ Agent  ──►  AI Provider Layer  ──►  Model (Ollama / NIM / future)
   names raise `ProviderConfigError`.
 - `ProviderResponseError` / `ProviderConnectionError` / `ProviderTimeoutError` / ... normalize
   failures so callers can retry, degrade, or report regardless of which provider is active.
+- Every HTTP request (Ollama and Groq alike) carries an explicit `RBXForge/0.1.0` User-Agent —
+  hosted providers (Groq's Cloudflare layer) reject Python's default `urllib` User-Agent with
+  `403 code 1010`, so the shared request layer sets one and still merges provided headers
+  (`Content-Type`, `Authorization`, ...) untouched.
 
 ### Initial Preferred Backend: Ollama (local models) — implemented
 
@@ -50,6 +64,25 @@ Agent  ──►  AI Provider Layer  ──►  Model (Ollama / NIM / future)
   URL is `http://127.0.0.1:11434` (no API key needed).
 - Runs models locally. Advantages: privacy, offline use, no per-token cost.
 - Model name is configurable via `RBXFORGE_MODEL` (never hard-coded).
+
+### Optional Backend: Groq (hosted models) — implemented (Phase 4E)
+
+- `GroqProvider` speaks Groq's OpenAI-compatible chat API (`POST {base_url}/chat/completions`);
+  the default base URL is `https://api.groq.com/openai/v1`.
+- Requires an **API key** for the `Authorization: Bearer ...` header — read from
+  `RBXFORGE_API_KEY`, never hard-coded. A missing key raises `ProviderConfigError` up front.
+- Model name is configurable via `RBXFORGE_MODEL` (e.g. `llama-3.3-70b-versatile`); the request
+  body keeps the OpenAI-compatible `{model, messages, stream, ...}` shape, and the reply is read
+  from `choices[0].message.content`, so the agent's JSON-in-text tool calling works unchanged.
+- Same typed errors as every provider (`ProviderTimeoutError`, `ProviderConnectionError`,
+  `ProviderResponseError`, ...) — no raw `urllib` errors leak to callers.
+- **GPT-OSS compatibility (Groq):** Groq defaults `tool_choice` to `none` when no `tools` are
+  sent, so a tool-capable model like GPT-OSS that calls a tool natively is rejected with HTTP
+  400 "Tool choice is none, but model called a tool". When the agent uses Groq it therefore
+  sends the registry's tool definitions as Groq `tools` (with `tool_choice: "auto"`) and the
+  provider normalizes any native `message.tool_calls` back into the JSON-in-text the agent
+  parses (`{"tool", "arguments"}`) — the JSON-in-text agent architecture is unchanged, and
+  Ollama/mock never receive `tools`.
 
 ### Optional Backend: NVIDIA NIM — recognized, not implemented
 
@@ -75,9 +108,9 @@ Agent  ──►  AI Provider Layer  ──►  Model (Ollama / NIM / future)
 
 | Variable            | Meaning                                                      | Default              |
 | ------------------- | ------------------------------------------------------------ | -------------------- |
-| `RBXFORGE_PROVIDER` | Provider name (`ollama`, `nim`, `mock`)                      | `ollama`             |
+| `RBXFORGE_PROVIDER` | Provider name (`ollama`, `groq`, `nim`, `mock`)              | `ollama`             |
 | `RBXFORGE_MODEL`    | Model name/identifier for that provider                      | *(required)*         |
-| `RBXFORGE_BASE_URL` | Endpoint / base URL (e.g. Ollama server)                     | Ollama default URL   |
+| `RBXFORGE_BASE_URL` | Endpoint / base URL (e.g. Ollama server or Groq API)         | Provider default URL (Ollama local, or `https://api.groq.com/openai/v1` for Groq) |
 | `RBXFORGE_API_KEY`  | API key (auth; never hard-coded in code)                     | *(empty)*            |
 | `RBXFORGE_TIMEOUT`  | Request timeout in seconds                                   | `30`                 |
 | `RBXFORGE_MOCK_RESPONSE` | Mock-only: what the mock provider returns verbatim (e.g. `{"tool": "create_part", ...}`) | `""`    |
@@ -119,55 +152,97 @@ Studio plugin           →   concise "[rbxforge] AI OK: called 'create_part' ->
   environment (`agent_from_env`, registry + connection wired to the running RBXForge) and
   reused afterwards.
 
-## Agent / Tool Calling (Implemented — Phase 3B, single step)
+## Agent / Tool Calling (Implemented — Phase 3B + Phase 4D)
 
 > **Implemented (Phase 3B):** `cli/agent.py` connects the provider layer to the Phase 2B tool
-> layer. This is a **minimal single-step** agent — no autonomous loop yet. It performs one
-> `prompt → provider → tool call → execution` pass and returns.
+> layer as a **single-step** pass: `prompt → provider → tool call → execution` then return.
+> **Extended (Phase 4D):** the same `Agent.run(prompt)` now drives a **bounded multi-step loop**
+> with project inspection. Single-step behavior is preserved for simple requests (a model that
+> answers with one `create_part` call executes it once and stops).
 
-The flow (`Agent.run(prompt) -> AgentResult`, all failures returned, never raised):
+The Phase 3B single-step flow (still how each individual tool call is handled):
 
 1. **Give the AI the currently registered tool definitions.** The agent serializes
    `registry.list()` into the system prompt — each tool's `name`, `description`, and
-   `parameters` (its `input_schema`) — and appends the user prompt. The model is instructed to
-   reply with exactly one JSON object: `{"tool": "<name>", "arguments": { ... }}`.
+   `parameters` (its `input_schema`) — and appends the user prompt.
 2. **Provider.** `provider.chat(messages)` is called (Ollama in real use, mock in tests). Any
    `ProviderError` (timeout/connection/response/…) becomes a safe `provider_error` result.
-3. **Parse.** The reply is parsed into a structured tool call (`parse_tool_call`). The parser
-   accepts the JSON object anywhere in the output (including inside a ```json fenced block) and
-   uses the first object found. Malformed output (no JSON, non-object JSON, missing/incorrect
-   `tool`/`arguments`) becomes a safe `malformed_output` result.
+3. **Parse.** The reply is parsed into either a structured tool call
+   (`parse_agent_reply`: `{"tool": ..., "arguments": {...}}`) or a final report
+   (`{"message": "..."}`). Malformed output becomes a safe `malformed_output` result.
 4. **Validate + execute through the `ToolRegistry` only.** `registry.execute(...)` is the sole
    execution path — the same call used by the CLI tool layer. `UnknownToolError` → `unknown_tool`
    result; `InvalidParamsError` → `invalid_arguments` result. Both are rejected before anything
-   is sent to the plugin.
+   is sent to the plugin. A falsy tool result becomes `execution_failed`.
 5. **Result.** `AgentResult` carries `ok`, the parsed `tool`, the tool layer's `output`, an
-   `error` dict (`code`/`message`/`type`), and the raw `provider_text` for diagnostics.
+   `error` dict (`code`/`message`/`type`), the raw `provider_text` for diagnostics, plus (Phase
+   4D) an optional final `message` and an ordered `steps` list of each call's outcome.
 
-- `Agent(provider, registry=..., rbx=..., timeout=...)` — `registry` defaults to the built-in
-  tool registry (`create_part`); `rbx` is the connection object handed to the registry when
-  executing a tool (an `RBXForge` instance in real use, a fake in tests).
-- `agent_from_env()` builds the agent with the provider configured from the environment (defaults
-  to Ollama, see Configuration above).
-- Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet: Phase 3B
-  relies on plain `chat` output parsed as JSON. Normalizing provider-specific tool-call formats
-  behind the provider abstraction is future work.
-- **Explicitly out of scope now (future):** multi-step autonomous loops, conversation history,
-  plan → tool select → execute → verify cycling, and project inspection.
+The Phase 4D multi-step loop:
+
+```
+User prompt
+   ↓
+Agent loop (bounded, max 5 executed tool calls per request)
+   ↓
+model → {"tool": ..., "arguments": ...}
+   ↓
+ToolRegistry.execute  (validation unchanged)   → Studio (plugin) → tool result
+   ↓
+bounded compacted result is appended to the conversation
+   ↓
+model can call find_instances / inspect_instance / inspect_hierarchy again, or act
+   ↓
+action tool (create_part) succeeds  →  loop stops, concise final AgentResult
+```
+
+- The model replies with **one JSON object per step**: a tool call or a final report. The loop
+  continues only while the model keeps choosing inspection tools successfully and the per-request
+  budget remains.
+- **Stopping:** the loop ends on an executed **action tool** (`create_part`), a final model
+  report (`{"message": ...}`), a hard rejection (`unknown_tool` / `invalid_arguments` /
+  `malformed_output` / `provider_error` / `execution_failed`), or the **5-call budget** being
+  exhausted (`max_tool_calls`). It stops rather than guessing when it cannot determine what to do.
+- **Tool results are bounded.** Each result is compacted before being shown to the model
+  (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
+  serialized payload has a hard character budget — unbounded hierarchy/property data is never
+  exposed to the model (see Project Context below).
+- **Every call goes through the existing `ToolRegistry`.** The agent wraps the connection in a
+  small `CapturingRBX` so it can observe each `send_request` response without changing any tool,
+  validation, or protocol behavior.
+- `Agent(provider, registry=..., rbx=..., timeout=..., max_tool_calls=5)` — `max_tool_calls` is
+  the per-request bound. `agent_from_env()` builds the agent with the provider configured from
+  the environment (defaults to Ollama, see Configuration above).
+- Simple prompts behave exactly as under Phase 3B: the first model reply is a `create_part` call,
+  it executes, and the loop returns — one chat call, one tool call.
+- Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet; the loop
+  relies on plain `chat` output parsed as JSON (one object per step). Normalizing
+  provider-specific tool-call formats behind the provider abstraction is future work.
+- **Explicitly out of scope now (future):** long-form conversation history, cross-request memory,
+  a full plan → verify → fix cycle, and generalized search/get tools beyond the current
+  inspection set.
 
 ## Context Management
 
-- Keep the conversation context within practical limits.
+- Keep the conversation context within practical limits (bounded by the per-request tool-call
+  budget and the bounded tool-result compaction in Phase 4D).
 - Trim or summarize older turns when needed.
-- Tool results must be included in context so the model knows what happened.
-- Context handling design is **not** yet defined; this is an open area.
+- Tool results must be included in context so the model knows what happened — Phase 4D appends
+  a compacted, bounded result after every executed inspection/action call.
+- Long-form conversation history / trimming across user requests is **not** yet defined; this is
+  an open area.
 
 ## Project Context
 
-- The agent should load only **relevant** project context where possible (decision D-012).
-- Project inspection/indexing (see [ARCHITECTURE.md](./ARCHITECTURE.md)) feeds context
-  selectively, rather than dumping the entire project into the prompt.
-- This is a long-term, phased capability (Phase 4 in [ROADMAP.md](./ROADMAP.md)).
+- The agent loads only **relevant, live** project context — the Phase 4D loop lets the model call
+  `find_instances` / `inspect_instance` / `inspect_hierarchy` against the current Workspace and
+  acts on the bounded results, rather than dumping the entire project into the prompt
+  (decision D-012 preserved).
+- Every result is compacted before it is shown to the model: cap on list entries, per-string
+  truncation, and a hard serialized-character budget (`MAX_TOOL_RESULT_*` in `cli/agent.py`), so
+  unbounded hierarchy/property data never reaches the model.
+- Indexing / selective pre-loading of persistent project context remains a long-term, phased
+  capability (Phase 4 in [ROADMAP.md](./ROADMAP.md)).
 
 ## Failure Handling (Implemented at the provider + agent layers)
 
@@ -178,11 +253,16 @@ The flow (`Agent.run(prompt) -> AgentResult`, all failures returned, never raise
   - `ProviderTimeoutError` — request exceeded the timeout
   - `ProviderResponseError` — invalid/unexpected response
   - `ProviderNotImplementedError` — recognized but not implemented (currently `nim`)
-- The Phase 3B agent converts provider errors into `provider_error` results, malformed model
+- Groq is implemented (Phase 4E) with its own client over the OpenAI-compatible endpoint; failing
+  requests surface the same typed errors, and responses missing `choices[0].message.content` are
+  rejected as `ProviderResponseError` rather than silently producing empty text.
+- The Phase 3B/4D agent converts provider errors into `provider_error` results, malformed model
   output into `malformed_output` results, and registry rejections into `unknown_tool` /
-  `invalid_arguments` results — none of these crash the caller.
-- The agent loop (diagnose/fix, see [AGENT.md](./AGENT.md)) is **not** implemented yet;
-  Phase 3B stops at one execution pass.
+  `invalid_arguments` results — none of these crash the caller. If the loop cannot determine what
+  to do (e.g. it exhausts the per-request tool-call budget without completing, code
+  `max_tool_calls`), it returns a clear failure instead of guessing.
+- The full agent loop (diagnose/fix/verify cycling, see [AGENT.md](./AGENT.md)) beyond the bounded
+  Phase 4D loop is **not** implemented yet.
 - Exact retry/backoff behavior is not yet defined.
 
 ## Open Questions

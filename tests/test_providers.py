@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Provider-layer tests for the RBXForge AI abstraction (Phase 3A).
+"""Provider-layer tests for the RBXForge AI abstraction (Phase 3A + Phase 4E).
 
 Covers provider selection, environment/configuration, the Ollama HTTP client
-(against a fake in-process Ollama /api/chat server), timeouts/errors, and the
-mock provider. Standard library only.
+(against a fake in-process Ollama /api/chat server), the Groq provider (against
+a fake OpenAI-compatible /chat/completions server), timeouts/errors, response
+parsing, and the mock provider. Standard library only.
 
 Run from the repository root:
     python3 tests/test_providers.py
@@ -37,6 +38,20 @@ def load_providers():
     return _PROVIDERS_MODULE
 
 
+_AGENT_MODULE = None
+AGENT = os.path.join(ROOT, "cli", "agent.py")
+
+
+def load_agent_module():
+    global _AGENT_MODULE
+    if _AGENT_MODULE is None:
+        spec = importlib.util.spec_from_file_location("rbxforge_agent", AGENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _AGENT_MODULE = module
+    return _AGENT_MODULE
+
+
 # --------------------------------------------------------------------------- #
 # A fake Ollama /api/chat server
 # --------------------------------------------------------------------------- #
@@ -45,6 +60,7 @@ def load_providers():
 class FakeOllamaHandler(BaseHTTPRequestHandler):
     mode = "ok"        # ok | error | http500 | sleep
     bodies = []
+    user_agents = []
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -60,6 +76,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         FakeOllamaHandler.bodies.append(self._read_body())
+        FakeOllamaHandler.user_agents.append(self.headers.get("User-Agent"))
         if self.path != "/api/chat":
             self._send(404, {"error": "unexpected path: " + self.path})
         elif self.mode == "error":
@@ -82,6 +99,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
 class FakeOllamaServer:
     def __init__(self, mode="ok"):
         FakeOllamaHandler.bodies = []
+        FakeOllamaHandler.user_agents = []
         FakeOllamaHandler.mode = mode
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
         self.port = self.httpd.server_address[1]
@@ -102,6 +120,111 @@ def free_port():
     port = sock.getsockname()[1]
     sock.close()   # released; used to point at a closed port
     return port
+
+
+# --------------------------------------------------------------------------- #
+# A fake Groq OpenAI-compatible /chat/completions server
+# --------------------------------------------------------------------------- #
+
+
+class FakeGroqHandler(BaseHTTPRequestHandler):
+    mode = "ok"   # ok | error | http500 | sleep | missing_content | empty_choices | nonjson
+    bodies = []
+    auth_headers = []
+    user_agents = []
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _send_json(self, code, obj):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_raw(self, code, text):
+        data = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        FakeGroqHandler.bodies.append(self._read_body())
+        FakeGroqHandler.auth_headers.append(self.headers.get("Authorization"))
+        FakeGroqHandler.user_agents.append(self.headers.get("User-Agent"))
+        if self.path != "/chat/completions":
+            self._send_json(404, {"error": "unexpected path: " + self.path})
+        elif self.mode == "error":
+            self._send_json(200, {"error": "model 'nope' not found"})
+        elif self.mode == "http500":
+            self._send_json(500, {"error": "server exploded"})
+        elif self.mode == "sleep":
+            time.sleep(2.0)
+            self._send_json(200, {
+                "model": "slow",
+                "choices": [{"message": {"role": "assistant", "content": "late reply"}}],
+            })
+        elif self.mode == "gptoss_native_tool":
+            # Reproduces the real GPT-OSS failure mode on Groq: the model emits a
+            # NATIVE OpenAI-style tool call (content empty) instead of the
+            # JSON-in-text the agent asks for.
+            self._send_json(200, {
+                "model": "gpt-oss-120b",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_rbx_1",
+                            "type": "function",
+                            "function": {
+                                "name": "find_instances",
+                                "arguments": '{"query": "SpawnLocation", "max_results": 10}',
+                            },
+                        }],
+                    },
+                }],
+            })
+        elif self.mode == "missing_content":
+            self._send_json(200, {"model": "fake-groq", "choices": [{"message": {}}]})
+        elif self.mode == "empty_choices":
+            self._send_json(200, {"model": "fake-groq", "choices": []})
+        elif self.mode == "nonjson":
+            self._send_raw(200, "this is not json")
+        else:
+            self._send_json(200, {
+                "model": "fake-groq",
+                "choices": [
+                    {"message": {"role": "assistant", "content": "hello from fake groq"}},
+                ],
+            })
+
+    def log_message(self, format, *args):
+        pass
+
+
+class FakeGroqServer:
+    def __init__(self, mode="ok"):
+        FakeGroqHandler.bodies = []
+        FakeGroqHandler.auth_headers = []
+        FakeGroqHandler.user_agents = []
+        FakeGroqHandler.mode = mode
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeGroqHandler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 # --------------------------------------------------------------------------- #
@@ -265,7 +388,10 @@ def scenario_ollama_success():
     assert body["messages"][0] == {"role": "user", "content": "make a red cube"}, body
     assert body["options"]["temperature"] == 0.2, body
     assert body["options"]["num_predict"] == 200, body
-    print("OK  ollama provider success; request body verified")
+    assert FakeOllamaHandler.user_agents == [mod.RBXFORGE_USER_AGENT], \
+        FakeOllamaHandler.user_agents
+    assert mod.RBXFORGE_USER_AGENT == "RBXForge/0.1.0", mod.RBXFORGE_USER_AGENT
+    print("OK  ollama provider success; request body + User-Agent verified")
 
 
 def scenario_ollama_timeout():
@@ -331,6 +457,288 @@ def scenario_ollama_response_errors():
     print("OK  ollama error payload and HTTP error -> ProviderResponseError")
 
 
+def scenario_groq_selection_and_config():
+    """RBXFORGE_PROVIDER=groq must select GroqProvider with the configured
+    model/base_url/api_key/timeout; the key is never hard-coded (missing key is a
+    config error) and the default base URL is Groq's API endpoint."""
+    mod = load_providers()
+    settings = mod.ProviderSettings(
+        provider="groq",
+        model="llama-3.3-70b-versatile",
+        base_url="http://127.0.0.1:9",
+        api_key="sk-test-42",
+        timeout=7,
+    )
+    provider = mod.build_provider(settings)
+    assert isinstance(provider, mod.GroqProvider), provider
+    assert provider.model == "llama-3.3-70b-versatile", provider.model
+    assert provider.base_url == "http://127.0.0.1:9", provider.base_url
+    assert provider.api_key == "sk-test-42", provider.api_key
+    assert provider.timeout == 7.0, provider.timeout
+
+    direct = mod.GroqProvider(model="llama-3.3-70b-versatile", api_key="sk-test-42")
+    assert direct.base_url == mod.GROQ_DEFAULT_BASE_URL, direct.base_url
+    assert mod.GROQ_DEFAULT_BASE_URL == "https://api.groq.com/openai/v1", \
+        mod.GROQ_DEFAULT_BASE_URL
+
+    # Missing api_key -> clear config error (never silently empty / hard-coded).
+    try:
+        mod.GroqProvider(model="llama-3.3-70b-versatile")
+    except mod.ProviderConfigError as exc:
+        assert "API key" in str(exc), exc
+    else:
+        raise AssertionError("groq without API key should raise ProviderConfigError")
+    try:
+        mod.build_provider(mod.ProviderSettings(
+            provider="groq", model="llama-3.3-70b-versatile"
+        ))
+    except mod.ProviderConfigError:
+        pass
+    else:
+        raise AssertionError("build_provider(groq) without API key should raise")
+
+    # The default provider remains ollama; unknown provider message lists groq.
+    defaults = mod.ProviderSettings(model="llama3.1")
+    assert defaults.select_provider() == "ollama", defaults.select_provider()
+    try:
+        mod.build_provider(mod.ProviderSettings(provider="bogus", model="m"))
+    except mod.ProviderConfigError as exc:
+        assert "groq" in str(exc), exc
+    print("OK  Groq provider selection, default base URL, and API-key requirement")
+
+
+def scenario_groq_success():
+    """GroqProvider must POST an OpenAI-compatible /chat/completions body with a
+    Bearer Authorization header and parse choices[0].message.content."""
+    mod = load_providers()
+    with FakeGroqServer(mode="ok") as server:
+        provider = mod.GroqProvider(
+            model="llama-3.3-70b-versatile",
+            base_url="http://127.0.0.1:{0}".format(server.port),
+            api_key="sk-test-42",
+            timeout=5.0,
+        )
+        response = provider.chat(
+            [mod.message("user", "make a red cube")],
+            temperature=0.1,
+            max_tokens=64,
+        )
+    assert response.provider == "groq", response
+    assert response.text == "hello from fake groq", response
+    assert response.model == "fake-groq", response
+    assert len(FakeGroqHandler.bodies) == 1, FakeGroqHandler.bodies
+    body = json.loads(FakeGroqHandler.bodies[0])
+    assert body["model"] == "llama-3.3-70b-versatile", body
+    assert body["stream"] is False, body
+    assert body["messages"] == [{"role": "user", "content": "make a red cube"}], body
+    assert body["temperature"] == 0.1, body
+    assert body["max_tokens"] == 64, body
+    assert FakeGroqHandler.auth_headers == ["Bearer sk-test-42"], \
+        FakeGroqHandler.auth_headers
+    assert FakeGroqHandler.user_agents == [mod.RBXFORGE_USER_AGENT], \
+        FakeGroqHandler.user_agents
+    assert mod.RBXFORGE_USER_AGENT == "RBXForge/0.1.0", mod.RBXFORGE_USER_AGENT
+    print("OK  groq provider success; OpenAI-compatible body + Bearer auth + User-Agent verified")
+
+
+def scenario_groq_timeout():
+    mod = load_providers()
+    with FakeGroqServer(mode="sleep") as server:
+        provider = mod.GroqProvider(
+            model="llama-3.3-70b-versatile",
+            base_url="http://127.0.0.1:{0}".format(server.port),
+            api_key="sk-test-42",
+            timeout=0.3,
+        )
+        try:
+            provider.chat([mod.message("user", "hi")])
+        except mod.ProviderTimeoutError:
+            pass
+        else:
+            raise AssertionError("expected ProviderTimeoutError")
+    print("OK  groq provider times out -> ProviderTimeoutError")
+
+
+def scenario_groq_connection_error():
+    mod = load_providers()
+    provider = mod.GroqProvider(
+        model="llama-3.3-70b-versatile",
+        base_url="http://127.0.0.1:{0}".format(free_port()),
+        api_key="sk-test-42",
+        timeout=0.5,
+    )
+    try:
+        provider.chat([mod.message("user", "hi")])
+    except mod.ProviderConnectionError:
+        pass
+    else:
+        raise AssertionError("expected ProviderConnectionError")
+    print("OK  groq connection refused -> ProviderConnectionError")
+
+
+def scenario_groq_http_and_response_errors():
+    """HTTP-level and response-level errors must surface as ProviderResponseError
+    through the existing typed error hierarchy (no raw urllib errors leak)."""
+    mod = load_providers()
+    with FakeGroqServer(mode="error") as server:
+        provider = mod.GroqProvider(
+            model="llama-3.3-70b-versatile",
+            base_url="http://127.0.0.1:{0}".format(server.port),
+            api_key="sk-test-42",
+            timeout=5.0,
+        )
+        try:
+            provider.chat([mod.message("user", "hi")])
+        except mod.ProviderResponseError:
+            pass
+        else:
+            raise AssertionError("expected ProviderResponseError from error payload")
+
+    with FakeGroqServer(mode="http500") as server:
+        provider = mod.GroqProvider(
+            model="llama-3.3-70b-versatile",
+            base_url="http://127.0.0.1:{0}".format(server.port),
+            api_key="sk-test-42",
+            timeout=5.0,
+        )
+        try:
+            provider.chat([mod.message("user", "hi")])
+        except mod.ProviderResponseError:
+            pass
+        else:
+            raise AssertionError("expected ProviderResponseError from HTTP 500")
+    print("OK  groq error payload and HTTP 500 -> ProviderResponseError")
+
+
+def scenario_groq_response_parsing():
+    """The parser must reject invalid model responses (missing content, empty
+    choices, non-JSON) instead of guessing."""
+    mod = load_providers()
+    server_modes = {
+        "missing_content": "choices[0] has no message.content",
+        "empty_choices": "choices is empty/absent",
+        "nonjson": "non-JSON body",
+    }
+    for mode, label in server_modes.items():
+        with FakeGroqServer(mode=mode) as server:
+            provider = mod.GroqProvider(
+                model="llama-3.3-70b-versatile",
+                base_url="http://127.0.0.1:{0}".format(server.port),
+                api_key="sk-test-42",
+                timeout=5.0,
+            )
+            try:
+                provider.chat([mod.message("user", "hi")])
+            except mod.ProviderResponseError:
+                pass
+            else:
+                raise AssertionError("expected ProviderResponseError for {0}".format(label))
+    print("OK  groq response parsing rejects missing content / empty choices / non-JSON")
+
+
+def scenario_groq_gptoss_native_tool_compat():
+    """Regression: Groq's default `tool_choice` is "none" when no `tools` are
+    sent, so a tool-capable model like GPT-OSS that calls a tool natively is
+    rejected with HTTP 400 "Tool choice is none, but model called a tool".
+
+    The fix must (a) post the real tool definitions with `tool_choice: "auto"`
+    in the request, and (b) translate a native `message.tool_calls` reply back
+    into the JSON-in-text the agent's parse_agent_reply expects - so the
+    JSON-in-text agent architecture is preserved.
+    """
+    mod = load_providers()
+    tool_defs = [
+        {
+            "name": "find_instances",
+            "description": "Search the live Workspace for instances by name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "min_length": 1},
+                    "max_results": {"type": "number", "minimum": 1, "maximum": 100},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "create_part",
+            "description": "Create a Part in workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "color": {"type": "string", "enum": ["red", "blue"]},
+                    "position": {
+                        "type": "object",
+                        "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}},
+                        "required": ["x", "y", "z"],
+                    },
+                    "size": {
+                        "type": "object",
+                        "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}},
+                        "required": ["x", "y", "z"],
+                    },
+                },
+                "required": ["name", "position", "size", "color"],
+            },
+        },
+    ]
+
+    with FakeGroqServer(mode="gptoss_native_tool") as server:
+        provider = mod.GroqProvider(
+            model="gpt-oss-120b",
+            base_url="http://127.0.0.1:{0}".format(server.port),
+            api_key="sk-test-42",
+            timeout=5.0,
+        )
+        response = provider.chat(
+            [mod.message("user", "find SpawnLocation and tell me about it")],
+            tools=tool_defs,
+        )
+
+    # (a) Request configuration: real `tools` + `tool_choice` is "auto" (NOT
+    # the default "none"), so Groq no longer rejects the native call.
+    assert len(FakeGroqHandler.bodies) == 1, FakeGroqHandler.bodies
+    body = json.loads(FakeGroqHandler.bodies[0])
+    assert body["tool_choice"] == "auto", body
+    assert [tool["type"] for tool in body["tools"]] == ["function", "function"], body
+    assert [tool["function"]["name"] for tool in body["tools"]] == \
+        ["find_instances", "create_part"], body["tools"]
+    assert body["tools"][0]["function"]["description"] == tool_defs[0]["description"], \
+        body["tools"][0]
+    assert body["tools"][0]["function"]["parameters"]["required"] == ["query"], \
+        body["tools"][0]
+    assert body["stream"] is False, body
+
+    # (b) The native tool call is normalized to the JSON-in-text the agent
+    # parses ({"tool", "arguments"}), never left as an empty string.
+    assert response.text == ('{"tool": "find_instances", '
+                             '"arguments": {"query": "SpawnLocation", "max_results": 10}}'), \
+        response.text
+
+    # The translated text must be parseable by the agent layer's parser.
+    agent_mod = load_agent_module()
+    call = agent_mod.parse_agent_reply(response.text)
+    assert call.name == "find_instances", call
+    assert call.arguments == {"query": "SpawnLocation", "max_results": 10}, call
+
+    # When a tool-capable model replies with plain content (no native call), the
+    # text passes through unchanged.
+    with FakeGroqServer(mode="ok") as server:
+        provider = mod.GroqProvider(
+            model="gpt-oss-120b",
+            base_url="http://127.0.0.1:{0}".format(server.port),
+            api_key="sk-test-42",
+            timeout=5.0,
+        )
+        response = provider.chat(
+            [mod.message("user", "hello")],
+            tools=tool_defs,
+        )
+    assert response.text == "hello from fake groq", response.text
+    print("OK  groq GPT-OSS: tools + tool_choice=auto sent; native calls normalized to JSON-in-text")
+
+
 def scenario_mock_runtime_env():
     """build_provider must honor RBXFORGE_MOCK_RESPONSE / RBXFORGE_MOCK_FAIL so
     subprocess/REPL tests can drive the mock deterministically."""
@@ -386,6 +794,13 @@ def main():
     scenario_ollama_timeout()
     scenario_ollama_connection_error()
     scenario_ollama_response_errors()
+    scenario_groq_selection_and_config()
+    scenario_groq_success()
+    scenario_groq_timeout()
+    scenario_groq_connection_error()
+    scenario_groq_http_and_response_errors()
+    scenario_groq_response_parsing()
+    scenario_groq_gptoss_native_tool_compat()
     scenario_mock_runtime_env()
     scenario_cli_smoke()
     print("\nAll provider scenarios passed.")

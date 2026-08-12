@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
-"""RBXForge minimal agent - Phase 3B: prompt -> provider -> tool call -> execution.
+"""RBXForge agent - Phase 4D: a bounded multi-step loop with project inspection.
 
 Connects the Phase 3A provider layer (cli/providers.py) to the Phase 2B tool
-layer (cli/rbxforge.py). A single natural-language prompt is sent to a provider
-together with the currently registered tool definitions. The model is expected
-to reply with a structured tool call:
+layer (cli/rbxforge.py). A natural-language prompt is sent to a provider
+together with the currently registered tool definitions. The model drives a
+short, bounded loop:
+
+    prompt -> model -> tool call -> ToolRegistry -> Studio -> result -> model -> ...
+
+The model may call the inspection tools (find_instances, inspect_instance,
+inspect_hierarchy) to gather live project context; each successful inspection
+result is returned to the model as a bounded message, so it can decide the next
+step. It eventually executes an action tool (create_part), at which point the
+loop stops and a concise final AgentResult is returned.
+
+Each step's reply is one JSON object - either a tool call:
 
     {"tool": "<tool name>", "arguments": { ... }}
 
-The call is parsed, validated against the ToolRegistry, and executed through the
-registry only. Unknown tools and invalid arguments are rejected safely instead
-of being executed.
+or a final report (when the model decides no tool call is needed):
 
-Explicitly out of scope for Phase 3B (no multi-step autonomous loops, no
-conversation history, no project inspection, no plugin/protocol changes, no new
-Studio tools). The Studio plugin and WebSocket protocol are untouched.
+    {"message": "<what it did or decided>"}
+
+Every tool call goes through the existing ToolRegistry (validation is
+unchanged); unknown tools and invalid arguments are rejected safely instead of
+being executed. The loop is bounded: at most MAX_TOOL_CALLS executed tool calls
+per request, and only bounded, compacted tool results are ever shown to the
+model (never unbounded hierarchy/property data). Single-step requests keep the
+previous behavior: one model call -> one tool call -> done.
+
+Explicitly out of scope: no new Studio tools, no plugin/protocol changes, no
+arbitrary Lua/code execution, no automatic modification except through the
+registered action tools. The Studio plugin and WebSocket protocol are untouched.
 
 Standard library only; no external dependencies.
 
@@ -52,6 +69,17 @@ class ToolCall:
 
     def __repr__(self):
         return "ToolCall(name={0!r}, arguments={1!r})".format(self.name, self.arguments)
+
+
+class FinalMessage:
+    """A model reply that finishes the task without another tool call:
+    ``{"message": "..."}``."""
+
+    def __init__(self, text):
+        self.text = text
+
+    def __repr__(self):
+        return "FinalMessage(text={0!r})".format(self.text)
 
 
 class ToolCallParseError(Exception):
@@ -121,6 +149,148 @@ def parse_tool_call(text):
     return ToolCall(data["tool"].strip(), arguments)
 
 
+def parse_agent_reply(text):
+    """Parse one model reply from the multi-step loop.
+
+    Accepted shapes (the first JSON object in the text is used):
+
+    - a tool call: ``{"tool": "...", "arguments": {...}}`` -> :class:`ToolCall`
+    - a final report: ``{"message": "..."}`` -> :class:`FinalMessage`
+
+    Raises :class:`ToolCallParseError` for any malformed output (no JSON, a
+    JSON array, a missing or bad ``tool``/``arguments``/``message``, ...).
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ToolCallParseError("model produced no output")
+    obj = _first_json_object(text)
+    if obj is None:
+        raise ToolCallParseError(
+            "model output contains no JSON object: {0!r}".format(text[:200])
+        )
+    try:
+        data = json.loads(obj)
+    except ValueError as exc:
+        raise ToolCallParseError("model output is not valid JSON: {0}".format(exc))
+    if not isinstance(data, dict):
+        raise ToolCallParseError("structured reply must be a JSON object")
+    if "message" in data:
+        if isinstance(data["message"], str) and data["message"].strip():
+            return FinalMessage(data["message"].strip())
+        raise ToolCallParseError("a final 'message' must be a non-empty string")
+    if not isinstance(data.get("tool"), str) or not data["tool"].strip():
+        raise ToolCallParseError(
+            "structured reply must be a tool call (with 'tool' and 'arguments') "
+            "or a final report (with 'message')"
+        )
+    arguments = data.get("arguments")
+    if not isinstance(arguments, dict):
+        raise ToolCallParseError("structured tool call 'arguments' must be an object")
+    return ToolCall(data["tool"].strip(), arguments)
+
+
+# --------------------------------------------------------------------------- #
+# Bounded tool results (Phase 4D)
+# --------------------------------------------------------------------------- #
+
+#: Tool names that change the project. Calling an action tool ends the loop.
+ACTION_TOOLS = frozenset({"create_part"})
+
+#: Hard bound on executed tool calls per user request.
+MAX_TOOL_CALLS = 5
+
+#: Bounds applied to tool results before they are shown to the model.
+MAX_TOOL_RESULT_ITEMS = 20       # cap on list/dict entries (e.g. matches, children)
+MAX_TOOL_RESULT_STRING = 200     # per-string truncation length
+MAX_TOOL_RESULT_CHARS = 2000     # serialized result budget
+
+
+def _compact_value(value, depth=0):
+    """Return a JSON-serializable, size-bounded copy of ``value``.
+
+    Arrays and dict entry lists are capped at :data:`MAX_TOOL_RESULT_ITEMS`,
+    strings at :data:`MAX_TOOL_RESULT_STRING`, and nesting at a fixed depth, so
+    no unbounded hierarchy/property data can reach the model even if the plugin
+    returned more than its own per-tool limits claim.
+    """
+    if depth > 10:
+        return "..."
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) <= MAX_TOOL_RESULT_STRING:
+            return value
+        return value[:MAX_TOOL_RESULT_STRING] + "..."
+    if isinstance(value, list):
+        return [_compact_value(item, depth + 1) for item in value[:MAX_TOOL_RESULT_ITEMS]]
+    if isinstance(value, dict):
+        return {
+            key: _compact_value(item, depth + 1)
+            for key, item in list(value.items())[:MAX_TOOL_RESULT_ITEMS]
+        }
+    return repr(value)[:MAX_TOOL_RESULT_STRING]
+
+
+def compact_tool_result(call, output, response_payload):
+    """Render the bounded tool-result text shown to the model for one call.
+
+    ``response_payload`` is the plugin's ``response`` payload captured from the
+    tool's ``send_request`` (or None when the tool produced no response). The
+    returned text is always bounded by :data:`MAX_TOOL_RESULT_CHARS`.
+    """
+    if response_payload is not None:
+        try:
+            text = json.dumps(_compact_value(response_payload), sort_keys=True)
+        except (TypeError, ValueError):
+            text = repr(output)
+    else:
+        text = repr(output)
+    if len(text) > MAX_TOOL_RESULT_CHARS:
+        suffix = "...\n[result truncated for length]"
+        keep = max(0, MAX_TOOL_RESULT_CHARS - len(suffix))
+        text = text[:keep] + suffix
+    return text
+
+
+def tool_result_message(index, call, output, response_payload):
+    """The message appended after a tool executes, so the next model turn can
+    act on what actually happened in Studio."""
+    return (
+        "Tool call #{0}: {1}\n"
+        "Arguments: {2}\n"
+        "Result: {3}".format(
+            index,
+            call.name,
+            json.dumps(call.arguments, sort_keys=True),
+            compact_tool_result(call, output, response_payload),
+        )
+    )
+
+
+class CapturingRBX:
+    """Wrap the connection handed to the ToolRegistry so tool responses can be
+    captured for the model while the registry and the tool layer are untouched.
+
+    Tools call ``send_request`` and ``log`` exactly as they do on the real
+    connection; the wrapper delegates both and records each ``send_request``
+    response. This is how the agent observes inspection results without changing
+    any tool or validation behavior.
+    """
+
+    def __init__(self, rbx):
+        self._rbx = rbx
+        self.responses = []
+
+    def send_request(self, tool, params, timeout):
+        response = self._rbx.send_request(tool, params, timeout)
+        self.responses.append({"tool": tool, "params": params, "response": response})
+        return response
+
+    def log(self, message):
+        return self._rbx.log(message)
+
+
 # --------------------------------------------------------------------------- #
 # Tool definitions for the model
 # --------------------------------------------------------------------------- #
@@ -181,18 +351,33 @@ def tool_definitions(registry):
 
 
 def build_system_prompt(registry):
-    """Build the system message describing available tools and the required
-    output format."""
+    """Build the system message describing available tools, the multi-step
+    loop, and the reply format."""
     tools_json = json.dumps(tool_definitions(registry))
     return (
-        "You are the RBXForge building agent. You can call exactly one RBXForge tool.\n"
+        "You are the RBXForge building agent. You act in short steps, calling "
+        "RBXForge tools to inspect the project before deciding, then to make "
+        "changes.\n"
         "Available tools:\n"
         + tools_json
         + "\n"
-        "Reply with only a single JSON object selecting a tool and its arguments:\n"
-        '{"tool": "<tool name>", "arguments": { ... }}\n'
-        "'arguments' must satisfy the selected tool's parameters schema exactly; "
-        "every declared property is required.\n"
+        "Reply with exactly one JSON object per step, either:\n"
+        '  - a tool call: {"tool": "<tool name>", "arguments": { ... }}\n'
+        '  - a final report: {"message": "<what you did or decided>"} - only '
+        "when you are finished\n"
+        "Rules:\n"
+        "- Use the inspection tools (find_instances, inspect_instance, "
+        "inspect_hierarchy) to gather live project context first; their results "
+        "are returned to you on the next step.\n"
+        "- find_instances locates instances by name; inspect_instance reads the "
+        "safe properties of one instance by full path.\n"
+        "- create_part changes the project; once a change tool reports success, "
+        "the task is complete - stop, do not call more tools.\n"
+        "- If a request is already simple (e.g. 'create a red cube'), make the "
+        "single tool call you need immediately instead of exploring.\n"
+        "- If you conclude no tool call is needed, reply with a final report.\n"
+        "- 'arguments' must satisfy the selected tool's parameters schema "
+        "exactly.\n"
         "3D vectors (e.g. position, size) are JSON objects of the form "
         '{"x": number, "y": number, "z": number} - never arrays like [0,5,0] '
         'and never strings like "0,5,0".\n'
@@ -210,22 +395,33 @@ def build_system_prompt(registry):
 
 
 class AgentResult:
-    """Outcome of a single :meth:`Agent.run` call.
+    """Outcome of a single :meth:`Agent.run` call (the concise final report).
 
-    - ``ok``: True only when a valid tool call was executed successfully.
-    - ``tool``: the parsed :class:`ToolCall`, or None when it could not be parsed.
-    - ``output``: the raw tool execution result from the tool layer (e.g. bool).
+    - ``ok``: True when the request either completed through an action tool or
+      ended with a final model report.
+    - ``tool``: the last executed :class:`ToolCall`, or None when no tool
+      executed (a final-report completion).
+    - ``output``: the last tool execution result from the tool layer (e.g. bool).
+    - ``message``: a final model report, or None.
+    - ``steps``: ordered record of each parsed tool call and its outcome as
+      ``{"tool", "arguments", "output", "data", "result", "ok"}`` where ``data``
+      is the bounded (compacted) plugin response, ``result`` is the bounded
+      text that was shown to the model, and ``ok`` is False for calls that were
+      rejected or failed before/during execution.
     - ``error``: None, or ``{"code": ..., "message": ...}`` (+ ``type`` for
       provider errors).
-    - ``provider_text``: the raw provider text, for diagnostics.
+    - ``provider_text``: the raw last provider text, for diagnostics.
     """
 
-    def __init__(self, ok, tool=None, output=None, error=None, provider_text=None):
+    def __init__(self, ok, tool=None, output=None, error=None, provider_text=None,
+                 message=None, steps=None):
         self.ok = ok
         self.tool = tool
         self.output = output
         self.error = error
         self.provider_text = provider_text
+        self.message = message
+        self.steps = steps if steps is not None else []
 
     def __repr__(self):
         return "AgentResult(ok={0!r}, error={1!r}, tool={2!r})".format(
@@ -234,96 +430,172 @@ class AgentResult:
 
 
 class Agent:
-    """Minimal single-step agent: prompt -> provider -> tool call -> execution.
+    """Bounded multi-step agent: prompt -> model -> tool call -> execution -> ...
 
-    Phase 3B deliberately performs **one** tool call per prompt and returns. No
-    multi-step loop, no memory, no project inspection.
+    Phase 4D; preserves the Phase 3B single-step behavior for simple requests.
+    The loop is bounded per user request by ``max_tool_calls`` (default 5), and
+    only compacted, bounded tool results are ever returned to the model.
 
     - ``provider``: a Phase 3A ``Provider`` instance (Ollama, mock, ...).
     - ``registry``: the :class:`ToolRegistry` tools are validated and executed
-      through (defaults to the built-in registry with ``create_part``).
+      through (defaults to the built-in registry).
     - ``rbx``: the object handed to the registry when executing a tool - an
       ``RBXForge`` connection in real use, a fake in tests.
     - ``timeout``: per-tool execution timeout in seconds.
+    - ``max_tool_calls``: hard bound on tool calls per request.
     """
 
-    def __init__(self, provider, registry=None, rbx=None, timeout=10.0):
+    def __init__(self, provider, registry=None, rbx=None, timeout=10.0,
+                 max_tool_calls=MAX_TOOL_CALLS):
         self.provider = provider
         self.registry = registry if registry is not None else rbxforge.default_registry()
         self.rbx = rbx if rbx is not None else rbxforge.RBXForge()
         self.timeout = timeout
+        self.max_tool_calls = max_tool_calls
 
     def tool_definitions(self):
         """The currently registered tool definitions sent to the model."""
         return tool_definitions(self.registry)
 
     def run(self, prompt, **chat_options):
-        """Run one prompt through the provider and execute the resulting call.
+        """Run ``prompt`` through the bounded multi-step loop.
 
-        Returns an :class:`AgentResult`. Provider failures, malformed model
-        output, unknown tools, and invalid arguments are all returned as
-        failures (never raised), so this is safe to call from the REPL or CLI.
+        Returns a concise :class:`AgentResult`. Provider failures, malformed
+        model output, unknown tools, invalid arguments, execution failures, and
+        hitting the per-request tool-call budget are all returned as failures
+        (never raised), so this is safe to call from the REPL or CLI.
+
+        Single-step requests behave as before: a model that replies with a
+        ``create_part`` call executes it once and stops.
         """
-        # -- prompt -> provider ------------------------------------------------ #
         messages = [
             providers.message("system", build_system_prompt(self.registry)),
             providers.message("user", prompt),
         ]
-        try:
-            response = self.provider.chat(messages, **chat_options)
-        except providers.ProviderError as exc:
-            return AgentResult(
-                ok=False,
-                error={
-                    "code": "provider_error",
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
-            )
-        text = response.text
+        steps = []
+        last_text = None
+        issued = 0
 
-        # -- provider output -> structured tool call --------------------------- #
-        try:
-            call = parse_tool_call(text)
-        except ToolCallParseError as exc:
-            return AgentResult(
-                ok=False,
-                provider_text=text,
-                error={"code": "malformed_output", "message": str(exc)},
-            )
+        while True:
+            # -- model ------------------------------------------------------- #
+            call_options = dict(chat_options)
+            # Tool-capable providers (Groq, for GPT-OSS compatibility) receive
+            # the registry's tool definitions so they never default tool_choice
+            # to "none" while the prompt describes tools. The agent still only
+            # parses JSON-in-text replies; backend-native tool calls (if any) are
+            # normalized into that text by the provider. Ollama/mock are
+            # unaffected (they do not set `supports_tools`).
+            if getattr(self.provider, "supports_tools", False):
+                call_options["tools"] = self.tool_definitions()
+            try:
+                response = self.provider.chat(messages, **call_options)
+            except providers.ProviderError as exc:
+                return AgentResult(
+                    ok=False,
+                    provider_text=last_text,
+                    steps=steps,
+                    error={
+                        "code": "provider_error",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+            last_text = response.text
 
-        # -- validate + execute through the registry only ---------------------- #
-        try:
-            output = self.registry.execute(self.rbx, call.name, call.arguments, self.timeout)
-        except rbxforge.UnknownToolError as exc:
-            return AgentResult(
-                ok=False,
-                tool=call,
-                provider_text=text,
-                error={"code": "unknown_tool", "message": str(exc)},
+            # -- parse ------------------------------------------------------- #
+            try:
+                reply = parse_agent_reply(last_text)
+            except ToolCallParseError as exc:
+                return AgentResult(
+                    ok=False,
+                    provider_text=last_text,
+                    steps=steps,
+                    error={"code": "malformed_output", "message": str(exc)},
+                )
+
+            if isinstance(reply, FinalMessage):
+                return AgentResult(
+                    ok=True,
+                    provider_text=last_text,
+                    steps=steps,
+                    message=reply.text,
+                )
+            call = reply
+
+            # -- validate + execute through the registry only ---------------- #
+            capturer = CapturingRBX(self.rbx)
+            output = None
+            failure = None
+            try:
+                output = self.registry.execute(capturer, call.name, call.arguments,
+                                               self.timeout)
+            except rbxforge.UnknownToolError as exc:
+                failure = {"code": "unknown_tool", "message": str(exc)}
+            except rbxforge.InvalidParamsError as exc:
+                failure = {"code": "invalid_arguments", "message": str(exc)}
+            if failure is None and not output:
+                failure = {
+                    "code": "execution_failed",
+                    "message": "tool {0!r} did not report success".format(call.name),
+                }
+
+            response_payload = (
+                capturer.responses[-1]["response"] if capturer.responses else None
             )
-        except rbxforge.InvalidParamsError as exc:
-            return AgentResult(
-                ok=False,
-                tool=call,
-                provider_text=text,
-                error={"code": "invalid_arguments", "message": str(exc)},
+            compacted = (
+                _compact_value(response_payload) if response_payload is not None else None
             )
-        if output:
-            return AgentResult(ok=True, tool=call, output=output, provider_text=text)
-        return AgentResult(
-            ok=False,
-            tool=call,
-            output=output,
-            provider_text=text,
-            error={
-                "code": "execution_failed",
-                "message": "tool {0!r} did not report success".format(call.name),
-            },
-        )
+            issued += 1
+            steps.append({
+                "tool": call.name,
+                "arguments": call.arguments,
+                "output": output,
+                "data": compacted,
+                "result": compact_tool_result(call, output, response_payload),
+                "ok": failure is None,
+            })
+
+            if failure is not None:
+                return AgentResult(
+                    ok=False,
+                    tool=call,
+                    output=output,
+                    provider_text=last_text,
+                    steps=steps,
+                    error=failure,
+                )
+            if call.name in ACTION_TOOLS:
+                return AgentResult(
+                    ok=True,
+                    tool=call,
+                    output=output,
+                    provider_text=last_text,
+                    steps=steps,
+                )
+            if issued >= self.max_tool_calls:
+                return AgentResult(
+                    ok=False,
+                    tool=call,
+                    output=output,
+                    provider_text=last_text,
+                    steps=steps,
+                    error={
+                        "code": "max_tool_calls",
+                        "message": "tool call budget exhausted after {0} call(s) "
+                                   "without completing the task".format(
+                                       self.max_tool_calls),
+                    },
+                )
+
+            # -- feed the bounded result back and continue ------------------- #
+            messages.append(providers.message("assistant", last_text))
+            messages.append(providers.message(
+                "user", tool_result_message(issued, call, output, response_payload)
+            ))
 
 
-def agent_from_env(registry=None, rbx=None, timeout=10.0):
+def agent_from_env(registry=None, rbx=None, timeout=10.0,
+                   max_tool_calls=MAX_TOOL_CALLS):
     """Build an :class:`Agent` with the provider configured from the environment
     (see :func:`providers.build_provider`; defaults to Ollama)."""
     return Agent(
@@ -331,6 +603,7 @@ def agent_from_env(registry=None, rbx=None, timeout=10.0):
         registry=registry,
         rbx=rbx,
         timeout=timeout,
+        max_tool_calls=max_tool_calls,
     )
 
 

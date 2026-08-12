@@ -1021,7 +1021,7 @@ def scenario_create_part_failure():
             "timestamp": 0.0,
             "payload": {
                 "ok": False,
-                "error": {"code": "invalid_params", "message": "unsupported color: blue"},
+                "error": {"code": "invalid_params", "message": "unsupported color: purple"},
             },
         })
         sock.close()
@@ -1138,7 +1138,7 @@ def scenario_tool_validation():
             k: v if k != "position" else {"x": 0, "y": 1} for k, v in valid.items()
         }),
         ("position not an object", {k: v if k != "position" else "5,5,5" for k, v in valid.items()}),
-        ("unsupported color", {k: v if k != "color" else "blue" for k, v in valid.items()}),
+        ("unsupported color", {k: v if k != "color" else "purple" for k, v in valid.items()}),
         ("name not a string", {k: v if k != "name" else 42 for k, v in valid.items()}),
         ("params not an object", ["nope"]),
     ]
@@ -1150,6 +1150,36 @@ def scenario_tool_validation():
         else:
             raise AssertionError("create_part accepted invalid params: " + label)
     print("OK  create_part schema rejects invalid arguments (missing/wrong type/value)")
+
+
+def scenario_create_part_all_colors():
+    """create_part must accept exactly the supported colors (Phase 5A) and
+    reject every unsupported color, keeping the enum strict and red as-is."""
+    mod = load_cli_module()
+    valid = dict(mod.CREATE_PART_DEFAULT_PARAMS)
+    tool = mod.default_registry().get("create_part")
+
+    expected = ["red", "blue", "green", "yellow", "white", "black", "gray"]
+    assert mod.CREATE_PART_COLORS == expected, mod.CREATE_PART_COLORS
+    assert tool.input_schema["properties"]["color"]["enum"] == expected, \
+        tool.input_schema["properties"]["color"]
+
+    # Every supported color passes the CLI schema (red unchanged).
+    for color in expected:
+        validated = tool.validate({k: v if k != "color" else color for k, v in valid.items()})
+        assert validated["color"] == color, validated
+
+    # Unsupported colors (and non-string / empty / case-mismatched values) are
+    # rejected before anything is sent.
+    for color in ("purple", "orange", "cyan", "pink", "brown", "magenta", "navy",
+                  "Red", "RED", "", 42, None):
+        try:
+            tool.validate({k: v if k != "color" else color for k, v in valid.items()})
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_part accepted unsupported color: {0!r}".format(color))
+    print("OK  create_part accepts all 7 colors and rejects unsupported colors")
 
 
 def scenario_tool_invalid_rejected_before_send():
@@ -1381,6 +1411,7 @@ def scenario_repl_after_plugin_connect_pty():
 def main():
     scenario_tool_registry_metadata()
     scenario_tool_validation()
+    scenario_create_part_all_colors()
     scenario_tool_invalid_rejected_before_send()
     scenario_inspect_hierarchy_mock_response()
     scenario_inspect_hierarchy_depth_semantics()

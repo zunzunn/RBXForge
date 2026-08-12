@@ -91,12 +91,14 @@ AI agent.
 
 ## Phase 3 — First Agent Loop
 
-> **Status:** In progress. Phase 3A (provider layer), Phase 3B (minimal single-step agent), and
+> **Status:** In progress. Phase 3A (provider layer), Phase 3B (single-step agent), and
 > Phase 3C (interactive AI REPL) are **Done**: a provider-agnostic inference interface
-> (`cli/providers.py`) with Ollama + mock backends and env-based configuration; a minimal agent
+> (`cli/providers.py`) with Ollama + mock backends and env-based configuration; an agent
 > (`cli/agent.py`) that turns one natural-language prompt into a structured tool call executed
 > through the `ToolRegistry`; and a REPL where ordinary text reaches Studio via the agent
-> (see [AI.md](./AI.md)). The multi-step agent loop itself is **not** implemented yet.
+> (see [AI.md](./AI.md)). The multi-step agent loop was delivered in **Phase 4D** (below) as a
+> bounded inspect → act loop, and a hosted **Groq** backend was added in **Phase 4E** (below);
+> a full plan → verify → fix cycle is still future work.
 
 **Goal:** Prompt → tool selection → execution → verification.
 
@@ -142,15 +144,51 @@ error code. Deliberately minimal: strict path validation, **no** arbitrary prope
 **no** recursive descendant inspection, and **no** caching/indexing — each path is resolved
 against the live hierarchy per request.
 
+**Phase 4D (done):** AI project context — the **bounded multi-step agent loop**. The agent can
+inspect the live Roblox project when needed *before* executing a tool:
+
+- The model may call `find_instances` or `inspect_instance` (and `inspect_hierarchy`) to gather
+  context; each successful tool result is returned to the model as a **bounded, compacted**
+  payload (capped lists, truncated strings, a hard serialized-character budget — unbounded
+  hierarchy/property data is never exposed to the model).
+- The loop eventually executes an action tool such as `create_part`, then returns a concise final
+  `AgentResult`.
+- **Safety:** at most **5 tool calls per request** (`max_tool_calls`); every call goes through the
+  existing `ToolRegistry` with validation unchanged; no arbitrary Lua/code execution; no new
+  Studio tools; no automatic modification except through the existing action tools; the loop
+  returns a clear failure (`unknown_tool` / `invalid_arguments` / `execution_failed` /
+  `provider_error` / `malformed_output` / `max_tool_calls`) instead of guessing; single-step
+  requests behave exactly as before.
+- Implemented in `cli/agent.py` only — **no** new tools, **no** plugin/WebSocket protocol
+  changes. Deterministic multi-step tests use the mock provider (no model needed).
+
+**Phase 4E (done):** a second real AI backend — **Groq**. `GroqProvider` in `cli/providers.py`
+speaks Groq's OpenAI-compatible chat API (`POST {base_url}/chat/completions`), selected with
+`RBXFORGE_PROVIDER=groq`:
+
+- Configured via `RBXFORGE_API_KEY` (required; never hard-coded — missing key raises
+  `ProviderConfigError` up front), `RBXFORGE_MODEL`, and `RBXFORGE_BASE_URL` (default
+  `https://api.groq.com/openai/v1`; kept distinct from Ollama's default).
+- Same `Provider` interface, same typed errors, and the same JSON-in-text tool calling as
+  Ollama — the Phase 3B/4D agent and the interactive REPL work unchanged against a hosted model.
+- No API calls to real Groq in tests; a fake in-process `/chat/completions` server covers
+  selection, configuration, success (request body + Bearer auth verified), timeout, connection
+  error, HTTP/error payloads, and response parsing.
+- **No** provider-native tool calling yet (still JSON-in-text); `OllamaProvider` and
+  `MockProvider` are unchanged; **NVIDIA NIM is still not implemented**; no changes to Studio
+  tools, the plugin, or the WebSocket protocol.
+
 **Remaining deliverables:**
 
 - Project inspection tooling (e.g. generalized search by class type / property).
 - Indexing that loads only relevant context into the AI.
 - Behavior that avoids duplicate systems where possible.
+- Full plan → verify → fix cycling (beyond the bounded phase 4D loop).
 
 **Verification criteria:**
 
-- The agent can answer what exists in the project (e.g. find "Town").
+- The agent can answer what exists in the project (e.g. find "Town") — now feasible via the
+  Phase 4D loop's inspection tools.
 - The agent plans changes around existing systems instead of duplicating them.
 
 **Dependencies:** Phase 3.
@@ -240,8 +278,8 @@ estimates are avoided until the system is real and measurable.
 | Phase 0 — Project Definition | **Done** |
 | Phase 1 — Studio Connection | **In progress** |
 | Phase 2 — Basic Studio Tools | **In progress** |
-| Phase 3 — First Agent Loop | **In progress** (3A provider layer + 3B single-step agent + 3C AI REPL done) |
-| Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`) |
+| Phase 3 — First Agent Loop | **In progress** (3A provider layer + 3B single-step agent + 3C AI REPL done; bounded multi-step loop delivered in 4D, hosted Groq backend delivered in 4E) |
+| Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`; 4D AI project context / bounded multi-step agent loop done; 4E hosted Groq provider done) |
 | Phase 5 — Building Systems | Not started |
 | Phase 6 — Gameplay Logic | Not started |
 | Phase 7 — Autonomous Game Development | Not started |

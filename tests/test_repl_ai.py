@@ -98,6 +98,29 @@ def ok_response(id):
     }
 
 
+def find_response(id):
+    """A find_instances plugin response payload the tool reports as success."""
+    return {
+        "type": "response",
+        "id": id,
+        "version": PROTOCOL_VERSION,
+        "timestamp": 0.0,
+        "payload": {
+            "ok": True,
+            "result": {
+                "query": "Baseplate",
+                "max_results": 20,
+                "total": 1,
+                "count": 1,
+                "truncated": False,
+                "matches": [
+                    {"name": "Baseplate", "className": "Part", "path": "Workspace/Baseplate"},
+                ],
+            },
+        },
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Scenarios
 # --------------------------------------------------------------------------- #
@@ -254,7 +277,7 @@ def scenario_unknown_and_invalid_tools_keeps_repl():
 
     invalid = json.dumps({
         "tool": "create_part",
-        "arguments": {"name": "", "position": {"x": 1}, "size": {}, "color": "blue"},
+        "arguments": {"name": "", "position": {"x": 1}, "size": {}, "color": "purple"},
     })
     proc = EnvProc(mock_env(response=invalid), "--port", "0")
     try:
@@ -312,6 +335,45 @@ def scenario_repl_usable_after_plugin_connection():
             proc.proc.kill()
 
 
+def scenario_multistep_loop_through_repl():
+    """A fixed mock response that keeps choosing an inspection tool must drive
+    the bounded multi-step loop through the real protocol: the plugin sees up to
+    5 find_instances requests (each answered and fed back to the model), then the
+    per-request budget is exhausted and a clear failure is logged. This proves
+    the Phase 4D loop works end-to-end (REPL -> agent -> ToolRegistry ->
+    WebSocket -> plugin -> back) without any model."""
+    env = mock_env(response=json.dumps({
+        "tool": "find_instances",
+        "arguments": {"query": "Baseplate"},
+    }))
+    proc = EnvProc(env, "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+        assert proc.reader.wait_for("PLUGIN CONNECTED"), proc._output()
+
+        send_prompt(proc, "explore the project")
+        received = 0
+        while received < 5:
+            req = recv_json(sock)
+            assert req["type"] == "request", req
+            assert req["payload"]["tool"] == "find_instances", req
+            send_json(sock, find_response(req["id"]))
+            received += 1
+        assert received == 5, received
+        assert proc.reader.wait_for("AI failed: max_tool_calls"), proc._output()
+
+        sock.close()
+        rc = proc.quit()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        print("OK  bounded multi-step loop runs through the real protocol (max 5 calls)")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
 def main():
     scenario_natural_language_prompt_creates_part()
     scenario_normal_commands_still_work()
@@ -320,6 +382,7 @@ def main():
     scenario_malformed_ai_output_keeps_repl()
     scenario_unknown_and_invalid_tools_keeps_repl()
     scenario_repl_usable_after_plugin_connection()
+    scenario_multistep_loop_through_repl()
     print("\nAll interactive AI REPL scenarios passed.")
 
 

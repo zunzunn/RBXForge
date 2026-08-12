@@ -14,11 +14,12 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   inspect_instance (Phase 4C) inspects one instance by its full path
   (request/response over the same socket)
 - an interactive AI REPL: ordinary text input is sent to the AI agent
-  (cli/agent.py, Phase 3B), which asks the provider for a structured tool call,
-  validates it against the ToolRegistry, and executes it - a real prompt like
-  "create a red cube" reaches Studio via create_part. Existing commands
-  (ping / status / create_part / help / quit) still work, and 'ask' runs the
-  agent explicitly.
+  (cli/agent.py, Phase 4D), which drives a bounded multi-step loop - the model
+  can call the inspection tools for project context, then an action tool such
+  as create_part - all validated against the ToolRegistry and executed over the
+  same protocol. A real prompt like "create a red cube" reaches Studio via
+  create_part. Existing commands (ping / status / create_part / help / quit)
+  still work, and 'ask' runs the agent explicitly.
 
 Standard library only; no external dependencies.
 
@@ -488,13 +489,15 @@ class ToolRegistry:
         return tool.run(rbx, validated, timeout)
 
 
+CREATE_PART_COLORS = ["red", "blue", "green", "yellow", "white", "black", "gray"]
+
 CREATE_PART_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string", "min_length": 1},
         "position": {"type": "vec3"},
         "size": {"type": "vec3"},
-        "color": {"type": "string", "enum": ["red"]},
+        "color": {"type": "string", "enum": CREATE_PART_COLORS},
     },
     "required": ["name", "position", "size", "color"],
 }
@@ -1001,17 +1004,21 @@ class RBXForge:
         return self.execute_tool("inspect_instance", {"path": path}, timeout)
 
     def ask(self, prompt):
-        """Run one natural-language prompt through the AI agent (Phase 3B/3C).
+        """Run one natural-language prompt through the AI agent (Phase 3B-4D).
 
         The agent (cli/agent.py) uses the environment-configured provider, sends
-        the registered tool definitions along with the prompt, parses the
-        model's structured tool call, and executes it through this instance's
-        ToolRegistry (this RBXForge acts as the connection handed to the tools).
+        the registered tool definitions along with the prompt, and drives a
+        bounded multi-step loop: it may call the inspection tools to gather
+        project context, then an action tool such as create_part, all through
+        this instance's ToolRegistry (this RBXForge acts as the connection
+        handed to the tools). Single-step requests behave exactly as before.
 
-        Provider errors, malformed output, unknown tools, and invalid arguments
-        are condensed into a short "[rbxforge] AI failed: ..." log line; nothing
-        here raises, so the interactive REPL always survives an AI/agent failure.
-        Returns True when a tool call executed successfully, else False.
+        Provider errors, malformed output, unknown tools, invalid arguments,
+        and execution failures are condensed into a short
+        "[rbxforge] AI failed: ..." log line; nothing here raises, so the
+        interactive REPL always survives an AI/agent failure.
+        Returns True when the request completed (an action tool ran, or the
+        model finished with a report), else False.
         """
         agent_mod = _import_agent()
         if agent_mod is None:
@@ -1025,7 +1032,11 @@ class RBXForge:
                 return False
         result = self._agent.run(prompt)
         if result.ok:
-            self.log("AI OK: called {0!r} -> {1!r}".format(result.tool.name, result.output))
+            if result.tool is not None:
+                self.log("AI OK: called {0!r} -> {1!r}".format(result.tool.name, result.output))
+            else:
+                report = (result.message or "").strip()
+                self.log("AI OK: {0}".format(report[:200] if report else "done"))
             return True
         code = (result.error or {}).get("code", "error")
         detail = (result.error or {}).get("message", "unknown error")

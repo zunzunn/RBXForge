@@ -8,12 +8,14 @@ this module provides:
 - a stable ``Provider`` interface (``chat``) that all providers implement
 - ``OllamaProvider`` ... the first implemented backend, using Ollama's local
   HTTP API (``POST {base_url}/api/chat``)
+- ``GroqProvider`` ... a hosted backend using Groq's OpenAI-compatible chat API
+  (``POST {base_url}/chat/completions``) authenticated with an API key
 - ``NimProvider`` ... a recognized-but-not-implemented placeholder so NVIDIA NIM
   stays compatible with the design (decision D-009)
 - ``MockProvider`` ... a deterministic provider for tests and local experiments
 - configuration via environment variables and a ``build_provider`` factory
 
-Standard library only (``urllib`` for the Ollama HTTP client); no external
+Standard library only (``urllib`` for the HTTP clients); no external
 dependencies. No credentials are hard-coded. The model does not execute tools
 yet and nothing here parses natural language into tool calls.
 """
@@ -53,6 +55,12 @@ class ProviderNotImplementedError(ProviderError):
     """Raised when a provider is recognized but not implemented yet."""
 
 
+#: Explicit User-Agent sent with every HTTP request. Hosted providers (e.g. Groq's
+#: Cloudflare layer) block or rate-limit Python's default ``urllib`` User-Agent
+#: (``403 code 1010``); an explicit, recognizable User-Agent avoids that.
+RBXFORGE_USER_AGENT = "RBXForge/0.1.0"
+
+
 # --------------------------------------------------------------------------- #
 # Message / response types
 # --------------------------------------------------------------------------- #
@@ -61,6 +69,35 @@ class ProviderNotImplementedError(ProviderError):
 def message(role, content):
     """Build a chat message dict: ``{"role": ..., "content": ...}``."""
     return {"role": role, "content": content}
+
+
+def _native_tool_calls_to_text(tool_calls):
+    """Translate OpenAI/Groq-native ``message.tool_calls`` into the JSON-in-text
+    the agent's ``parse_agent_reply`` expects (``{"tool", "arguments"}``).
+
+    The agent loop is JSON-in-text by design and is not switched to native tool
+    calling; this provider-side shim lets a tool-capable Groq model such as
+    GPT-OSS call tools natively and still return the text the agent parses. Each
+    tool call becomes one JSON object (newline-joined when several were emitted;
+    the agent uses the first).
+    """
+    objects = []
+    for call in tool_calls or []:
+        function = call.get("function") or {}
+        name = function.get("name")
+        raw_arguments = function.get("arguments") or "{}"
+        try:
+            arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError):
+            arguments = None
+        if not isinstance(arguments, dict):
+            arguments = {"raw": raw_arguments}
+        objects.append({"tool": name, "arguments": arguments})
+    if not objects:
+        return None
+    if len(objects) == 1:
+        return json.dumps(objects[0])
+    return "\n".join(json.dumps(obj) for obj in objects)
 
 
 class ProviderResponse:
@@ -121,15 +158,26 @@ class Provider:
                 "(never hard-code credentials)".format(self.name)
             )
 
-    def _http_json(self, url, body):
+    def _http_json(self, url, body, headers=None):
         """POST ``body`` as JSON to ``url`` and return the decoded JSON response.
 
-        Converts transport failures into the provider error hierarchy.
+        Every request carries an explicit :data:`RBXFORGE_USER_AGENT` (hosted
+        providers block Python's default ``urllib`` User-Agent — see the
+        module constant). ``headers`` (optional) are extra request headers
+        merged over the defaults (e.g. an ``Authorization`` header for hosted
+        providers). Converts transport failures into the provider error
+        hierarchy.
         """
+        merged_headers = {
+            "Content-Type": "application/json",
+            "User-Agent": RBXFORGE_USER_AGENT,
+        }
+        if headers:
+            merged_headers.update(headers)
         request = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=merged_headers,
             method="POST",
         )
         try:
@@ -251,8 +299,128 @@ class NimProvider(Provider):
     def chat(self, messages, **options):
         raise ProviderNotImplementedError(
             "the NVIDIA NIM provider is recognized but not implemented "
-            "(Phase 3A only implements Ollama and mock). "
+            "(Groq and Ollama are implemented). "
             "Set RBXFORGE_PROVIDER=ollama to use a local model."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Groq (hosted, OpenAI-compatible chat API)
+# --------------------------------------------------------------------------- #
+
+GROQ_DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
+
+
+class GroqProvider(Provider):
+    """Groq backend via its OpenAI-compatible ``/chat/completions`` endpoint.
+
+    Configuration:
+      - model: any Groq-hosted chat model (e.g. ``llama-3.3-70b-versatile``)
+      - base_url: defaults to GROQ_DEFAULT_BASE_URL
+      - api_key: required; read from RBXFORGE_API_KEY (never hard-coded here).
+        The key is passed only as the ``Authorization: Bearer ...`` header.
+
+    ``chat`` stays on the plain-text JSON protocol the agent relies on: the
+    request body is the OpenAI-compatible ``{model, messages, stream, ...}``
+    shape and the content is read from ``choices[0].message.content``, so tool
+    definitions and the agent's JSON-in-text parsing are unchanged.
+    """
+
+    name = "groq"
+
+    #: Groq models accept OpenAI-style ``tools`` plus ``tool_choice``. The agent
+    #: stays JSON-in-text; setting this flag makes the agent hand the registry's
+    #: tool definitions to :meth:`chat` so Groq never defaults ``tool_choice`` to
+    #: ``none`` (which turns GPT-OSS-style native tool calls into HTTP 400).
+    supports_tools = True
+
+    def __init__(
+        self,
+        model,
+        base_url=GROQ_DEFAULT_BASE_URL,
+        api_key=None,
+        timeout=30.0,
+    ):
+        super().__init__(
+            model,
+            base_url=(base_url or GROQ_DEFAULT_BASE_URL),
+            api_key=api_key,
+            timeout=timeout,
+        )
+        self._check_api_key()
+
+    def chat(self, messages, temperature=None, max_tokens=None, options=None,
+             tools=None, **extras):
+        extra_option = dict(extras)
+        if temperature is not None:
+            extra_option["temperature"] = temperature
+        if max_tokens is not None:
+            extra_option["max_tokens"] = max_tokens
+        toptions = dict(options or {})
+        toptions.update(extra_option)
+
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+        }
+        # Tool-capable Groq models (e.g. openai/gpt-oss-120b) call tools natively
+        # whenever the prompt describes them. Groq defaults `tool_choice` to
+        # "none" when no `tools` are supplied, so such a generation is rejected
+        # with HTTP 400 "Tool choice is none, but model called a tool" (code
+        # tool_use_failed) - exactly the observed GPT-OSS failure. Supplying the
+        # real definitions with `tool_choice: "auto"` allows the call; native
+        # tool calls are then normalized back into the JSON-in-text the agent
+        # parses (see `_native_tool_calls_to_text`), so the JSON-in-text agent
+        # architecture is unchanged.
+        if tools:
+            if "tool_choice" not in toptions:
+                toptions["tool_choice"] = "auto"
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name"),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters")
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+                for tool in tools
+            ]
+        body.update(toptions)
+
+        data = self._http_json(
+            self.base_url.rstrip("/") + "/chat/completions",
+            body,
+            headers={"Authorization": "Bearer {0}".format(self.api_key)},
+        )
+        if isinstance(data, dict) and data.get("error"):
+            raise ProviderResponseError(
+                "groq error: {0}".format(data["error"])
+            )
+        content = None
+        native_text = None
+        if isinstance(data, dict):
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message") or {}
+                content = message.get("content")
+                if message.get("tool_calls"):
+                    native_text = _native_tool_calls_to_text(message["tool_calls"])
+        # A native tool call takes precedence over any stray content (Groq tends
+        # to leave content empty or whitespace when it calls a tool).
+        if native_text is not None:
+            content = native_text
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderResponseError(
+                "groq response missing usable text; got: {0!r}".format(data)
+            )
+        return ProviderResponse(
+            text=content,
+            model=data.get("model") or self.model,
+            provider=self.name,
+            raw=data,
         )
 
 
@@ -403,6 +571,13 @@ def build_provider(settings=None):
             api_key=settings.api_key,
             timeout=settings.timeout,
         )
+    if name == "groq":
+        return GroqProvider(
+            model=model,
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+            timeout=settings.timeout,
+        )
     if name == "nim":
         return NimProvider(
             model=model,
@@ -422,7 +597,7 @@ def build_provider(settings=None):
             fail=os.environ.get("RBXFORGE_MOCK_FAIL") or None,
         )
     raise ProviderConfigError(
-        "unknown provider: {0!r}. Supported providers: ollama, nim (not "
+        "unknown provider: {0!r}. Supported providers: ollama, groq, nim (not "
         "implemented), mock. Set RBXFORGE_PROVIDER.".format(settings.provider)
     )
 

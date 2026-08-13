@@ -1,11 +1,11 @@
 --!nonstrict
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
--- + Phase 4B (find_instances) + Phase 4C (inspect_instance)
+-- + Phase 4B (find_instances) + Phase 4C (inspect_instance) + Phase 6A (create_script)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and four Studio operations: create_part, inspect_hierarchy, find_instances,
--- and inspect_instance (request/response).
+-- and five Studio operations: create_part, inspect_hierarchy, find_instances,
+-- inspect_instance, and create_script (request/response).
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -624,6 +624,152 @@ local function handleInspectInstance(id, params)
 	})
 end
 
+-- Builds the full Instance path for `instance`, from the top of the DataModel
+-- down (excluding the root itself), e.g. "ServerScriptService/MyScript" or
+-- "Workspace/Shop/Door". Path segments are Names joined with "/". Unlike
+-- buildPath (which stops at Workspace), this covers instances anywhere in the
+-- game hierarchy (services, ReplicatedStorage, StarterPlayer, ...).
+local function buildGamePath(instance)
+	local parts = {}
+	local current = instance
+	while current and current.Parent do
+		table.insert(parts, 1, current.Name)
+		current = current.Parent
+	end
+	return table.concat(parts, "/")
+end
+
+-- Resolves a validated, DataModel-rooted list of segments to the live instance
+-- by walking from the game root with exact child Name lookups (like
+-- resolveSegments, but rooted at game instead of workspace). Returns nil when
+-- any segment does not exist.
+local function resolveGameSegments(segments)
+	local current = game
+	for _, segment in ipairs(segments) do
+		local child = current:FindFirstChild(segment)
+		if not child then
+			return nil
+		end
+		current = child
+	end
+	return current
+end
+
+-- Supported create_script types (Phase 6A) mapped to their Instance class. The
+-- CLI schema validates the same set first; the plugin re-validates so it can
+-- never create a script of a class it does not know how to make.
+local SCRIPT_CLASSES = {
+	Script = "Script",
+	LocalScript = "LocalScript",
+	ModuleScript = "ModuleScript",
+}
+
+-- Per-type default containers used when `parent_path` is omitted. These are
+-- the conventional homes for each script type in a fresh Roblox place.
+local DEFAULT_SCRIPT_PARENTS = {
+	Script = game.ServerScriptService,
+	LocalScript = game.StarterPlayer.StarterPlayerScripts,
+	ModuleScript = game.ReplicatedStorage,
+}
+
+local function handleCreateScript(id, params)
+	params = params or {}
+	local name = params.name
+	if type(name) ~= "string" or name == "" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.name must be a non-empty string",
+		})
+	end
+
+	local scriptType = params.type
+	if scriptType == nil then
+		scriptType = "Script"
+	end
+	local scriptClass = SCRIPT_CLASSES[scriptType]
+	if type(scriptType) ~= "string" or not scriptClass then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "unsupported script type: " .. tostring(scriptType),
+		})
+	end
+
+	local source = params.source
+	if source == nil then
+		source = ""
+	end
+	if type(source) ~= "string" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.source must be a string",
+		})
+	end
+
+	local parent
+	local parentPath = params.parent_path
+	if parentPath ~= nil then
+		if type(parentPath) ~= "string" or parentPath == "" then
+			return sendResponse(id, false, {
+				code = "invalid_params",
+				message = "params.parent_path must be a non-empty string",
+			})
+		end
+		local segments = splitPathSegments(parentPath)
+		for _, segment in ipairs(segments) do
+			if segment == "" then
+				return sendResponse(id, false, {
+					code = "invalid_params",
+					message = "params.parent_path contains an empty segment",
+				})
+			end
+		end
+		local ok, resolved = pcall(resolveGameSegments, segments)
+		if not ok then
+			log("create_script resolve error: " .. tostring(resolved))
+			return sendResponse(id, false, {
+				code = "execution_failed",
+				message = tostring(resolved),
+			})
+		end
+		if not resolved then
+			return sendResponse(id, false, {
+				code = "not_found",
+				message = "parent not found at path: " .. parentPath,
+			})
+		end
+		parent = resolved
+	else
+		parent = DEFAULT_SCRIPT_PARENTS[scriptType]
+	end
+
+	local script = Instance.new(scriptClass)
+	script.Name = name
+	script.Source = source
+
+	local okParent, parentErr = pcall(function()
+		script.Parent = parent
+	end)
+	if not okParent then
+		script:Destroy()
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = "could not parent script: " .. tostring(parentErr),
+		})
+	end
+
+	log(string.format(
+		"created %s %s in %s (%d chars of source)",
+		scriptType, name, buildGamePath(parent), #source
+	))
+	return sendResponse(id, true, {
+		name = name,
+		type = scriptType,
+		parent_path = buildGamePath(parent),
+		path = buildGamePath(script),
+		source_length = #source,
+	})
+end
+
 -- Tool handler registry: incoming request messages are dispatched through this
 -- table rather than hard-coded branches. Each handler is registered by name with
 -- registerTool(); handleRequest looks the tool up here.
@@ -639,6 +785,7 @@ end
 
 -- Registered tool handlers (dispatch happens in handleRequest).
 registerTool("create_part", handleCreatePart)
+registerTool("create_script", handleCreateScript)
 registerTool("inspect_hierarchy", handleInspectHierarchy)
 registerTool("find_instances", handleFindInstances)
 registerTool("inspect_instance", handleInspectInstance)

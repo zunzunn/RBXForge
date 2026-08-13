@@ -11,8 +11,8 @@ short, bounded loop:
 The model may call the inspection tools (find_instances, inspect_instance,
 inspect_hierarchy) to gather live project context; each successful inspection
 result is returned to the model as a bounded message, so it can decide the next
-step. It eventually executes an action tool (create_part), at which point the
-loop stops and a concise final AgentResult is returned.
+step. It eventually executes an action tool (create_part, create_script), at
+which point the loop stops and a concise final AgentResult is returned.
 
 Each step's reply is one JSON object - either a tool call:
 
@@ -193,7 +193,7 @@ def parse_agent_reply(text):
 # --------------------------------------------------------------------------- #
 
 #: Tool names that change the project. Calling an action tool ends the loop.
-ACTION_TOOLS = frozenset({"create_part"})
+ACTION_TOOLS = frozenset({"create_part", "create_script"})
 
 #: Hard bound on executed tool calls per user request.
 MAX_TOOL_CALLS = 5
@@ -371,8 +371,8 @@ def build_system_prompt(registry):
         "are returned to you on the next step.\n"
         "- find_instances locates instances by name; inspect_instance reads the "
         "safe properties of one instance by full path.\n"
-        "- create_part changes the project; once a change tool reports success, "
-        "the task is complete - stop, do not call more tools.\n"
+        "- create_part and create_script change the project; once a change tool "
+        "reports success, the task is complete - stop, do not call more tools.\n"
         "- If a request is already simple (e.g. 'create a red cube'), make the "
         "single tool call you need immediately instead of exploring.\n"
         "- If you conclude no tool call is needed, reply with a final report.\n"

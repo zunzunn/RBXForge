@@ -1085,6 +1085,110 @@ def scenario_create_part_failure():
             proc.proc.kill()
 
 
+def scenario_create_script_success():
+    """--create-script-once must wait for the plugin, send a create_script
+    request with the fixed test parameters, accept a success response, and
+    exit 0."""
+    proc = Proc("--create-script-once", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "create_script", req
+        assert req["payload"]["params"]["name"] == "RBXForgeTestScript", req
+        assert req["payload"]["params"]["type"] == "Script", req
+        assert req["payload"]["params"]["parent_path"] == "ServerScriptService", req
+        assert req["payload"]["params"]["source"] == 'print("Hello from RBXForge")\n', req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": True,
+                "result": {
+                    "name": "RBXForgeTestScript",
+                    "type": "Script",
+                    "parent_path": "ServerScriptService",
+                    "path": "ServerScriptService/RBXForgeTestScript",
+                    "source_length": 28,
+                },
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("create_script OK"), proc._output()
+        print("OK  create_script request sent; success response handled; clean exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_create_script_failure():
+    """A failed create_script (plugin replies ok:false) must be reported and
+    yield a non-zero exit code."""
+    proc = Proc("--create-script-once", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "create_script", req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": False,
+                "error": {"code": "not_found", "message": "parent not found at path: ServerScriptService"},
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 4, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("create_script FAILED"), proc._output()
+        assert proc.reader.contains("not_found"), proc._output()
+        print("OK  create_script failure response reported; non-zero exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_interactive_create_script_registered():
+    """The interactive REPL must recognize the 'create_script' command.
+
+    Mirror of scenario_interactive_create_part_registered: the command must be
+    dispatched (to the no-connection path) rather than rejected as unknown.
+    """
+    proc = Proc("--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        assert proc.reader.wait_for("Type 'help'"), proc._output()
+
+        proc.proc.stdin.write(b"create_script\n")
+        proc.proc.stdin.flush()
+        proc.reader.wait_for("cannot execute create_script")
+        assert not proc.reader.contains("unknown command"), proc._output()
+
+        rc = proc.quit()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        print("OK  interactive REPL recognizes create_script (not 'unknown command')")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
 def scenario_interactive_create_part_registered():
     """The interactive REPL must recognize the 'create_part' command.
 
@@ -1113,13 +1217,14 @@ def scenario_interactive_create_part_registered():
 
 
 def scenario_tool_registry_metadata():
-    """The tool registry must expose create_part, find_instances,
+    """The tool registry must expose create_part, create_script, find_instances,
     inspect_hierarchy, and inspect_instance with name/description/schema."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
-        "create_part", "find_instances", "inspect_hierarchy", "inspect_instance",
+        "create_part", "create_script", "find_instances", "inspect_hierarchy",
+        "inspect_instance",
     ], tools
 
     tool = registry.get("create_part")
@@ -1129,6 +1234,21 @@ def scenario_tool_registry_metadata():
     assert tool.input_schema["type"] == "object"
     assert "name" in tool.input_schema["properties"]
     assert set(tool.input_schema["required"]) == {"name", "position", "size", "color"}
+
+    script = registry.get("create_script")
+    assert script is not None
+    assert isinstance(script.description, str) and script.description
+    assert script.input_schema["type"] == "object"
+    assert set(script.input_schema["required"]) == {"name"}
+    name_prop = script.input_schema["properties"]["name"]
+    assert name_prop == {"type": "string", "min_length": 1}
+    type_prop = script.input_schema["properties"]["type"]
+    assert type_prop == {"type": "string", "enum": mod.CREATE_SCRIPT_TYPES, "default": "Script"}
+    assert mod.CREATE_SCRIPT_TYPES == ["Script", "LocalScript", "ModuleScript"]
+    parent_prop = script.input_schema["properties"]["parent_path"]
+    assert parent_prop == {"type": "string", "min_length": 1}
+    source_prop = script.input_schema["properties"]["source"]
+    assert source_prop == {"type": "string", "default": ""}
 
     hierarchy = registry.get("inspect_hierarchy")
     assert hierarchy is not None
@@ -1162,8 +1282,8 @@ def scenario_tool_registry_metadata():
     assert path_prop["type"] == "string"
     assert path_prop["min_length"] == 1
     assert set(inspector.input_schema["required"]) == {"path"}
-    print("OK  registry registers create_part, find_instances, inspect_hierarchy, "
-          "and inspect_instance with metadata")
+    print("OK  registry registers create_part, create_script, find_instances, "
+          "inspect_hierarchy, and inspect_instance with metadata")
 
 
 def scenario_tool_validation():
@@ -1405,6 +1525,70 @@ def scenario_create_part_material_validation():
     print("OK  create_part material: enum/default/optional + compatibility validation")
 
 
+def scenario_create_script_validation():
+    """create_script must validate name/type/parent_path/source against its
+    schema, apply the CLI defaults, and never send invalid arguments."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("create_script")
+    valid = dict(mod.CREATE_SCRIPT_DEFAULT_PARAMS)
+
+    # Schema: name required; type/parent_path/source optional with defaults.
+    assert tool.input_schema["required"] == ["name"]
+    assert tool.input_schema["properties"]["type"] == {
+        "type": "string", "enum": ["Script", "LocalScript", "ModuleScript"], "default": "Script",
+    }
+    assert tool.input_schema["properties"]["source"] == {"type": "string", "default": ""}
+    assert mod.CREATE_SCRIPT_DEFAULT_PARAMS["type"] == "Script"
+    assert mod.CREATE_SCRIPT_DEFAULT_PARAMS["parent_path"] == "ServerScriptService"
+
+    # The happy path (fixed test params, plus a variation) validates.
+    tool.validate(valid)
+    tool.validate({
+        "name": "MyModule",
+        "type": "ModuleScript",
+        "parent_path": "ReplicatedStorage.Gameplay",
+        "source": 'local x = 1',
+    })
+
+    invalid_cases = [
+        ("missing required property", {}),
+        ("empty name", {k: v if k != "name" else "" for k, v in valid.items()}),
+        ("name not a string", {k: v if k != "name" else 42 for k, v in valid.items()}),
+        ("unsupported type", {k: v if k != "type" else "RemoteScript" for k, v in valid.items()}),
+        ("type case mismatch", {k: v if k != "type" else "script" for k, v in valid.items()}),
+        ("type not a string", {k: v if k != "type" else 7 for k, v in valid.items()}),
+        ("empty parent_path", {k: v if k != "parent_path" else "" for k, v in valid.items()}),
+        ("parent_path not a string", {k: v if k != "parent_path" else 1 for k, v in valid.items()}),
+        ("source not a string", {k: v if k != "source" else ["print()"] for k, v in valid.items()}),
+        ("params not an object", "nope"),
+    ]
+    for label, bad_params in invalid_cases:
+        try:
+            tool.validate(bad_params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_script accepted invalid params: " + label)
+
+    # Invalid arguments are rejected before anything is sent.
+    rbx = FakeRBX({"ok": True, "result": {"name": "NeverSent"}})
+    for bad_params in ({"name": ""}, {"name": "X", "type": "CoreScript"},
+                       {"name": "X", "parent_path": ""}):
+        try:
+            mod.default_registry().execute(rbx, "create_script", bad_params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("create_script sent invalid params: {0!r}".format(bad_params))
+    assert rbx.requests == [], rbx.requests
+
+    # A valid default call sends exactly the fixed params.
+    ok = mod.default_registry().execute(rbx, "create_script", valid)
+    assert ok is True, ok
+    assert rbx.requests == [("create_script", valid)], rbx.requests
+    print("OK  create_script schema: required name + enum/defaults + validation")
+
+
 def scenario_tool_invalid_rejected_before_send():
     """execute_tool must reject invalid params before attempting to send."""
     mod = load_cli_module()
@@ -1637,6 +1821,7 @@ def main():
     scenario_create_part_all_colors()
     scenario_create_part_physics_validation()
     scenario_create_part_material_validation()
+    scenario_create_script_validation()
     scenario_tool_invalid_rejected_before_send()
     scenario_inspect_hierarchy_mock_response()
     scenario_inspect_hierarchy_depth_semantics()
@@ -1655,6 +1840,8 @@ def main():
     scenario_create_part_success()
     scenario_create_part_physics_round_trip()
     scenario_create_part_failure()
+    scenario_create_script_success()
+    scenario_create_script_failure()
     scenario_inspect_hierarchy_roundtrip()
     scenario_find_instances_roundtrip()
     scenario_find_instances_roundtrip_truncated()
@@ -1662,6 +1849,7 @@ def main():
     scenario_inspect_instance_roundtrip()
     scenario_inspect_instance_not_found()
     scenario_interactive_create_part_registered()
+    scenario_interactive_create_script_registered()
     scenario_repl_run_after_connection()
     scenario_repl_after_plugin_connect_pty()
     print("\nAll protocol scenarios passed.")

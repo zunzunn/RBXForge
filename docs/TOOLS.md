@@ -298,6 +298,14 @@ Each tool is described conceptually by:
 - **Inputs (conceptual):** Script type, name, parent, source content.
 - **Expected output:** Success/failure plus the script's reference.
 - **Why the agent might use it:** Adding gameplay logic (Phase 6).
+- **Implemented (Phase 6A):** `name` (required non-empty string), `type` (optional, one of
+  `"Script"`, `"LocalScript"`, `"ModuleScript"`, default `"Script"`), `parent_path` (optional
+  game-rooted path, e.g. `"ServerScriptService.Scripts"`; when omitted the plugin uses the
+  per-type default container: `ServerScriptService` for Script, `StarterPlayer.StarterPlayerScripts`
+  for LocalScript, `ReplicatedStorage` for ModuleScript), and `source` (optional Luau source,
+  default empty). Result: `{ name, type, parent_path, path, source_length }`. The CLI validates
+  `name`/`type`/`source` first and the plugin re-validates and resolves the parent; an unresolvable
+  `parent_path` returns `not_found`.
 
 ### modify_script
 
@@ -334,14 +342,14 @@ Each tool is described conceptually by:
 ## Design Notes
 
 - The list above is **conceptual**. Exact names, arguments, and schemas are open questions.
-- **Implemented registry (Phase 2B/4A/4B/4C):** the CLI keeps a `ToolRegistry` keyed by tool name;
+- **Implemented registry (Phase 2B/4A/4B/4C/6A):** the CLI keeps a `ToolRegistry` keyed by tool name;
   each `Tool` carries `name`, `description`, and `input_schema` and knows how to turn validated
   arguments into a protocol request/response exchange. Adding a tool later means registering one
   more `Tool` — no protocol changes required. `inspect_hierarchy` (Phase 4A), `find_instances`
-  (Phase 4B), and `inspect_instance` (Phase 4C) demonstrate this: each shipped with no protocol
-  changes, only a new client-side `Tool` and a matching plugin-side handler. The Phase 4D
-  multi-step agent loop shipped with **no** registry/protocol changes at all — it reuses the four
-  existing tools.
+  (Phase 4B), `inspect_instance` (Phase 4C), and `create_script` (Phase 6A) demonstrate this: each
+  shipped with no protocol changes, only a new client-side `Tool` and a matching plugin-side handler.
+  The Phase 4D multi-step agent loop shipped with **no** registry/protocol changes at all — it
+  reuses the existing tools.
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

@@ -99,6 +99,29 @@ def ok_part_response():
     }
 
 
+def valid_script_arguments():
+    return {
+        "name": "AgentScript",
+        "type": "Script",
+        "parent_path": "ServerScriptService",
+        "source": 'print("hi")\n',
+    }
+
+
+def ok_script_response():
+    """A plugin 'ok:true' response for create_script (matches the tool's expect)."""
+    return {
+        "ok": True,
+        "result": {
+            "name": "AgentScript",
+            "type": "Script",
+            "parent_path": "ServerScriptService",
+            "path": "ServerScriptService/AgentScript",
+            "source_length": 13,
+        },
+    }
+
+
 def valid_part_arguments():
     return {
         "name": "AgentCube",
@@ -126,7 +149,8 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["create_part", "find_instances", "inspect_hierarchy", "inspect_instance"], names
+    assert names == ["create_part", "create_script", "find_instances",
+                     "inspect_hierarchy", "inspect_instance"], names
     create_part = defs[0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"
@@ -171,6 +195,19 @@ def scenario_tool_definitions_sent_to_ai():
     }, create_part
     assert create_part["parameters"]["required"] == ["name", "position", "size", "color"], \
         create_part
+    create_script = defs[1]
+    assert isinstance(create_script["description"], str) and create_script["description"]
+    assert create_script["parameters"]["type"] == "object"
+    assert create_script["parameters"]["required"] == ["name"], create_script
+    assert create_script["parameters"]["properties"]["type"] == {
+        "type": "string",
+        "enum": ["Script", "LocalScript", "ModuleScript"],
+        "default": "Script",
+    }, create_script
+    assert create_script["parameters"]["properties"]["source"] == {
+        "type": "string", "default": "",
+    }, create_script
+
     hierarchy = next(d for d in defs if d["name"] == "inspect_hierarchy")
     assert hierarchy["parameters"]["properties"]["depth"]["type"] == "number"
     assert hierarchy["parameters"]["properties"]["depth"]["minimum"] == 1, hierarchy
@@ -187,6 +224,7 @@ def scenario_tool_definitions_sent_to_ai():
     assert messages is not None
     assert messages[0]["role"] == "system"
     assert "create_part" in messages[0]["content"], messages[0]
+    assert "create_script" in messages[0]["content"], messages[0]
     assert '"parameters"' in messages[0]["content"], messages[0]
     assert '"tool"' in messages[0]["content"], messages[0]
     assert messages[1] == {"role": "user", "content": "create a red cube"}
@@ -491,6 +529,10 @@ def part_call():
     return json.dumps({"tool": "create_part", "arguments": valid_part_arguments()})
 
 
+def script_call():
+    return json.dumps({"tool": "create_script", "arguments": valid_script_arguments()})
+
+
 # --------------------------------------------------------------------------- #
 # Phase 4D: bounded multi-step loop scenarios
 # --------------------------------------------------------------------------- #
@@ -589,6 +631,43 @@ def scenario_multistep_single_call_still_single_step():
     print("OK  simple single-step request uses exactly one chat + one tool call")
 
 
+def scenario_create_script_action_tool():
+    """create_script must be an action tool (Phase 6): listed in ACTION_TOOLS,
+    exposed to the model, and — like create_part — executing it ends the loop
+    with a single chat call and no follow-up summary request."""
+    mod = load_agent_module()
+    assert "create_script" in mod.ACTION_TOOLS, mod.ACTION_TOOLS
+
+    provider = SequenceProvider([script_call()])
+    rbx = MultiFakeRBX({"create_script": ok_script_response()})
+    result = make_agent(provider, rbx=rbx).run("add a server script that prints hi")
+
+    assert result.ok is True, result
+    assert result.error is None, result
+    assert result.tool.name == "create_script", result
+    assert result.output is True, result
+    assert result.message is None, result
+    assert [step["tool"] for step in result.steps] == ["create_script"], result.steps
+    assert rbx.requests == [("create_script", valid_script_arguments())], rbx.requests
+    assert len(provider.chat_calls) == 1, len(provider.chat_calls)
+    assert any("create_script OK" in line for line in rbx.logs), rbx.logs
+    print("OK  create_script is an action tool: executed once, loop stops, ok reported")
+
+    # A create_script execution failure (plugin replies ok:false) must be
+    # reported as execution_failed, not crash the loop.
+    failing = ok_script_response()
+    failing["ok"] = False
+    failing["error"] = {"code": "not_found", "message": "parent not found"}
+    rbx_fail = MultiFakeRBX({"create_script": failing})
+    provider_fail = SequenceProvider([script_call()])
+    result_fail = make_agent(provider_fail, rbx=rbx_fail).run("add a script")
+    assert result_fail.ok is False, result_fail
+    assert result_fail.error["code"] == "execution_failed", result_fail
+    assert result_fail.steps[0]["tool"] == "create_script", result_fail.steps
+    assert result_fail.steps[0]["ok"] is False, result_fail.steps
+    print("OK  create_script failure in agent loop reported as execution_failed")
+
+
 def scenario_groq_compat_agent_passes_tools():
     """Agent-side half of the GPT-OSS/Groq compatibility fix: when the provider
     advertises ``supports_tools`` (Groq), the agent hands it the registry's tool
@@ -618,10 +697,10 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 4, tools
+    assert isinstance(tools, list) and len(tools) == 5, tools
     names = [tool["name"] for tool in tools]
-    assert names == ["create_part", "find_instances", "inspect_hierarchy", "inspect_instance"], \
-        names
+    assert names == ["create_part", "create_script", "find_instances",
+                     "inspect_hierarchy", "inspect_instance"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = tools[0]
@@ -817,6 +896,7 @@ def main():
     scenario_multistep_find_then_inspect_then_report()
     scenario_multistep_inspect_then_create_part()
     scenario_multistep_single_call_still_single_step()
+    scenario_create_script_action_tool()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

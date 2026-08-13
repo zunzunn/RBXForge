@@ -4,10 +4,10 @@
 >
 > - **Current / Implemented:** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. Four Studio operations are implemented as registered tools,
+>   `plugin/rbxforge.lua`. Five Studio operations are implemented as registered tools,
 >   dispatched through registries on both sides, with CLI-side argument validation before any
 >   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A),
->   `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C).
+>   `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), and `create_script` (Phase 6A).
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -201,6 +201,7 @@ Implemented tools and their `params`:
 | `inspect_hierarchy` | `depth` (optional integer, `1..50`, default `3`) | `{ root, depth, count, truncated, tree }` |
 | `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
 | `inspect_instance` | `path` (non-empty string, full path from Workspace) | `{ name, className, path, parent_path, properties }` |
+| `create_script` | `name` (non-empty string), `type` (optional string, default `"Script"`, one of `"Script"`, `"LocalScript"`, `"ModuleScript"`), `parent_path` (optional game-rooted string, e.g. `"ServerScriptService.Scripts"`; default container per type), `source` (optional string, default `""`) | `{ name, type, parent_path, path, source_length }` |
 
 `inspect_hierarchy` example request:
 
@@ -361,6 +362,54 @@ not rooted at Workspace, or with an empty segment) yields `ok: false` with
 `error.code = "invalid_params"`. Non-goals: no arbitrary/sensitive property reflection, no
 recursive descendant inspection, no caching/indexing.
 
+`create_script` example request (creates a server Script with some Luau source):
+
+```json
+{
+  "type": "request",
+  "id": "req-5",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "tool": "create_script",
+    "params": {
+      "name": "Greeter",
+      "type": "Script",
+      "parent_path": "ServerScriptService",
+      "source": "print(\"Hello from RBXForge\")\n"
+    }
+  }
+}
+```
+
+Its success result carries the script's identity and its full game-rooted path; the source is
+not echoed (only its length, so the response stays bounded even for large scripts):
+
+```json
+{
+  "type": "response",
+  "id": "req-5",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "ok": true,
+    "result": {
+      "name": "Greeter",
+      "type": "Script",
+      "parent_path": "ServerScriptService",
+      "path": "ServerScriptService/Greeter",
+      "source_length": 28
+    }
+  }
+}
+```
+
+An invalid `name`/`type`/`source`/`parent_path` yields `ok: false` with
+`error.code = "invalid_params"`; a `parent_path` that does not resolve to an instance yields
+`ok: false` with `error.code = "not_found"`. When `parent_path` is omitted the plugin places the
+script in the per-type default container (`ServerScriptService` for Script,
+`StarterPlayer.StarterPlayerScripts` for LocalScript, `ReplicatedStorage` for ModuleScript).
+
 Tool error codes (in `response.payload.error.code`):
 
 | Code | Meaning |
@@ -423,8 +472,10 @@ name, position, size, color, optional physics flags, and optional material), `in
 truncation), `find_instances` (searches the
 live `workspace` hierarchy by instance name — case-insensitive substring match — returning a
 bounded list of `{ name, className, path }` matches plus a total count and a truncation flag),
-and `inspect_instance` (resolves one instance by full path and returns its identity, full path,
-parent path, and allowlisted safe properties).
+`inspect_instance` (resolves one instance by full path and returns its identity, full path,
+parent path, and allowlisted safe properties), and `create_script` (creates a Script/LocalScript/
+ModuleScript with the given source, placed at the given game-rooted parent path or the per-type
+default container).
 For `create_part`, unsupported/case-mismatched materials are rejected as `invalid_params` with
 an `unsupported material: <value>` message.
 Every `request` gets a `response` —
@@ -442,9 +493,9 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only four Studio operations (`create_part`, `inspect_hierarchy`, `find_instances`,
-  `inspect_instance`). Other object operations and generalized search (class type / property
-  value / parent scope) are planned.
+- Only five Studio operations (`create_part`, `create_script`, `inspect_hierarchy`,
+  `find_instances`, `inspect_instance`). Other object/script/UI operations and generalized
+  search (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
   `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`; only identity,
   path, and a small allowlisted property set by `inspect_instance`); no indexing, spatial

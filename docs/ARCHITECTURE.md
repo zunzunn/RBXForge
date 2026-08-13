@@ -201,7 +201,9 @@ Project Inspection component — `find_instances` (Phase 4B) searches the live `
 instance name (case-insensitive substring match) and returns each match's Name, ClassName, and
 full Instance path, bounded by `max_results`, and `inspect_instance` (Phase 4C) reads one
 instance by its full path and returns its identity, full path, parent path, and an allowlisted
-safe-property set. The remaining conceptual tools are not implemented.
+safe-property set. `create_script` (Phase 6A) creates a Script/LocalScript/ModuleScript with
+optional Luau source at a game-rooted parent path (or the per-type default container). The
+remaining conceptual tools are not implemented.
 
 ### Project Inspection / Index
 

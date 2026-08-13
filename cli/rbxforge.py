@@ -575,6 +575,74 @@ def create_part_tool():
     )
 
 
+# Single source of truth for the create_script type enum (Phase 6). The CLI
+# validates this list first and the plugin validates it again; the model-facing
+# schema inherits it automatically through the schema conversion.
+CREATE_SCRIPT_TYPES = ["Script", "LocalScript", "ModuleScript"]
+
+CREATE_SCRIPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "min_length": 1},
+        "type": {"type": "string", "enum": CREATE_SCRIPT_TYPES, "default": "Script"},
+        # Optional game-rooted parent path (e.g. "ServerScriptService.Scripts").
+        # When omitted the plugin uses the per-type default container. The CLI
+        # only checks it is a non-empty string; the plugin resolves it.
+        "parent_path": {"type": "string", "min_length": 1},
+        # Optional Luau source. Omitted (or empty) creates an empty script.
+        "source": {"type": "string", "default": ""},
+    },
+    "required": ["name"],
+}
+
+CREATE_SCRIPT_DEFAULT_PARAMS = {
+    "name": "RBXForgeTestScript",
+    "type": "Script",
+    "parent_path": "ServerScriptService",
+    "source": 'print("Hello from RBXForge")\n',
+}
+
+
+def create_script_tool():
+    """Build the create_script tool (Phase 6).
+
+    Creates a Luau script (Script/LocalScript/ModuleScript) in the project via
+    the plugin, placed at the given parent path (game-rooted) or the plugin's
+    per-type default container when omitted. The CLI validates name/type/source
+    first; the plugin re-validates and resolves the parent.
+    """
+
+    def run(rbx, params, timeout):
+        response = rbx.send_request("create_script", params, timeout)
+        if response is None:
+            rbx.log("create_script failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            result = response.get("result") or {}
+            rbx.log("create_script OK: created {0} ({1}) at {2} ({3} chars)".format(
+                result.get("name"), result.get("type"),
+                result.get("path", "?"), result.get("source_length", "?")
+            ))
+            return True
+        error = response.get("error") or {}
+        rbx.log("create_script FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "create_script",
+        "Create a Luau script (Script, LocalScript, or ModuleScript) in the "
+        "project. parent_path is optional and game-rooted (e.g. "
+        "'ServerScriptService.Scripts'); when omitted the plugin uses the "
+        "per-type default container (ServerScriptService for Script, "
+        "StarterPlayer.StarterPlayerScripts for LocalScript, ReplicatedStorage "
+        "for ModuleScript). source is optional Luau source code.",
+        CREATE_SCRIPT_SCHEMA,
+        run,
+    )
+
+
 # Hierarchy snapshot schema. `depth` is optional (the CLI applies the default
 # below when omitted); when given it must be a whole number in [1, 50] so the
 # plugin response stays bounded.
@@ -747,6 +815,7 @@ def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
     registry.register(create_part_tool())
+    registry.register(create_script_tool())
     registry.register(inspect_hierarchy_tool())
     registry.register(find_instances_tool())
     registry.register(inspect_instance_tool())
@@ -1014,6 +1083,15 @@ class RBXForge:
         """Create the test part in Studio via the registered create_part tool."""
         return self.execute_tool("create_part", CREATE_PART_DEFAULT_PARAMS, timeout)
 
+    def create_script(self, params=None, timeout=10.0):
+        """Create a script in Studio via the registered create_script tool.
+
+        ``params`` defaults to the fixed test parameters when omitted.
+        """
+        if params is None:
+            params = CREATE_SCRIPT_DEFAULT_PARAMS
+        return self.execute_tool("create_script", params, timeout)
+
     def inspect_hierarchy(self, depth=None, timeout=10.0):
         """Snapshot the Studio Workspace hierarchy via the inspect_hierarchy tool.
 
@@ -1139,6 +1217,12 @@ def repl(rbx, console, prompt="RBXForge> "):
             rbx.send_ping()
         elif command == "create_part":
             rbx.create_part()
+        elif command == "create_script":
+            after = line.strip()[len(command):].strip()
+            params = dict(CREATE_SCRIPT_DEFAULT_PARAMS) if after else None
+            if params is not None:
+                params["name"] = after
+            rbx.create_script(params)
         elif command == "inspect_hierarchy":
             parts = line.split(None, 1)
             depth = None
@@ -1189,6 +1273,9 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("commands:")
             print("  ping        - send a ping to the connected plugin and wait for pong")
             print("  create_part - run the create_part tool (creates a test Part in Studio)")
+            print("  create_script [name]")
+            print("              - run the create_script tool (creates a test Script in")
+            print("                ServerScriptService; optional name overrides the default)")
             print("  inspect_hierarchy [depth]")
             print("              - snapshot the Workspace tree (default depth: 3)")
             print("  find_instances <query> [max_results]")
@@ -1234,6 +1321,10 @@ def main(argv=None):
     parser.add_argument(
         "--create-part-once", action="store_true",
         help="wait for the plugin to connect, create one test part, report, then exit",
+    )
+    parser.add_argument(
+        "--create-script-once", action="store_true",
+        help="wait for the plugin to connect, create one test script, report, then exit",
     )
     parser.add_argument(
         "--inspect-hierarchy-once", action="store_true",
@@ -1302,6 +1393,10 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.create_part(args.request_timeout) else 4
+        if args.create_script_once:
+            if not wait_for_plugin(rbx, args.timeout):
+                return 2
+            return 0 if rbx.create_script(timeout=args.request_timeout) else 4
         if args.inspect_hierarchy_once:
             if not wait_for_plugin(rbx, args.timeout):
                 return 2

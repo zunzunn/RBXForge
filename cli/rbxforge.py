@@ -9,6 +9,8 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
 - a test message: ping -> pong
 - a tool registry (name, description, input schema) that validates arguments
   before sending a request; create_part is the first registered tool,
+  create_script (Phase 6A) creates a Luau script, modify_instance (Phase 6B)
+  modifies an allowlisted set of properties on an existing instance,
   inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree,
   find_instances (Phase 4B) searches the live Workspace hierarchy by name, and
   inspect_instance (Phase 4C) inspects one instance by its full path
@@ -34,6 +36,8 @@ Usage:
                   [--max-results N] [--timeout SEC] [--request-timeout SEC]
     rbxforge --inspect-instance-once --path PATH [--host HOST] [--port PORT]
                   [--timeout SEC] [--request-timeout SEC]
+    rbxforge --modify-instance-once --path PATH --properties JSON
+                  [--host HOST] [--port PORT] [--timeout SEC] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
@@ -400,10 +404,21 @@ def _validate_value(value, spec, path):
     if kind == "object":
         if not isinstance(value, dict):
             return path + " must be an object"
+        if "min_properties" in spec and len(value) < spec["min_properties"]:
+            return path + " must have at least {0} propert(y/ies)".format(
+                spec["min_properties"])
         for required in spec.get("required", []):
             if required not in value:
                 return path + " is missing required property '" + required + "'"
-        for key, child in spec.get("properties", {}).items():
+        declared = spec.get("properties", {})
+        # ``additionalProperties: False`` rejects keys that are not in the
+        # explicit allowlist (used by modify_instance's properties object so no
+        # arbitrary property name supplied by the model reaches the plugin).
+        if spec.get("additionalProperties") is False:
+            for key in value:
+                if key not in declared:
+                    return path + " has an unsupported property '" + key + "'"
+        for key, child in declared.items():
             if key in value:
                 error = _validate_value(value[key], child, path + "." + key)
                 if error is not None:
@@ -643,6 +658,111 @@ def create_script_tool():
     )
 
 
+# Single source of truth for the modify_instance team_color enum (Phase 6B).
+# These are valid Roblox BrickColor names, kept aligned with the 7 create_part
+# colors so a model can reason about the palette in one place. The CLI validates
+# this list first and the plugin validates it again.
+MODIFY_TEAM_COLORS = [
+    "Really red",
+    "Bright blue",
+    "Bright green",
+    "Bright yellow",
+    "White",
+    "Black",
+    "Medium stone grey",
+]
+
+# The modify_instance property allowlist (Phase 6B). BasePart properties apply
+# to any BasePart (including SpawnLocation, which is a BasePart); SpawnLocation
+# properties apply only to SpawnLocation instances. ``color`` reuses the
+# create_part palette and ``material`` reuses the create_part material list. The
+# nested ``properties`` object sets ``additionalProperties: False`` so any
+# property name outside this allowlist is rejected by the CLI before send (the
+# plugin independently re-validates the same allowlist).
+MODIFY_INSTANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "min_length": 1},
+        "properties": {
+            "type": "object",
+            "additionalProperties": False,
+            "min_properties": 1,
+            "properties": {
+                "position": {"type": "vec3"},
+                "size": {"type": "vec3"},
+                "anchored": {"type": "boolean"},
+                "can_collide": {"type": "boolean"},
+                "transparency": {"type": "number", "minimum": 0, "maximum": 1},
+                "color": {"type": "string", "enum": CREATE_PART_COLORS},
+                "material": {"type": "string", "enum": CREATE_PART_MATERIALS},
+                "enabled": {"type": "boolean"},
+                "duration": {"type": "number", "minimum": 0},
+                "neutral": {"type": "boolean"},
+                "team_color": {"type": "string", "enum": MODIFY_TEAM_COLORS},
+            },
+        },
+    },
+    "required": ["path", "properties"],
+}
+
+# Fixed test parameters for --modify-instance-once and the REPL command. The
+# default targets a SpawnLocation (every new place has one) and turns it into a
+# neutral team-free spawn point.
+MODIFY_INSTANCE_DEFAULT_PARAMS = {
+    "path": "Workspace.SpawnLocation",
+    "properties": {
+        "neutral": True,
+        "enabled": True,
+    },
+}
+
+
+def modify_instance_tool():
+    """Build the modify_instance tool (Phase 6B).
+
+    Modifies an allowlisted set of properties on one existing instance in the
+    project via the plugin, addressed by its full Workspace-rooted path. The CLI
+    validates the path, the property names (unknown ones are rejected), and each
+    value's type/range/enum before anything is sent; the plugin re-validates
+    independently and applies the requested properties atomically.
+    """
+
+    def run(rbx, params, timeout):
+        response = rbx.send_request("modify_instance", params, timeout)
+        if response is None:
+            rbx.log("modify_instance failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            result = response.get("result") or {}
+            rbx.log("modify_instance OK: {0} ({1}) changed: {2}".format(
+                result.get("path", "?"),
+                result.get("className", "?"),
+                json.dumps(result.get("changed") or {}, sort_keys=True),
+            ))
+            return True
+        error = response.get("error") or {}
+        rbx.log("modify_instance FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "modify_instance",
+        "Modify an allowlisted set of properties on one existing instance in "
+        "the project, addressed by its full Workspace-rooted path (e.g. "
+        "'Workspace.SpawnLocation'). Supported properties depend on the target "
+        "class: BasePart accepts position/size (vec3 objects with numeric "
+        "x/y/z), anchored/can_collide (booleans), transparency (number 0..1), "
+        "color (string from the create_part palette), and material (string from "
+        "the create_part material list); SpawnLocation additionally accepts "
+        "enabled/neutral (booleans), duration (number >= 0), and team_color "
+        "(string BrickColor name). Unknown property names and values outside "
+        "the allowlists are rejected.",
+        MODIFY_INSTANCE_SCHEMA,
+        run,
+    )
+
+
 # Hierarchy snapshot schema. `depth` is optional (the CLI applies the default
 # below when omitted); when given it must be a whole number in [1, 50] so the
 # plugin response stays bounded.
@@ -816,6 +936,7 @@ def default_registry():
     registry = ToolRegistry()
     registry.register(create_part_tool())
     registry.register(create_script_tool())
+    registry.register(modify_instance_tool())
     registry.register(inspect_hierarchy_tool())
     registry.register(find_instances_tool())
     registry.register(inspect_instance_tool())
@@ -1092,6 +1213,17 @@ class RBXForge:
             params = CREATE_SCRIPT_DEFAULT_PARAMS
         return self.execute_tool("create_script", params, timeout)
 
+    def modify_instance(self, path, properties, timeout=10.0):
+        """Modify an instance's allowlisted properties in Studio via the
+        registered modify_instance tool.
+
+        ``path`` is the full Workspace-rooted path (e.g. "Workspace.SpawnLocation");
+        ``properties`` is a dict of allowlisted property names to values.
+        """
+        return self.execute_tool(
+            "modify_instance", {"path": path, "properties": properties}, timeout
+        )
+
     def inspect_hierarchy(self, depth=None, timeout=10.0):
         """Snapshot the Studio Workspace hierarchy via the inspect_hierarchy tool.
 
@@ -1223,6 +1355,27 @@ def repl(rbx, console, prompt="RBXForge> "):
             if params is not None:
                 params["name"] = after
             rbx.create_script(params)
+        elif command == "modify_instance":
+            after = line.strip()[len(command):].strip()
+            brace = after.find("{")
+            if brace < 0:
+                rbx.log("modify_instance: no JSON properties given (e.g. "
+                        "'modify_instance Workspace.SpawnLocation {\"neutral\": false}')")
+            else:
+                path = after[:brace].strip()
+                json_text = after[brace:]
+                try:
+                    properties = json.loads(json_text)
+                except ValueError:
+                    rbx.log("modify_instance: invalid JSON properties: {0!r}".format(json_text))
+                else:
+                    if not path:
+                        rbx.log("modify_instance: no path given (e.g. "
+                                "'modify_instance Workspace.SpawnLocation {\"neutral\": false}')")
+                    elif not isinstance(properties, dict):
+                        rbx.log("modify_instance: properties must be a JSON object")
+                    else:
+                        rbx.modify_instance(path, properties)
         elif command == "inspect_hierarchy":
             parts = line.split(None, 1)
             depth = None
@@ -1276,6 +1429,10 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("  create_script [name]")
             print("              - run the create_script tool (creates a test Script in")
             print("                ServerScriptService; optional name overrides the default)")
+            print("  modify_instance <path> <json>")
+            print("              - run the modify_instance tool (changes allowlisted")
+            print("                properties on one instance, e.g.")
+            print("                'modify_instance Workspace.SpawnLocation {\"neutral\": false}')")
             print("  inspect_hierarchy [depth]")
             print("              - snapshot the Workspace tree (default depth: 3)")
             print("  find_instances <query> [max_results]")
@@ -1327,6 +1484,11 @@ def main(argv=None):
         help="wait for the plugin to connect, create one test script, report, then exit",
     )
     parser.add_argument(
+        "--modify-instance-once", action="store_true",
+        help="wait for the plugin to connect, modify the instance at --path with "
+             "the --properties (JSON) allowlisted properties, report, then exit",
+    )
+    parser.add_argument(
         "--inspect-hierarchy-once", action="store_true",
         help="wait for the plugin to connect, snapshot the Workspace hierarchy, "
              "report, then exit",
@@ -1354,6 +1516,11 @@ def main(argv=None):
         "--path", default=None,
         help="full instance path for --inspect-instance-once, e.g. "
              "'Workspace.SpawnLocation'",
+    )
+    parser.add_argument(
+        "--properties", default=None,
+        help="JSON object of allowlisted properties for --modify-instance-once, "
+             "e.g. '{\"neutral\": false, \"duration\": 3}'",
     )
     parser.add_argument(
         "--max-results", type=int, default=None,
@@ -1397,6 +1564,24 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.create_script(timeout=args.request_timeout) else 4
+        if args.modify_instance_once:
+            if not args.path:
+                rbx.error("--modify-instance-once requires --path <path>")
+                return 2
+            if not args.properties:
+                rbx.error("--modify-instance-once requires --properties <json>")
+                return 2
+            try:
+                properties = json.loads(args.properties)
+            except ValueError:
+                rbx.error("--properties must be a valid JSON object")
+                return 2
+            if not isinstance(properties, dict):
+                rbx.error("--properties must be a JSON object")
+                return 2
+            if not wait_for_plugin(rbx, args.timeout):
+                return 2
+            return 0 if rbx.modify_instance(args.path, properties, args.request_timeout) else 4
         if args.inspect_hierarchy_once:
             if not wait_for_plugin(rbx, args.timeout):
                 return 2

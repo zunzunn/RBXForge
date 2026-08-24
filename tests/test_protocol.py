@@ -1217,14 +1217,14 @@ def scenario_interactive_create_part_registered():
 
 
 def scenario_tool_registry_metadata():
-    """The tool registry must expose create_part, create_script, find_instances,
-    inspect_hierarchy, and inspect_instance with name/description/schema."""
+    """The tool registry must expose create_part, create_script, modify_instance,
+    find_instances, inspect_hierarchy, and inspect_instance with metadata."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
         "create_part", "create_script", "find_instances", "inspect_hierarchy",
-        "inspect_instance",
+        "inspect_instance", "modify_instance",
     ], tools
 
     tool = registry.get("create_part")
@@ -1249,6 +1249,31 @@ def scenario_tool_registry_metadata():
     assert parent_prop == {"type": "string", "min_length": 1}
     source_prop = script.input_schema["properties"]["source"]
     assert source_prop == {"type": "string", "default": ""}
+
+    modifier = registry.get("modify_instance")
+    assert modifier is not None
+    assert isinstance(modifier.description, str) and modifier.description
+    assert modifier.input_schema["type"] == "object"
+    assert set(modifier.input_schema["required"]) == {"path", "properties"}
+    assert modifier.input_schema["properties"]["path"] == {"type": "string", "min_length": 1}
+    inner = modifier.input_schema["properties"]["properties"]
+    assert inner["type"] == "object"
+    assert inner["additionalProperties"] is False  # explicit allowlist only
+    assert set(inner["properties"].keys()) == {
+        "position", "size", "anchored", "can_collide", "transparency", "color",
+        "material", "enabled", "duration", "neutral", "team_color",
+    }, inner
+    assert inner["properties"]["transparency"] == {
+        "type": "number", "minimum": 0, "maximum": 1,
+    }
+    assert inner["properties"]["color"]["enum"] == mod.CREATE_PART_COLORS
+    assert inner["properties"]["material"]["enum"] == mod.CREATE_PART_MATERIALS
+    assert inner["properties"]["duration"] == {"type": "number", "minimum": 0}
+    assert inner["properties"]["team_color"]["enum"] == mod.MODIFY_TEAM_COLORS
+    assert mod.MODIFY_TEAM_COLORS == [
+        "Really red", "Bright blue", "Bright green", "Bright yellow", "White",
+        "Black", "Medium stone grey",
+    ]
 
     hierarchy = registry.get("inspect_hierarchy")
     assert hierarchy is not None
@@ -1282,8 +1307,8 @@ def scenario_tool_registry_metadata():
     assert path_prop["type"] == "string"
     assert path_prop["min_length"] == 1
     assert set(inspector.input_schema["required"]) == {"path"}
-    print("OK  registry registers create_part, create_script, find_instances, "
-          "inspect_hierarchy, and inspect_instance with metadata")
+    print("OK  registry registers create_part, create_script, modify_instance, "
+          "find_instances, inspect_hierarchy, and inspect_instance with metadata")
 
 
 def scenario_tool_validation():
@@ -1589,6 +1614,227 @@ def scenario_create_script_validation():
     print("OK  create_script schema: required name + enum/defaults + validation")
 
 
+def scenario_modify_instance_validation():
+    """modify_instance must validate path + the property allowlist strictly:
+    valid BasePart and SpawnLocation modifications pass, unknown properties,
+    wrong types, out-of-range values, and invalid colors/materials/team colors
+    are rejected, and nothing is sent when CLI validation fails."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+    tool = registry.get("modify_instance")
+    assert tool.input_schema["required"] == ["path", "properties"]
+
+    # -- valid requests (nothing sent yet, just validation) ------------------ #
+    valid_basepart = {
+        "path": "Workspace.MyPart",
+        "properties": {
+            "position": {"x": 0, "y": 5, "z": 0},
+            "size": {"x": 2, "y": 2, "z": 2},
+            "anchored": False,
+            "can_collide": True,
+            "transparency": 0.5,
+            "color": "red",
+            "material": "Neon",
+        },
+    }
+    tool.validate(valid_basepart)
+
+    # Multiple properties in one request (SpawnLocation extras).
+    valid_spawn = {
+        "path": "Workspace.SpawnLocation",
+        "properties": {
+            "enabled": False,
+            "duration": 3,
+            "neutral": True,
+            "team_color": "Bright blue",
+            "transparency": 0,
+            "anchored": True,
+        },
+    }
+    tool.validate(valid_spawn)
+
+    # Boundary values are valid: transparency 0 and 1, duration 0.
+    tool.validate({
+        "path": "Workspace.P",
+        "properties": {"transparency": 1, "duration": 0},
+    })
+
+    # -- invalid requests: rejected by the CLI, nothing sent ---------------- #
+    invalid_cases = [
+        ("missing path", {"properties": {"anchored": True}}),
+        ("empty path", {"path": "", "properties": {"anchored": True}}),
+        ("missing properties", {"path": "Workspace.P"}),
+        ("properties not an object", {"path": "Workspace.P", "properties": "nope"}),
+        ("properties empty object", {"path": "Workspace.P", "properties": {}}),
+        ("unknown property", {"path": "Workspace.P", "properties": {"unknown_key": 1}}),
+        ("unknown property model name", {
+            "path": "Workspace.P", "properties": {"Position": 1},
+        }),
+        ("unknown nested in otherwise-valid", {
+            "path": "Workspace.P", "properties": {"anchored": True, "bogus": "x"},
+        }),
+        ("wrong type boolean", {
+            "path": "Workspace.P", "properties": {"anchored": "yes"},
+        }),
+        ("wrong type vec3", {
+            "path": "Workspace.P", "properties": {"position": [0, 5, 0]},
+        }),
+        ("vec3 missing axis", {
+            "path": "Workspace.P", "properties": {"size": {"x": 1, "y": 2}},
+        }),
+        ("invalid transparency high", {
+            "path": "Workspace.P", "properties": {"transparency": 1.5},
+        }),
+        ("invalid transparency low", {
+            "path": "Workspace.P", "properties": {"transparency": -0.1},
+        }),
+        ("transparency not a number", {
+            "path": "Workspace.P", "properties": {"transparency": "half"},
+        }),
+        ("invalid duration negative", {
+            "path": "Workspace.P", "properties": {"duration": -1},
+        }),
+        ("duration not a number", {
+            "path": "Workspace.P", "properties": {"duration": None},
+        }),
+        ("invalid color", {
+            "path": "Workspace.P", "properties": {"color": "purple"},
+        }),
+        ("color case mismatch", {
+            "path": "Workspace.P", "properties": {"color": "Red"},
+        }),
+        ("invalid material", {
+            "path": "Workspace.P", "properties": {"material": "plastic"},
+        }),
+        ("invalid team color", {
+            "path": "Workspace.P", "properties": {"team_color": "Hot pink"},
+        }),
+        ("team color case mismatch", {
+            "path": "Workspace.P", "properties": {"team_color": "bright blue"},
+        }),
+    ]
+    rbx = FakeRBX({"ok": True, "result": {"path": "Workspace.P", "className": "Part", "changed": {}}})
+    for label, bad_params in invalid_cases:
+        try:
+            registry.execute(rbx, "modify_instance", bad_params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("modify_instance accepted invalid params: " + label)
+    assert rbx.requests == [], rbx.requests
+
+    # -- a valid call sends exactly what was validated ---------------------- #
+    ok = registry.execute(rbx, "modify_instance", valid_basepart)
+    assert ok is True, ok
+    assert rbx.requests == [("modify_instance", valid_basepart)], rbx.requests
+    print("OK  modify_instance: allowlist + types + ranges validated; "
+          "unknown/out-of-range rejected before send")
+    print("OK  modify_instance valid BasePart + SpawnLocation requests pass")
+    print("OK  modify_instance valid multiple-property request passes")
+
+
+def scenario_modify_instance_success_roundtrip():
+    """--modify-instance-once must wait for the plugin, send a modify_instance
+    request with the given --path/--properties, accept a success response, and
+    exit 0."""
+    proc = Proc("--modify-instance-once", "--path", "Workspace.SpawnLocation",
+                "--properties", '{"neutral": true, "enabled": true}', "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "modify_instance", req
+        assert req["payload"]["params"]["path"] == "Workspace.SpawnLocation", req
+        assert req["payload"]["params"]["properties"] == {"neutral": True, "enabled": True}, req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": True,
+                "result": {
+                    "path": "Workspace/SpawnLocation",
+                    "className": "SpawnLocation",
+                    "changed": {"neutral": True, "enabled": True},
+                },
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("modify_instance OK"), proc._output()
+        print("OK  modify_instance request sent; success response handled; clean exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_modify_instance_failure():
+    """A failed modify_instance (plugin replies ok:false, e.g. plugin-side
+    validation or not_found) must be reported and yield a non-zero exit code."""
+    proc = Proc("--modify-instance-once", "--path", "Workspace.Missing",
+                "--properties", '{"anchored": true}', "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "modify_instance", req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": False,
+                "error": {"code": "not_found", "message": "instance not found at path: Workspace.Missing"},
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 4, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("modify_instance FAILED"), proc._output()
+        assert proc.reader.contains("not_found"), proc._output()
+        print("OK  modify_instance failure response (plugin-side) reported; non-zero exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_interactive_modify_instance_registered():
+    """The interactive REPL must recognize the 'modify_instance' command.
+
+    Mirror of scenario_interactive_create_part_registered: the command must be
+    dispatched (to the no-connection path) rather than rejected as unknown.
+    """
+    proc = Proc("--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        assert proc.reader.wait_for("Type 'help'"), proc._output()
+
+        proc.proc.stdin.write(b'modify_instance Workspace.SpawnLocation {"neutral": false}\n')
+        proc.proc.stdin.flush()
+        proc.reader.wait_for("cannot execute modify_instance")
+        assert not proc.reader.contains("unknown command"), proc._output()
+
+        rc = proc.quit()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        print("OK  interactive REPL recognizes modify_instance (not 'unknown command')")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
 def scenario_tool_invalid_rejected_before_send():
     """execute_tool must reject invalid params before attempting to send."""
     mod = load_cli_module()
@@ -1822,6 +2068,7 @@ def main():
     scenario_create_part_physics_validation()
     scenario_create_part_material_validation()
     scenario_create_script_validation()
+    scenario_modify_instance_validation()
     scenario_tool_invalid_rejected_before_send()
     scenario_inspect_hierarchy_mock_response()
     scenario_inspect_hierarchy_depth_semantics()
@@ -1842,6 +2089,8 @@ def main():
     scenario_create_part_failure()
     scenario_create_script_success()
     scenario_create_script_failure()
+    scenario_modify_instance_success_roundtrip()
+    scenario_modify_instance_failure()
     scenario_inspect_hierarchy_roundtrip()
     scenario_find_instances_roundtrip()
     scenario_find_instances_roundtrip_truncated()
@@ -1850,6 +2099,7 @@ def main():
     scenario_inspect_instance_not_found()
     scenario_interactive_create_part_registered()
     scenario_interactive_create_script_registered()
+    scenario_interactive_modify_instance_registered()
     scenario_repl_run_after_connection()
     scenario_repl_after_plugin_connect_pty()
     print("\nAll protocol scenarios passed.")

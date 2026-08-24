@@ -4,10 +4,11 @@
 >
 > - **Current / Implemented:** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. Five Studio operations are implemented as registered tools,
+>   `plugin/rbxforge.lua`. Six Studio operations are implemented as registered tools,
 >   dispatched through registries on both sides, with CLI-side argument validation before any
 >   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A),
->   `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), and `create_script` (Phase 6A).
+>   `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A),
+>   and `modify_instance` (Phase 6B).
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -202,6 +203,7 @@ Implemented tools and their `params`:
 | `find_instances` | `query` (non-empty string), `max_results` (optional integer, `1..100`, default `20`) | `{ query, max_results, total, count, truncated, matches }` |
 | `inspect_instance` | `path` (non-empty string, full path from Workspace) | `{ name, className, path, parent_path, properties }` |
 | `create_script` | `name` (non-empty string), `type` (optional string, default `"Script"`, one of `"Script"`, `"LocalScript"`, `"ModuleScript"`), `parent_path` (optional game-rooted string, e.g. `"ServerScriptService.Scripts"`; default container per type), `source` (optional string, default `""`) | `{ name, type, parent_path, path, source_length }` |
+| `modify_instance` | `path` (non-empty string, full path from Workspace), `properties` (non-empty object with at least one allowlisted property, see below) | `{ path, className, changed }` |
 
 `inspect_hierarchy` example request:
 
@@ -410,6 +412,71 @@ An invalid `name`/`type`/`source`/`parent_path` yields `ok: false` with
 script in the per-type default container (`ServerScriptService` for Script,
 `StarterPlayer.StarterPlayerScripts` for LocalScript, `ReplicatedStorage` for ModuleScript).
 
+`modify_instance` example request (changes allowlisted properties on one instance, identified by
+its full path from Workspace):
+
+```json
+{
+  "type": "request",
+  "id": "req-6",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "tool": "modify_instance",
+    "params": {
+      "path": "Workspace.SpawnLocation",
+      "properties": { "neutral": true, "enabled": true }
+    }
+  }
+}
+```
+
+The `properties` object is a **fixed allowlist** (see [TOOLS.md](./TOOLS.md)); both the CLI and the
+plugin reject anything not on it. Keys use the tool's Model 1 names, not Luau property names. The
+success result echoes the normalized path, the class name, and which keys were actually changed:
+
+```json
+{
+  "type": "response",
+  "id": "req-6",
+  "version": 1,
+  "timestamp": 0.0,
+  "payload": {
+    "ok": true,
+    "result": {
+      "path": "Workspace/SpawnLocation",
+      "className": "SpawnLocation",
+      "changed": { "neutral": true, "enabled": true }
+    }
+  }
+}
+```
+
+Allowed `properties` keys (with their accepted values and valid classes):
+
+| Key | Value | Applied to |
+| --- | --- | --- |
+| `position` | object with numeric `x`, `y`, `z` | BasePart |
+| `size` | object with numeric `x`, `y`, `z` | BasePart |
+| `anchored` | boolean | BasePart |
+| `can_collide` | boolean | BasePart |
+| `transparency` | number in `0..1` | BasePart |
+| `color` | string, one of `"red"`, `"blue"`, `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"` | BasePart |
+| `material` | string, one of `"Plastic"`, `"SmoothPlastic"`, `"Neon"`, `"Wood"`, `"WoodPlanks"`, `"Metal"`, `"DiamondPlate"`, `"Concrete"`, `"Brick"`, `"Glass"`, `"Granite"`, `"Marble"`, `"Slate"`, `"Sand"`, `"Fabric"`, `"Grass"`, `"Ice"` | BasePart |
+| `enabled` | boolean | SpawnLocation |
+| `duration` | number `>= 0` | SpawnLocation |
+| `neutral` | boolean | SpawnLocation |
+| `team_color` | string, one of `"Really red"`, `"Bright blue"`, `"Bright green"`, `"Bright yellow"`, `"White"`, `"Black"`, `"Medium stone grey"` | SpawnLocation |
+
+Values are validated on both sides: the CLI rejects invalid `param`s before sending (an unknown
+`properties` key, wrong type, an empty `properties` object, and out-of-range values all fail
+locally), and the plugin re-validates independently as defense in depth. Invalid params on either
+side yield `error.code = "invalid_params"`; a path that does not resolve to an instance yields
+`error.code = "not_found"`. The change is applied to the **current live instance** resolved from
+the path, so a previously created part (e.g. `Workspace.RBXForgeTestPart`) can be re-targeted by
+path. Property changes are non-destructive: only the requested keys are written and read back as
+`changed`; nothing else is touched.
+
 Tool error codes (in `response.payload.error.code`):
 
 | Code | Meaning |
@@ -475,7 +542,8 @@ bounded list of `{ name, className, path }` matches plus a total count and a tru
 `inspect_instance` (resolves one instance by full path and returns its identity, full path,
 parent path, and allowlisted safe properties), and `create_script` (creates a Script/LocalScript/
 ModuleScript with the given source, placed at the given game-rooted parent path or the per-type
-default container).
+default container), and `modify_instance` (resolves one instance by full path and changes only the
+allowlisted properties given in `params.properties`, echoing back which keys were changed).
 For `create_part`, unsupported/case-mismatched materials are rejected as `invalid_params` with
 an `unsupported material: <value>` message.
 Every `request` gets a `response` —
@@ -493,8 +561,9 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only five Studio operations (`create_part`, `create_script`, `inspect_hierarchy`,
-  `find_instances`, `inspect_instance`). Other object/script/UI operations and generalized
+- Only six Studio operations (`create_part`, `create_script`, `modify_instance`,
+  `inspect_hierarchy`, `find_instances`, `inspect_instance`). Other object/script/UI operations
+  and generalized
   search (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
   `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`; only identity,

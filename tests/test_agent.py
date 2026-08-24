@@ -150,7 +150,7 @@ def scenario_tool_definitions_sent_to_ai():
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
     assert names == ["create_part", "create_script", "find_instances",
-                     "inspect_hierarchy", "inspect_instance"], names
+                     "inspect_hierarchy", "inspect_instance", "modify_instance"], names
     create_part = defs[0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"
@@ -207,6 +207,42 @@ def scenario_tool_definitions_sent_to_ai():
     assert create_script["parameters"]["properties"]["source"] == {
         "type": "string", "default": "",
     }, create_script
+
+    modify = next(d for d in defs if d["name"] == "modify_instance")
+    assert isinstance(modify["description"], str) and modify["description"]
+    assert modify["parameters"]["type"] == "object"
+    assert modify["parameters"]["required"] == ["path", "properties"], modify
+    assert modify["parameters"]["properties"]["path"]["type"] == "string", modify
+    inner = modify["parameters"]["properties"]["properties"]
+    assert inner["type"] == "object", inner
+    assert inner["additionalProperties"] is False, inner
+    props = inner["properties"]
+    assert props["position"]["type"] == "object", props
+    assert props["transparency"]["type"] == "number", props
+    assert props["transparency"]["minimum"] == 0 and props["transparency"]["maximum"] == 1, props
+    assert props["duration"]["type"] == "number" and props["duration"]["minimum"] == 0, props
+    assert props["color"]["enum"] == ["red", "blue", "green", "yellow", "white", "black", "gray"], props
+    assert props["material"]["enum"] == [
+        "Plastic",
+        "SmoothPlastic",
+        "Neon",
+        "Wood",
+        "WoodPlanks",
+        "Metal",
+        "DiamondPlate",
+        "Concrete",
+        "Brick",
+        "Glass",
+        "Granite",
+        "Marble",
+        "Slate",
+        "Sand",
+        "Fabric",
+        "Grass",
+        "Ice",
+    ], props
+    assert "enabled" in props and "duration" in props and "neutral" in props, props
+    assert props["team_color"]["type"] == "string", props
 
     hierarchy = next(d for d in defs if d["name"] == "inspect_hierarchy")
     assert hierarchy["parameters"]["properties"]["depth"]["type"] == "number"
@@ -697,10 +733,10 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 5, tools
+    assert isinstance(tools, list) and len(tools) == 6, tools
     names = [tool["name"] for tool in tools]
     assert names == ["create_part", "create_script", "find_instances",
-                     "inspect_hierarchy", "inspect_instance"], names
+                     "inspect_hierarchy", "inspect_instance", "modify_instance"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = tools[0]

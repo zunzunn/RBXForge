@@ -11,8 +11,10 @@ short, bounded loop:
 The model may call the inspection tools (find_instances, inspect_instance,
 inspect_hierarchy) to gather live project context; each successful inspection
 result is returned to the model as a bounded message, so it can decide the next
-step. It eventually executes an action tool (create_part, create_script), at
-which point the loop stops and a concise final AgentResult is returned.
+step. It eventually executes an action tool (create_part, create_script,
+modify_instance), at which point the loop stops (modify_instance may be
+followed by exactly one optional inspect_instance verification step) and a
+concise final AgentResult is returned.
 
 Each step's reply is one JSON object - either a tool call:
 
@@ -192,8 +194,10 @@ def parse_agent_reply(text):
 # Bounded tool results (Phase 4D)
 # --------------------------------------------------------------------------- #
 
-#: Tool names that change the project. Calling an action tool ends the loop.
-ACTION_TOOLS = frozenset({"create_part", "create_script"})
+#: Tool names that change the project. Calling an action tool ends the loop
+#: (Phase 6B: modify_instance allows exactly one optional inspect_instance
+#: verification step before the loop ends).
+ACTION_TOOLS = frozenset({"create_part", "create_script", "modify_instance"})
 
 #: Hard bound on executed tool calls per user request.
 MAX_TOOL_CALLS = 5
@@ -373,6 +377,11 @@ def build_system_prompt(registry):
         "safe properties of one instance by full path.\n"
         "- create_part and create_script change the project; once a change tool "
         "reports success, the task is complete - stop, do not call more tools.\n"
+        "- modify_instance also changes the project: it modifies an allowlisted "
+        "set of properties on one instance by path. After it succeeds you may "
+        "call inspect_instance exactly once to verify the change if your "
+        "reasoning requires it, then report; do not call any other tools "
+        "afterwards.\n"
         "- If a request is already simple (e.g. 'create a red cube'), make the "
         "single tool call you need immediately instead of exploring.\n"
         "- If you conclude no tool call is needed, reply with a final report.\n"
@@ -399,8 +408,11 @@ class AgentResult:
 
     - ``ok``: True when the request either completed through an action tool or
       ended with a final model report.
-    - ``tool``: the last executed :class:`ToolCall`, or None when no tool
-      executed (a final-report completion).
+    - ``tool``: the action :class:`ToolCall` that completed the task, or None
+      when no action tool executed (a final-report completion or pure-inspection
+      loop). For a successful ``modify_instance`` the action call is reported
+      even when the loop also ran the single optional verification step (the
+      verification is recorded in ``steps``).
     - ``output``: the last tool execution result from the tool layer (e.g. bool).
     - ``message``: a final model report, or None.
     - ``steps``: ordered record of each parsed tool call and its outcome as
@@ -466,7 +478,9 @@ class Agent:
         (never raised), so this is safe to call from the REPL or CLI.
 
         Single-step requests behave as before: a model that replies with a
-        ``create_part`` call executes it once and stops.
+        ``create_part`` call executes it once and stops. A successful
+        ``modify_instance`` pauses the loop for exactly one optional
+        ``inspect_instance`` verification step, then ends.
         """
         messages = [
             providers.message("system", build_system_prompt(self.registry)),
@@ -475,6 +489,10 @@ class Agent:
         steps = []
         last_text = None
         issued = 0
+        # (Phase 6B) Set after a successful modify_instance so the model may run
+        # exactly one optional inspect_instance verification step before the
+        # loop ends. The reported action tool stays the modify_instance call.
+        pending_verify = None
 
         while True:
             # -- model ------------------------------------------------------- #
@@ -514,6 +532,15 @@ class Agent:
                 )
 
             if isinstance(reply, FinalMessage):
+                if pending_verify is not None:
+                    return AgentResult(
+                        ok=True,
+                        tool=pending_verify["call"],
+                        output=pending_verify["output"],
+                        provider_text=last_text,
+                        steps=steps,
+                        message=reply.text,
+                    )
                 return AgentResult(
                     ok=True,
                     provider_text=last_text,
@@ -565,10 +592,31 @@ class Agent:
                     error=failure,
                 )
             if call.name in ACTION_TOOLS:
+                # Phase 6B: a successful modify_instance does not end the loop
+                # immediately - it permits exactly one optional inspect_instance
+                # verification step before the loop ends.
+                if call.name == "modify_instance" and pending_verify is None:
+                    pending_verify = {"call": call, "output": output}
+                    messages.append(providers.message("assistant", last_text))
+                    messages.append(providers.message(
+                        "user", tool_result_message(issued, call, output, response_payload)
+                    ))
+                    continue
                 return AgentResult(
                     ok=True,
                     tool=call,
                     output=output,
+                    provider_text=last_text,
+                    steps=steps,
+                )
+            if pending_verify is not None:
+                # The optional verification inspect_instance (or any other
+                # follow-up call) ends the loop here: no unrestricted autonomous
+                # loop is created, and the modification remains the outcome.
+                return AgentResult(
+                    ok=True,
+                    tool=pending_verify["call"],
+                    output=pending_verify["output"],
                     provider_text=last_text,
                     steps=steps,
                 )

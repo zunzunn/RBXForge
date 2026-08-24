@@ -1,9 +1,10 @@
 # RBXForge — Tool System
 
-> **Status:** Four tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
-> find_instances in Phase 4B, inspect_instance in Phase 4C); the rest is conceptual. The
+> **Status:** Six tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
+> modify_instance in Phase 6B); the rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
-> of these inspection tools without adding any new tool.
+> of these tools without adding any new tool.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -20,6 +21,11 @@
 > - **Implemented (Phase 4C):** `inspect_instance` inspects one live instance by its full
 >   path and returns its identity plus a small **allowlisted** set of safe properties. Same
 >   registry/validation/protocol flow.
+> - **Implemented (Phase 6A):** `create_script` creates a Script/LocalScript/ModuleScript with
+>   an optional Luau source. Same registry/validation/protocol flow.
+> - **Implemented (Phase 6B):** `modify_instance` changes a small **allowlisted** set of
+>   properties on one live instance, identified by its full path. Same registry/validation/protocol
+>   flow.
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -163,8 +169,8 @@ as a one-shot flag. The query must be a non-empty string and `max_results` a who
 > `inspect_instance` are the only tools the agent is allowed to use for *gathering context* in
 > the multi-step loop. Their results are run through a bounded compactor before being shown to
 > the model (lists capped, strings truncated, a fixed character budget), so the model never sees
-> unbounded hierarchy/property data. `create_part` is the only current *action* tool; after it
-> reports success the loop stops (see [AI.md](./AI.md)).
+> unbounded hierarchy/property data. `create_part`, `create_script`, and `modify_instance` are the
+> current *action* tools; after one of them reports success the loop stops (see [AI.md](./AI.md)).
 
 The CLI exposes `inspect_instance <path>` as a REPL command and
 `--inspect-instance-once --path <path>` as a one-shot flag. The path must be a non-empty string;
@@ -209,7 +215,7 @@ Each tool is described conceptually by:
 - **Expected output:** What the agent can expect back (success/failure, plus data).
 - **Why the agent might use it:** Typical situations where the tool is the right choice.
 
-> **Implemented tool anatomy (Phase 2B/4A/4B/4C):** every registered tool carries machine-readable
+> **Implemented tool anatomy (Phase 2B/4A/4B/4C/6A/6B):** every registered tool carries machine-readable
 > metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
 > against that schema before sending a `request`. `create_part` (Phase 2B), `inspect_hierarchy`
 > (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) are the implemented
@@ -262,6 +268,20 @@ Each tool is described conceptually by:
 - **Inputs (conceptual):** Instance reference, property/value pairs to set.
 - **Expected output:** Success/failure plus confirmation of the new property values.
 - **Why the agent might use it:** "make the cube red", "rename the model".
+- **Implemented (Phase 6B):** `path` (required non-empty string, full path from Workspace, e.g.
+  `"Workspace.SpawnLocation"` or `"Workspace/SpawnLocation"`) and `properties` (required non-empty
+  object of at least one **allowlisted** property). Result:
+  `{ path, className, changed }`. `properties` keys use the tool's Model 1 names, not Luau property
+  names. BasePart keys: `position`/`size` (object with numeric `x`, `y`, `z`), `anchored`/
+  `can_collide` (boolean), `transparency` (number in `0..1`), `color` (one of `"red"`, `"blue"`,
+  `"green"`, `"yellow"`, `"white"`, `"black"`, `"gray"`), `material` (same fixed list as
+  `create_part`). SpawnLocation keys: `enabled`/`neutral` (boolean), `duration` (number `>= 0`),
+  `team_color` (one of `"Really red"`, `"Bright blue"`, `"Bright green"`, `"Bright yellow"`,
+  `"White"`, `"Black"`, `"Medium stone grey"`). The CLI validates the whole request first and the
+  plugin re-validates as defense in depth; unknown keys, wrong types, empty `properties`, and
+  out-of-range values return `invalid_params` (nothing is applied). A path that does not resolve to
+  an instance returns `not_found`. Only the requested keys are written and echoed back in
+  `changed`; every other property is left untouched.
 
 ### delete_instance
 

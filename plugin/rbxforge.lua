@@ -1,11 +1,12 @@
 --!nonstrict
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
 -- + Phase 4B (find_instances) + Phase 4C (inspect_instance) + Phase 6A (create_script)
+-- + Phase 6B (modify_instance)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and five Studio operations: create_part, inspect_hierarchy, find_instances,
--- inspect_instance, and create_script (request/response).
+-- and six Studio operations: create_part, create_script, modify_instance,
+-- inspect_hierarchy, find_instances, and inspect_instance (request/response).
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -770,6 +771,254 @@ local function handleCreateScript(id, params)
 	})
 end
 
+-- Supported modify_instance property keys (Phase 6B). The CLI schema validates
+-- the same allowlist first (and rejects unknown property names before send);
+-- the plugin re-validates each value and applies the changes atomically. BasePart
+-- properties apply to any BasePart (including SpawnLocation, a BasePart subclass);
+-- SpawnLocation properties apply only to SpawnLocation instances.
+local BASEPART_MODIFY_PROPERTIES = {
+	position = "Position",
+	size = "Size",
+	anchored = "Anchored",
+	can_collide = "CanCollide",
+	transparency = "Transparency",
+	color = "Color",
+	material = "Material",
+}
+
+local SPAWNLOCATION_MODIFY_PROPERTIES = {
+	enabled = "Enabled",
+	duration = "Duration",
+	neutral = "Neutral",
+	team_color = "TeamColor",
+}
+
+-- Supported modify_instance team_color values (Phase 6B) as Roblox BrickColor
+-- names. Kept aligned with the 7 create_part colors (shared palette).
+local TEAM_COLORS = {
+	["Really red"] = BrickColor.new("Really red"),
+	["Bright blue"] = BrickColor.new("Bright blue"),
+	["Bright green"] = BrickColor.new("Bright green"),
+	["Bright yellow"] = BrickColor.new("Bright yellow"),
+	["White"] = BrickColor.new("White"),
+	["Black"] = BrickColor.new("Black"),
+	["Medium stone grey"] = BrickColor.new("Medium stone grey"),
+}
+
+-- Validates one BasePart property value and converts it to its Roblox value.
+-- Returns (robloxValue, echoValue, err) where err is nil on success; booleans
+-- (including false) are valid values, so only err (nil vs string) signals
+-- success/failure. Color/material reuse the create_part allowlists.
+local function resolveBasePartModifyValue(key, value)
+	if key == "position" or key == "size" then
+		local vec, vecErr = validateVec3(value, "params.properties." .. key)
+		if not vec then
+			return nil, nil, vecErr
+		end
+		return vec, { x = vec.X, y = vec.Y, z = vec.Z }, nil
+	elseif key == "anchored" or key == "can_collide" then
+		if type(value) ~= "boolean" then
+			return nil, nil, "params.properties." .. key .. " must be a boolean"
+		end
+		return value, value, nil
+	elseif key == "transparency" then
+		if type(value) ~= "number" then
+			return nil, nil, "params.properties.transparency must be a number"
+		end
+		if value < 0 or value > 1 then
+			return nil, nil, "params.properties.transparency must be in the range [0, 1]"
+		end
+		return value, value, nil
+	elseif key == "color" then
+		local color = PART_COLORS[value]
+		if type(value) ~= "string" or not color then
+			return nil, nil, "unsupported color: " .. tostring(value)
+		end
+		return color, value, nil
+	elseif key == "material" then
+		local material = PART_MATERIALS[value]
+		if type(value) ~= "string" or not material then
+			return nil, nil, "unsupported material: " .. tostring(value)
+		end
+		return material, value, nil
+	end
+	return nil, nil, "unsupported property: " .. tostring(key)
+end
+
+-- Validates one SpawnLocation-only property value and converts it to its
+-- Roblox value. Same return contract as resolveBasePartModifyValue.
+local function resolveSpawnLocationModifyValue(key, value)
+	if key == "enabled" or key == "neutral" then
+		if type(value) ~= "boolean" then
+			return nil, nil, "params.properties." .. key .. " must be a boolean"
+		end
+		return value, value, nil
+	elseif key == "duration" then
+		if type(value) ~= "number" then
+			return nil, nil, "params.properties.duration must be a number"
+		end
+		if value < 0 then
+			return nil, nil, "params.properties.duration must be at least 0"
+		end
+		return value, value, nil
+	elseif key == "team_color" then
+		local brickColor = TEAM_COLORS[value]
+		if type(value) ~= "string" or not brickColor then
+			return nil, nil, "unsupported team color: " .. tostring(value)
+		end
+		return brickColor, value, nil
+	end
+	return nil, nil, "unsupported property: " .. tostring(key)
+end
+
+local function handleModifyInstance(id, params)
+	params = params or {}
+	local path = params.path
+	if type(path) ~= "string" or path == "" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must be a non-empty string",
+		})
+	end
+	local properties = params.properties
+	if type(properties) ~= "table" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.properties must be an object",
+		})
+	end
+	if next(properties) == nil then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.properties must contain at least one property",
+		})
+	end
+
+	local segments = splitPathSegments(path)
+	if #segments < 2 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must name an instance inside Workspace "
+				.. "(e.g. \"Workspace.SpawnLocation\")",
+		})
+	end
+	if segments[1] ~= "Workspace" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must start with the Workspace root "
+				.. "(e.g. \"Workspace.SpawnLocation\")",
+		})
+	end
+	for _, segment in ipairs(segments) do
+		if segment == "" then
+			return sendResponse(id, false, {
+				code = "invalid_params",
+				message = "params.path contains an empty segment "
+					.. "(e.g. \"Workspace..Part\" or a trailing separator)",
+			})
+		end
+	end
+
+	local okResolve, target = pcall(resolveSegments, segments)
+	if not okResolve then
+		log("modify_instance resolve error: " .. tostring(target))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = tostring(target),
+		})
+	end
+	if not target then
+		return sendResponse(id, false, {
+			code = "not_found",
+			message = "instance not found at path: " .. path,
+		})
+	end
+
+	local isSpawnLocation = target:IsA("SpawnLocation")
+	local isBasePart = target:IsA("BasePart")
+	if not isSpawnLocation and not isBasePart then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "instance class '" .. target.ClassName .. "' supports no modifiable "
+				.. "properties",
+		})
+	end
+
+	-- Validate every requested property and build the ordered apply/echo lists.
+	-- All validation happens before any write so a single bad property rejects
+	-- the whole request with nothing applied.
+	local writes = {}
+	local changed = {}
+	for key, value in pairs(properties) do
+		local robloxValue, echoValue, err
+		local propertyName = BASEPART_MODIFY_PROPERTIES[key]
+		if propertyName then
+			robloxValue, echoValue, err = resolveBasePartModifyValue(key, value)
+		else
+			propertyName = SPAWNLOCATION_MODIFY_PROPERTIES[key]
+			if propertyName then
+				if not isSpawnLocation then
+					return sendResponse(id, false, {
+						code = "invalid_params",
+						message = "property '" .. key .. "' is only supported for "
+							.. "SpawnLocation instances",
+					})
+				end
+				robloxValue, echoValue, err = resolveSpawnLocationModifyValue(key, value)
+			else
+				return sendResponse(id, false, {
+					code = "invalid_params",
+					message = "unsupported property: " .. tostring(key),
+				})
+			end
+		end
+		if err then
+			return sendResponse(id, false, { code = "invalid_params", message = err })
+		end
+		table.insert(writes, { property = propertyName, value = robloxValue })
+		changed[key] = echoValue
+	end
+
+	-- Snapshot the originals so a failed apply can be rolled back atomically.
+	local originals = {}
+	for _, write in ipairs(writes) do
+		table.insert(originals, { property = write.property, value = target[write.property] })
+	end
+
+	local okApply, applyErr = pcall(function()
+		for _, write in ipairs(writes) do
+			target[write.property] = write.value
+		end
+	end)
+	if not okApply then
+		local okRollback = pcall(function()
+			for _, original in ipairs(originals) do
+				target[original.property] = original.value
+			end
+		end)
+		if not okRollback then
+			log("modify_instance rollback error")
+		end
+		log("modify_instance apply error: " .. tostring(applyErr))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = "could not apply properties: " .. tostring(applyErr),
+		})
+	end
+
+	log(string.format(
+		"modified %s (%s): %d property/properties",
+		target.Name,
+		target.ClassName,
+		#writes
+	))
+	return sendResponse(id, true, {
+		path = buildPath(target),
+		className = target.ClassName,
+		changed = changed,
+	})
+end
+
 -- Tool handler registry: incoming request messages are dispatched through this
 -- table rather than hard-coded branches. Each handler is registered by name with
 -- registerTool(); handleRequest looks the tool up here.
@@ -786,6 +1035,7 @@ end
 -- Registered tool handlers (dispatch happens in handleRequest).
 registerTool("create_part", handleCreatePart)
 registerTool("create_script", handleCreateScript)
+registerTool("modify_instance", handleModifyInstance)
 registerTool("inspect_hierarchy", handleInspectHierarchy)
 registerTool("find_instances", handleFindInstances)
 registerTool("inspect_instance", handleInspectInstance)

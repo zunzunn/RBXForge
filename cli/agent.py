@@ -375,8 +375,12 @@ def build_system_prompt(registry):
         "are returned to you on the next step.\n"
         "- find_instances locates instances by name; inspect_instance reads the "
         "safe properties of one instance by full path.\n"
-        "- create_part and create_script change the project; once a change tool "
-        "reports success, the task is complete - stop, do not call more tools.\n"
+        "- create_part and create_script change the project; once a change tool reports "
+        "success, the model may call inspect_instance exactly once to verify the "
+        "result if the target can be resolved and verification is useful; "
+        "verification is skipped when the tool result already provides sufficient "
+        "information and would be redundant. The task is complete after verification "
+        "or when the model decides not to verify.\n"
         "- modify_instance also changes the project: it modifies an allowlisted "
         "set of properties on one instance by path. After it succeeds you may "
         "call inspect_instance exactly once to verify the change if your "
@@ -493,6 +497,10 @@ class Agent:
         # exactly one optional inspect_instance verification step before the
         # loop ends. The reported action tool stays the modify_instance call.
         pending_verify = None
+        # Track whether find_instances or inspect_instance was called during
+        # this session, so we can conditionally enable verification after
+        # create_part/create_script when the model has gathered context.
+        inspection_called = False
 
         while True:
             # -- model ------------------------------------------------------- #
@@ -551,16 +559,36 @@ class Agent:
 
             # -- validate + execute through the registry only ---------------- #
             capturer = CapturingRBX(self.rbx)
-            output = None
-            failure = None
-            try:
-                output = self.registry.execute(capturer, call.name, call.arguments,
-                                               self.timeout)
-            except rbxforge.UnknownToolError as exc:
-                failure = {"code": "unknown_tool", "message": str(exc)}
-            except rbxforge.InvalidParamsError as exc:
-                failure = {"code": "invalid_arguments", "message": str(exc)}
-            if failure is None and not output:
+
+            # Phase 6B guard: if pending_verify is already set and this call
+            # matches the originally-executed action tool, skip re-execution
+            # and reuse the stored output. This prevents double-execution when
+            # the provider returns a scripted response that has already been
+            # handled (e.g. RecordingProvider returning the same call text).
+            skip_tool_execution = False
+            if (pending_verify is not None and
+                call.name == pending_verify["call"].name and
+                call.arguments == pending_verify["call"].arguments):
+                skip_tool_execution = True
+                output = pending_verify["output"]
+
+            if not skip_tool_execution:
+                output = None
+                failure = None
+                try:
+                    output = self.registry.execute(capturer, call.name, call.arguments,
+                                                   self.timeout)
+                except rbxforge.UnknownToolError as exc:
+                    failure = {"code": "unknown_tool", "message": str(exc)}
+                except rbxforge.InvalidParamsError as exc:
+                    failure = {"code": "invalid_arguments", "message": str(exc)}
+                if failure is None and not output:
+                    failure = {
+                        "code": "execution_failed",
+                        "message": "tool {0!r} did not report success".format(call.name),
+                    }
+
+            if not skip_tool_execution and failure is None and not output:
                 failure = {
                     "code": "execution_failed",
                     "message": "tool {0!r} did not report success".format(call.name),
@@ -582,6 +610,12 @@ class Agent:
                 "ok": failure is None,
             })
 
+            # Track if inspection tools were called, so we can conditionally
+            # enable verification after create_part/create_script when the
+            # model has gathered context.
+            if call.name in ("find_instances", "inspect_instance"):
+                inspection_called = True
+
             if failure is not None:
                 return AgentResult(
                     ok=False,
@@ -592,16 +626,28 @@ class Agent:
                     error=failure,
                 )
             if call.name in ACTION_TOOLS:
-                # Phase 6B: a successful modify_instance does not end the loop
+                # Phase 6B: a successful action tool does not end the loop
                 # immediately - it permits exactly one optional inspect_instance
-                # verification step before the loop ends.
-                if call.name == "modify_instance" and pending_verify is None:
-                    pending_verify = {"call": call, "output": output}
-                    messages.append(providers.message("assistant", last_text))
-                    messages.append(providers.message(
-                        "user", tool_result_message(issued, call, output, response_payload)
-                    ))
-                    continue
+                # verification step before the loop ends. After a successful
+                # mutation, the model may call inspect_instance to verify the
+                # result when the target can be resolved and verification is
+                # useful; verification is skipped when the tool result already
+                # provides sufficient information.
+                # modify_instance always permits verification; create_part and
+                # create_script only permit it when the model has previously
+                # called an inspection tool to gather project context.
+                if pending_verify is None:
+                    if call.name == "modify_instance":
+                        pending_verify = {"call": call, "output": output}
+                    elif call.name in ("create_part", "create_script") and inspection_called:
+                        pending_verify = {"call": call, "output": output}
+
+                    if pending_verify is not None:
+                        messages.append(providers.message("assistant", last_text))
+                        messages.append(providers.message(
+                            "user", tool_result_message(issued, call, output, response_payload)
+                        ))
+                        continue
                 return AgentResult(
                     ok=True,
                     tool=call,

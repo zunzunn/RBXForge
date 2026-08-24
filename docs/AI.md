@@ -4,26 +4,13 @@
 > (Phases 3A–3C); the **bounded multi-step agent loop with project inspection** is
 > implemented in Phase 4D; a **second real provider (Groq, hosted)** is implemented in Phase 4E.
 >
-> - **Implemented (Phase 3A):** a provider-agnostic chat/inference interface in
->   `cli/providers.py`, an **Ollama** backend (local HTTP API), a **mock** backend for tests, and
->   environment-based configuration. NVIDIA **NIM** is recognized by the design (decision D-009)
->   but **not implemented**.
-> - **Implemented (Phase 3B):** `cli/agent.py` — a minimal single-step agent that connects the
->   provider layer to the tool layer: natural-language prompt → provider → structured JSON tool
->   call → validation + execution through the `ToolRegistry`.
-> - **Implemented (Phase 3C):** the interactive REPL treats ordinary text as an AI prompt —
->   `RBXForge> create a red cube` reaches Studio via the agent → ToolRegistry → plugin pipeline.
-> - **Implemented (Phase 4D):** the agent is now a **bounded multi-step loop**. The model may
->   call the inspection tools (`find_instances`, `inspect_instance`, `inspect_hierarchy`) to
->   gather live project context, each tool result is returned to the model (bounded, compacted),
->   and the model can then act (e.g. `create_part`). The loop is capped at **5 tool calls per
->   request**, only executes through the existing `ToolRegistry`, and never exposes unbounded
->   hierarchy/property data to the model.
-> - **Implemented (Phase 4E):** a **Groq** backend (`RBXFORGE_PROVIDER=groq`) using Groq's
->   OpenAI-compatible chat API — same `chat` interface, same JSON-in-text tool calling, so the
->   agent loop works unchanged against a hosted model.
-> - **Not implemented yet:** long-form conversation history / context management, provider-native
->   tool calling, and a full plan → verify → fix loop.
+> **Implemented (Phase 6C):** the bounded multi-step agent loop with project inspection
+> and optional verification. The model may call the inspection tools
+> (`find_instances`, `inspect_instance`, `inspect_hierarchy`) to gather live project context;
+> each tool result is returned to the model as a bounded, compacted payload, so it can decide
+> the next step. It eventually executes an action tool (`create_part`, `create_script`,
+> `modify_instance`). The loop is capped at **5 tool calls per request**, only executes through
+> the existing `ToolRegistry`, and never exposes unbounded hierarchy/property data to the model.
 
 ## Purpose
 
@@ -152,13 +139,15 @@ Studio plugin           →   concise "[rbxforge] AI OK: called 'create_part' ->
   environment (`agent_from_env`, registry + connection wired to the running RBXForge) and
   reused afterwards.
 
-## Agent / Tool Calling (Implemented — Phase 3B + Phase 4D)
+## Agent / Tool Calling (Implemented — Phase 3B + Phase 4D + Phase 6C)
 
 > **Implemented (Phase 3B):** `cli/agent.py` connects the provider layer to the Phase 2B tool
 > layer as a **single-step** pass: `prompt → provider → tool call → execution` then return.
 > **Extended (Phase 4D):** the same `Agent.run(prompt)` now drives a **bounded multi-step loop**
-> with project inspection. Single-step behavior is preserved for simple requests (a model that
-> answers with one `create_part` call executes it once and stops).
+> with project inspection. Single-step behavior is preserved for simple requests.
+> **Extended (Phase 6C):** the loop permits optional verification via `inspect_instance`
+> after action tool success, conditional on whether the model previously called an inspection
+> tool to gather project context.
 
 The Phase 3B single-step flow (still how each individual tool call is handled):
 
@@ -176,9 +165,9 @@ The Phase 3B single-step flow (still how each individual tool call is handled):
    is sent to the plugin. A falsy tool result becomes `execution_failed`.
 5. **Result.** `AgentResult` carries `ok`, the parsed `tool`, the tool layer's `output`, an
    `error` dict (`code`/`message`/`type`), the raw `provider_text` for diagnostics, plus (Phase
-   4D) an optional final `message` and an ordered `steps` list of each call's outcome.
+   4D/6C) an optional final `message` and an ordered `steps` list of each call's outcome.
 
-The Phase 4D multi-step loop:
+The Phase 4D/6C multi-step loop:
 
 ```
 User prompt
@@ -193,16 +182,21 @@ bounded compacted result is appended to the conversation
    ↓
 model can call find_instances / inspect_instance / inspect_hierarchy again, or act
    ↓
-action tool (create_part) succeeds  →  loop stops, concise final AgentResult
+action tool succeeds → loop permits exactly one optional inspect_instance
+  verification step before ending (conditional on whether the model
+  previously called an inspection tool during the same request to gather project context).
+  modify_instance also permits exactly one optional inspect_instance verification step
+  after success (existing Phase 4D behavior).
 ```
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
   budget remains.
-- **Stopping:** the loop ends on an executed **action tool** (`create_part`), a final model
-  report (`{"message": ...}`), a hard rejection (`unknown_tool` / `invalid_arguments` /
-  `malformed_output` / `provider_error` / `execution_failed`), or the **5-call budget** being
-  exhausted (`max_tool_calls`). It stops rather than guessing when it cannot determine what to do.
+- **Stopping:** the loop ends on an executed **action tool** (`create_part`, `create_script`,
+  `modify_instance`), a final model report (`{"message": ...}`), a hard rejection
+  (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
+  `execution_failed`), or the **5-call budget** being exhausted (`max_tool_calls`). It stops
+  rather than guessing when it cannot determine what to do.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never
@@ -213,8 +207,19 @@ action tool (create_part) succeeds  →  loop stops, concise final AgentResult
 - `Agent(provider, registry=..., rbx=..., timeout=..., max_tool_calls=5)` — `max_tool_calls` is
   the per-request bound. `agent_from_env()` builds the agent with the provider configured from
   the environment (defaults to Ollama, see Configuration above).
-- Simple prompts behave exactly as under Phase 3B: the first model reply is a `create_part` call,
-  it executes, and the loop returns — one chat call, one tool call.
+- **Simple prompts** (e.g. "create a red cube") behave exactly as under Phase 3B: the first
+  model reply is a `create_part` or `create_script` call, it executes, and the loop returns —
+  one chat call, one tool call. **If the model previously called an inspection tool** (`find_instances`
+  or `inspect_instance`) **during the same request**, one optional `inspect_instance`
+  verification step is permitted before the loop ends.
+- **Verification behavior:**
+  - `modify_instance`: after success, exactly one optional `inspect_instance` verification
+    step is permitted (existing Phase 4D behavior).
+  - `create_part`/`create_script`: after success, an optional `inspect_instance` verification
+    step is permitted **only if the model previously called an inspection tool** (`find_instances`
+    or `inspect_instance`) during the same request, allowing it to verify the newly-created
+    instance against the gathered context. Verification is skipped when the tool result already
+    provides sufficient information or when no inspection context was gathered.
 - Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet; the loop
   relies on plain `chat` output parsed as JSON (one object per step). Normalizing
   provider-specific tool-call formats behind the provider abstraction is future work.
@@ -225,16 +230,16 @@ action tool (create_part) succeeds  →  loop stops, concise final AgentResult
 ## Context Management
 
 - Keep the conversation context within practical limits (bounded by the per-request tool-call
-  budget and the bounded tool-result compaction in Phase 4D).
+  budget and the bounded tool-result compaction in Phase 4D/6C).
 - Trim or summarize older turns when needed.
-- Tool results must be included in context so the model knows what happened — Phase 4D appends
+- Tool results must be included in context so the model knows what happened — Phase 4D/6D appends
   a compacted, bounded result after every executed inspection/action call.
 - Long-form conversation history / trimming across user requests is **not** yet defined; this is
   an open area.
 
 ## Project Context
 
-- The agent loads only **relevant, live** project context — the Phase 4D loop lets the model call
+- The agent loads only **relevant, live** project context — the Phase 4D/6C loop lets the model call
   `find_instances` / `inspect_instance` / `inspect_hierarchy` against the current Workspace and
   acts on the bounded results, rather than dumping the entire project into the prompt
   (decision D-012 preserved).
@@ -256,13 +261,13 @@ action tool (create_part) succeeds  →  loop stops, concise final AgentResult
 - Groq is implemented (Phase 4E) with its own client over the OpenAI-compatible endpoint; failing
   requests surface the same typed errors, and responses missing `choices[0].message.content` are
   rejected as `ProviderResponseError` rather than silently producing empty text.
-- The Phase 3B/4D agent converts provider errors into `provider_error` results, malformed model
+- The Phase 3B/4D/6C agent converts provider errors into `provider_error` results, malformed model
   output into `malformed_output` results, and registry rejections into `unknown_tool` /
   `invalid_arguments` results — none of these crash the caller. If the loop cannot determine what
   to do (e.g. it exhausts the per-request tool-call budget without completing, code
   `max_tool_calls`), it returns a clear failure instead of guessing.
 - The full agent loop (diagnose/fix/verify cycling, see [AGENT.md](./AGENT.md)) beyond the bounded
-  Phase 4D loop is **not** implemented yet.
+  Phase 4D/6C loop is **not** implemented yet.
 - Exact retry/backoff behavior is not yet defined.
 
 ## Open Questions

@@ -620,11 +620,13 @@ def scenario_multistep_find_then_inspect_then_report():
 
 def scenario_multistep_inspect_then_create_part():
     """The model must be able to inspect an object and then execute create_part
-    using the gathered context; the loop stops after the action tool."""
+    using the gathered context; the loop permits one optional inspect_instance
+    verification step after the action tool (Phase 6B)."""
     mod = load_agent_module()
     provider = SequenceProvider([
         inspect_call("Workspace/Shop"),
         part_call(),
+        json.dumps({"message": "Added a floor part to the shop."}),
     ])
     rbx = MultiFakeRBX({
         "inspect_instance": inspect_payload("Shop", properties={"PrimaryPart": "Workspace/Shop/Main"}),
@@ -636,7 +638,7 @@ def scenario_multistep_inspect_then_create_part():
     assert result.ok is True, result
     assert result.tool.name == "create_part", result
     assert result.output is True, result
-    assert result.message is None, result
+    assert result.message == "Added a floor part to the shop.", result.message
     assert [step["tool"] for step in result.steps] == ["inspect_instance", "create_part"], \
         result.steps
 
@@ -645,10 +647,11 @@ def scenario_multistep_inspect_then_create_part():
         ("create_part", valid_part_arguments()),
     ], rbx.requests
 
-    # Three chat calls happened (inspect -> result -> action) and no more: the
-    # loop does not ask for a summary after an action tool succeeds.
-    assert len(provider.chat_calls) == 2, len(provider.chat_calls)
-    print("OK  multi-step: inspect_instance -> create_part (single requests preserved)")
+    # Three chat calls happened (inspect -> result -> action, then final report):
+    # the loop permits one optional inspect_instance verification step after
+    # the action tool succeeds, and the model completes with a final report.
+    assert len(provider.chat_calls) == 3, len(provider.chat_calls)
+    assert result.message == "Added a floor part to the shop.", result.message
 
 
 def scenario_multistep_single_call_still_single_step():

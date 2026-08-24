@@ -57,12 +57,29 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 | CLI | **Implemented (Phases 1–4D)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` tools ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Implemented (bounded, Phase 3B → 4D)** — `prompt → provider → tool call → ... → action` multi-step loop in `cli/agent.py`: inspection tools feed bounded results back to the model (max 5 tool calls per request); single-step requests preserve the original behavior |
 | AI provider layer | **Implemented (Phase 3A + Phase 4E)** — `cli/providers.py`: provider interface, Ollama + Groq + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
-| Agent loop | **Partially implemented (Phase 4D)** — a bounded multi-step loop (inspect → act) is done; the full understand/plan/verify/fix cycle is planned |
+| Agent loop | **Implemented (Phase 4D → 6C)** — bounded multi-step loop with project inspection
+  and optional verification. The model inspects the live Roblox project via the inspection
+  tools, receives bounded tool results, and then acts through an action tool. After an action
+  tool succeeds, the model may call `inspect_instance` for verification under two conditions:
+  - For `modify_instance`: always permitted (one optional verification step after success).
+  - For `create_part`/`create_script`: permitted only if the model previously called an inspection
+    tool (`find_instances` or `inspect_instance`) during the same request, allowing it to verify
+    the newly-created instance against gathered context. Verification is skipped when the tool
+    result already provides sufficient information. Single-step requests preserve the original
+  behavior: one model call → one tool call → done (unless inspection context was gathered).
+  The full understand/plan/verify/fix autonomy is still planned. |
 | Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) live end-to-end (CLI + plugin); more tools planned |
 | Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C + Phase 4D)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; the Phase 4D agent loop drives these live before acting; indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
 | Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, and `inspect_instance`, see [PLUGIN.md](./PLUGIN.md) |
-| Verification system | **Planned** — future |
+| Verification system | **Implemented (Phase 6C)** — optional verification after action tool success. After
+  a successful `modify_instance`, exactly one `inspect_instance` verification step is permitted.
+  After a successful `create_part`/`create_script`, one `inspect_instance` verification step is
+  permitted if the model previously called an inspection tool during the same request. Verification
+  is skipped when the tool result already provides sufficient information. The system distinguishes
+  between the mutation success and independently verified properties; it may state that the mutation
+  succeeded while distinguishing that from independently verified properties. See [AI.md](./AI.md)
+  for the full verification behavior specification.
 
 Implemented today: the Phase 1 local connection, the Phase 2 tool layer (create_part), the
 Phase 3A AI provider layer, the Phase 3B single-step agent, the Phase 3C interactive

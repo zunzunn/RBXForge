@@ -1144,8 +1144,7 @@ class RBXForge:
         with self.pong_lock:
             self.pong_events.pop(mid, None)
         if event["received_at"] is not None:
-            rtt = (event["received_at"] - started) * 1000.0
-            self.log("PONG received for {0} in {1:.1f} ms".format(mid, rtt))
+            self.log("✓ PONG received")
             return True
         self.log("timed out waiting for pong ({0}) after {1:g}s".format(mid, timeout))
         return False

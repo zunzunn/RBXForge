@@ -8,7 +8,10 @@
 > (`find_instances`), the Phase 4C single-instance inspection (`inspect_instance`), the
 > **Phase 4D bounded multi-step agent loop** (the model inspects the live project via the
 > inspection tools, results are fed back bounded, and it then acts), and the **Phase 4E Groq
-> provider** (a second real AI backend via Groq's OpenAI-compatible chat API) are implemented.
+> provider** (a second real AI backend via Groq's OpenAI-compatible chat API) are implemented,
+> as is the **Phase 7A asset discovery** tool (`asset_search`), the first tool whose execution
+> is a read-only **local HTTP** call to the Roblox Open Cloud Creator Store API rather than a
+> plugin request.
 > A full verify → fix → report cycle remains planned.
 
 ## Overview
@@ -54,7 +57,7 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–4D)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` tools ([TOOLS.md](./TOOLS.md)) |
+| CLI | **Implemented (Phases 1–4D + Phase 7A)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`asset_search`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` + `asset_search` tools ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Implemented (bounded, Phase 3B → 4D)** — `prompt → provider → tool call → ... → action` multi-step loop in `cli/agent.py`: inspection tools feed bounded results back to the model (max 5 tool calls per request); single-step requests preserve the original behavior |
 | AI provider layer | **Implemented (Phase 3A + Phase 4E)** — `cli/providers.py`: provider interface, Ollama + Groq + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Implemented (Phase 4D → 6C)** — bounded multi-step loop with project inspection
@@ -68,7 +71,7 @@ connects a user prompt to changes that actually appear in Roblox Studio.
     result already provides sufficient information. Single-step requests preserve the original
   behavior: one model call → one tool call → done (unless inspection context was gathered).
   The full understand/plan/verify/fix autonomy is still planned. |
-| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) live end-to-end (CLI + plugin); more tools planned |
+| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7A)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A), and `modify_instance` (Phase 6B) live end-to-end (CLI + plugin); `asset_search` (Phase 7A) is schema-registered alongside them but executes as a local HTTP call (no plugin handler); more tools planned |
 | Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C + Phase 4D)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; the Phase 4D agent loop drives these live before acting; indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
 | Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, and `inspect_instance`, see [PLUGIN.md](./PLUGIN.md) |
@@ -219,8 +222,11 @@ instance name (case-insensitive substring match) and returns each match's Name, 
 full Instance path, bounded by `max_results`, and `inspect_instance` (Phase 4C) reads one
 instance by its full path and returns its identity, full path, parent path, and an allowlisted
 safe-property set. `create_script` (Phase 6A) creates a Script/LocalScript/ModuleScript with
-optional Luau source at a game-rooted parent path (or the per-type default container). The
-remaining conceptual tools are not implemented.
+optional Luau source at a game-rooted parent path (or the per-type default container).
+`modify_instance` (Phase 6B) changes a small allowlisted property set on one live instance.
+`asset_search` (Phase 7A) searches the public Roblox Creator Store over the Open Cloud API —
+a read-only local HTTP call that is deliberately **not** a Studio operation. The remaining
+conceptual tools are not implemented.
 
 ### Project Inspection / Index
 

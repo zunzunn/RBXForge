@@ -149,9 +149,16 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["create_part", "create_script", "find_instances",
+    assert names == ["asset_search", "create_part", "create_script", "find_instances",
                      "inspect_hierarchy", "inspect_instance", "modify_instance"], names
-    create_part = defs[0]
+    asset_search = defs[0]
+    assert isinstance(asset_search["description"], str) and asset_search["description"]
+    assert asset_search["parameters"]["type"] == "object"
+    assert set(asset_search["parameters"]["required"]) == {"query"}, asset_search
+    assert set(asset_search["parameters"]["properties"]) == {
+        "query", "asset_type", "max_results",
+    }, asset_search
+    create_part = [entry for entry in defs if entry["name"] == "create_part"][0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"
     assert set(create_part["parameters"]["required"]) == {
@@ -195,7 +202,7 @@ def scenario_tool_definitions_sent_to_ai():
     }, create_part
     assert create_part["parameters"]["required"] == ["name", "position", "size", "color"], \
         create_part
-    create_script = defs[1]
+    create_script = next(d for d in defs if d["name"] == "create_script")
     assert isinstance(create_script["description"], str) and create_script["description"]
     assert create_script["parameters"]["type"] == "object"
     assert create_script["parameters"]["required"] == ["name"], create_script
@@ -434,7 +441,7 @@ def scenario_regression_vec3_format_guidance():
     # an explicit object schema with numeric x/y/z, so the model knows the shape.
     mod = load_agent_module()
     agent = make_agent(RecordingProvider(""))
-    create_part = agent.tool_definitions()[0]
+    create_part = [entry for entry in agent.tool_definitions() if entry["name"] == "create_part"][0]
     vec = create_part["parameters"]["properties"]["position"]
     assert vec["type"] == "object", vec
     assert vec["required"] == ["x", "y", "z"], vec
@@ -736,13 +743,13 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 6, tools
+    assert isinstance(tools, list) and len(tools) == 7, tools
     names = [tool["name"] for tool in tools]
-    assert names == ["create_part", "create_script", "find_instances",
+    assert names == ["asset_search", "create_part", "create_script", "find_instances",
                      "inspect_hierarchy", "inspect_instance", "modify_instance"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
-    create_part = tools[0]
+    create_part = [tool for tool in tools if tool["name"] == "create_part"][0]
     assert create_part["description"], create_part
     assert create_part["parameters"]["type"] == "object", create_part
     assert create_part["parameters"]["properties"]["position"]["type"] == "object", \

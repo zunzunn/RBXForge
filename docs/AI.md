@@ -11,6 +11,11 @@
 > the next step. It eventually executes an action tool (`create_part`, `create_script`,
 > `modify_instance`). The loop is capped at **5 tool calls per request**, only executes through
 > the existing `ToolRegistry`, and never exposes unbounded hierarchy/property data to the model.
+>
+> **Implemented (Phase 7A):** `asset_search` is exposed to the model as a read-only Creator
+> Store search tool (local HTTP, not a plugin tool). It is **not** an action tool: a successful
+> search never ends the loop, and its dict result is compacted for the model the same way plugin
+> results are.
 
 ## Purpose
 
@@ -189,6 +194,11 @@ action tool succeeds → loop permits exactly one optional inspect_instance
   after success (existing Phase 4D behavior).
 ```
 
+`asset_search` (Phase 7A) participates in the same loop but executes as a **local HTTP call**
+(no plugin `request`), so `ToolRegistry.execute  → Studio (plugin)` does not apply to it. Its
+structured dict result takes the place of the plugin `response` payload when the loop compacts
+what to show the model.
+
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
   budget remains.
@@ -196,7 +206,8 @@ action tool succeeds → loop permits exactly one optional inspect_instance
   `modify_instance`), a final model report (`{"message": ...}`), a hard rejection
   (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
   `execution_failed`), or the **5-call budget** being exhausted (`max_tool_calls`). It stops
-  rather than guessing when it cannot determine what to do.
+  rather than guessing when it cannot determine what to do. `asset_search` is **not** an action
+  tool, so a successful search alone never ends the loop.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never

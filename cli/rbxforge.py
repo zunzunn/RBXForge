@@ -12,9 +12,11 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   create_script (Phase 6A) creates a Luau script, modify_instance (Phase 6B)
   modifies an allowlisted set of properties on an existing instance,
   inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree,
-  find_instances (Phase 4B) searches the live Workspace hierarchy by name, and
+  find_instances (Phase 4B) searches the live Workspace hierarchy by name,
   inspect_instance (Phase 4C) inspects one instance by its full path
-  (request/response over the same socket)
+  (request/response over the same socket), and asset_search (Phase 7A) searches
+  the Roblox Creator Store over the Open Cloud API -- a read-only local HTTP
+  call that intentionally does NOT use the WebSocket/plugin path
 - an interactive AI REPL: ordinary text input is sent to the AI agent
   (cli/agent.py, Phase 4D), which drives a bounded multi-step loop - the model
   can call the inspection tools for project context, then an action tool such
@@ -38,10 +40,14 @@ Usage:
                   [--timeout SEC] [--request-timeout SEC]
     rbxforge --modify-instance-once --path PATH --properties JSON
                   [--host HOST] [--port PORT] [--timeout SEC] [--request-timeout SEC]
+    rbxforge --asset-search-once --query TEXT [--asset-type TYPE] [--max-results N]
+                  [--host HOST] [--port PORT] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
-prompt input.
+prompt input. The read-only asset_search tool (Phase 7A) searches the Roblox
+Creator Store over the Open Cloud API and needs RBXFORGE_OPEN_CLOUD_API_KEY
+(see cli/roblox_assets.py); it runs locally and does not touch the plugin.
 
 Protocol details: see docs/PROTOCOL.md.
 """
@@ -931,6 +937,100 @@ def inspect_instance_tool():
     )
 
 
+# Creator Store asset search (Phase 7A). `query` is required and must be a
+# non-empty string; `asset_type` is an optional strict allowlist (the official
+# searchCategoryType values); `max_results` is optional (the CLI applies the
+# default below when omitted) and must be a whole number in [1, 20] so the API
+# page stays bounded.
+DEFAULT_ASSET_MAX_RESULTS = 5
+MAX_ASSET_RESULTS = 20
+
+
+def asset_search_tool():
+    """Build the asset_search tool (Phase 7A).
+
+    Searches the public Roblox Creator Store via the official Open Cloud
+    Creator Store API (cli/roblox_assets.py). This is a READ-ONLY local HTTP
+    call from this process -- it deliberately does NOT go over the
+    WebSocket/plugin protocol, and nothing is inserted, cloned, downloaded,
+    or purchased. Configuration comes from the environment
+    (RBXFORGE_OPEN_CLOUD_API_KEY; optional base URL / timeout), or from the
+    connection's injected ``asset_client`` when one was provided. The returned
+    structured result dict (truthy) is what the agent shows to the model as a
+    bounded tool result; on failure the tool logs and returns False.
+    """
+
+    def run(rbx, params, timeout):
+        assets_mod = _import_assets()
+        if assets_mod is None:
+            rbx.log("asset_search FAILED: cli/roblox_assets.py could not be imported")
+            return False
+        client = None
+        resolver = getattr(rbx, "assets", None)
+        if resolver is not None:
+            try:
+                client = resolver()
+            except assets_mod.AssetConfigError as exc:
+                rbx.log("asset_search FAILED: {0}".format(exc))
+                return False
+        if client is None:
+            try:
+                client = assets_mod.asset_client_from_env()
+            except assets_mod.AssetConfigError as exc:
+                rbx.log("asset_search FAILED: {0}".format(exc))
+                return False
+        max_results = params.get("max_results") or DEFAULT_ASSET_MAX_RESULTS
+        search_kwargs = {
+            "query": params["query"],
+            "asset_type": params.get("asset_type"),
+            "max_results": max_results,
+        }
+        try:
+            result = client.search(**search_kwargs)
+        except assets_mod.AssetConfigError as exc:
+            rbx.log("asset_search FAILED: {0}".format(exc))
+            return False
+        except assets_mod.AssetError as exc:
+            rbx.log("asset_search FAILED: {0}".format(exc))
+            return False
+        summary = "asset_search OK: {0} result(s) for query {1!r}".format(
+            len(result.get("results") or []), result.get("query")
+        )
+        if result.get("asset_type"):
+            summary += " (asset_type={0})".format(result["asset_type"])
+        if result.get("truncated"):
+            summary += " (truncated - more results exist beyond max_results)"
+        rbx.log(summary)
+        return result
+
+    module = _import_assets()
+    if module is None:
+        raise RuntimeError("cli/roblox_assets.py could not be imported")
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "min_length": 1},
+            "asset_type": {"type": "string", "enum": list(module.ASSET_TYPES)},
+            "max_results": {
+                "type": "number", "integer": True,
+                "minimum": 1, "maximum": MAX_ASSET_RESULTS,
+            },
+        },
+        "required": ["query"],
+    }
+    return Tool(
+        "asset_search",
+        "Search the public Roblox Creator Store for assets (models, decals, "
+        "audio, plugins, meshes, videos, font families) matching a query and "
+        "return a bounded list of matches with id, name, type, creator, "
+        "description, and thumbnail URL. Read-only: nothing is inserted, "
+        "cloned, downloaded, or purchased. Requires an Open Cloud API key set "
+        "in RBXFORGE_OPEN_CLOUD_API_KEY.",
+        schema,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
@@ -940,6 +1040,7 @@ def default_registry():
     registry.register(inspect_hierarchy_tool())
     registry.register(find_instances_tool())
     registry.register(inspect_instance_tool())
+    registry.register(asset_search_tool())
     return registry
 
 
@@ -969,6 +1070,39 @@ def _import_agent():
             return None
 
 
+def _import_assets():
+    """Lazily import cli/roblox_assets.py and return the module (or None).
+
+    Mirrors ``_import_agent``: works both when this file runs as a script and
+    when it is loaded in-process by tests. The import is lazy so plain CLI use
+    never loads the asset-discovery layer unless an asset_search call happens.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    try:
+        import roblox_assets
+        return roblox_assets
+    except ImportError:
+        here = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        try:
+            import roblox_assets  # reload after cli/ was added to sys.path
+            return roblox_assets
+        except ImportError:
+            return None
+
+
+def _asset_client_from_env():
+    """Build a RobloxAssetClient from the environment, or None on import failure."""
+    module = _import_assets()
+    if module is None:
+        return None
+    return module.asset_client_from_env()
+
+
 # --------------------------------------------------------------------------- #
 # RBXForge protocol layer (see docs/PROTOCOL.md)
 # --------------------------------------------------------------------------- #
@@ -977,11 +1111,13 @@ def _import_agent():
 class RBXForge:
     """Connection tracking, message dispatch, and the ping command."""
 
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, console=None, registry=None):
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, console=None, registry=None,
+                 asset_client=None):
         self.host = host
         self.port = port
         self.console = console if console is not None else REPLConsole()
         self.registry = registry if registry is not None else default_registry()
+        self._asset_client = asset_client
         self.server = None
         self.connection = None
         self.connection_lock = threading.Lock()
@@ -999,6 +1135,18 @@ class RBXForge:
 
     def error(self, message):
         self.console.error(message)
+
+    def assets(self):
+        """Return the configured Roblox asset-search client (Phase 7A).
+
+        Builds and caches one lazily from the environment
+        (RBXFORGE_OPEN_CLOUD_API_KEY, see cli/roblox_assets.py) on first use,
+        unless an ``asset_client`` was injected at construction. Raises the
+        client's AssetConfigError when no API key is configured.
+        """
+        if self._asset_client is None:
+            self._asset_client = _asset_client_from_env()
+        return self._asset_client
 
     # -- server callbacks -------------------------------------------------- #
 
@@ -1250,6 +1398,22 @@ class RBXForge:
         """
         return self.execute_tool("inspect_instance", {"path": path}, timeout)
 
+    def asset_search(self, query, asset_type=None, max_results=None, timeout=10.0):
+        """Search the Creator Store (Phase 7A) via the asset_search tool.
+
+        Read-only: the search runs locally over the Open Cloud Creator Store
+        API (see cli/roblox_assets.py) and never touches the plugin or the
+        WebSocket protocol. Requires RBXFORGE_OPEN_CLOUD_API_KEY in the
+        environment (or an injected ``asset_client``). Returns the bounded
+        result dict on success (truthy), or False on failure.
+        """
+        params = {"query": query}
+        if asset_type is not None:
+            params["asset_type"] = asset_type
+        if max_results is not None:
+            params["max_results"] = max_results
+        return self.execute_tool("asset_search", params, timeout)
+
     def ask(self, prompt):
         """Run one natural-language prompt through the AI agent (Phase 3B-4D).
 
@@ -1407,6 +1571,22 @@ def repl(rbx, console, prompt="RBXForge> "):
                         "'inspect_instance Workspace.SpawnLocation')")
             else:
                 rbx.inspect_instance(after)
+        elif command == "asset_search":
+            after = line.strip()[len(command):].strip()
+            if not after:
+                rbx.log("asset_search: no query given (e.g. 'asset_search sword')")
+            else:
+                max_results = None
+                words = after.split()
+                if len(words) >= 2:
+                    try:
+                        parsed = int(words[-1])
+                    except ValueError:
+                        pass
+                    else:
+                        max_results = parsed
+                        after = " ".join(words[:-1])
+                rbx.asset_search(after, max_results=max_results)
         elif command == "status":
             with rbx.connection_lock:
                 client = rbx.connection
@@ -1440,6 +1620,9 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("  inspect_instance <path>")
             print("              - inspect one Workspace instance by its full path")
             print("                (e.g. Workspace.SpawnLocation)")
+            print("  asset_search <query> [max_results]")
+            print("              - search the Creator Store over the Open Cloud API")
+            print("                (read-only; default max_results: 5)")
             print("  status      - show connection status")
             print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
@@ -1503,13 +1686,19 @@ def main(argv=None):
              "--path, report, then exit",
     )
     parser.add_argument(
+        "--asset-search-once", action="store_true",
+        help="search the Creator Store for --query over the Open Cloud API "
+             "(read-only, local HTTP, no plugin needed), report, then exit",
+    )
+    parser.add_argument(
         "--depth", type=int, default=None,
         help="maximum hierarchy depth for --inspect-hierarchy-once (default: 3; "
              "must be a whole number in 1..{0})".format(MAX_HIERARCHY_DEPTH),
     )
     parser.add_argument(
         "--query", default=None,
-        help="instance name query for --find-instances-once",
+        help="instance name query for --find-instances-once, or Creator Store "
+             "query for --asset-search-once",
     )
     parser.add_argument(
         "--path", default=None,
@@ -1524,7 +1713,13 @@ def main(argv=None):
     parser.add_argument(
         "--max-results", type=int, default=None,
         help="maximum matches for --find-instances-once (default: {0}; must be a "
-             "whole number in 1..{1})".format(DEFAULT_FIND_MAX_RESULTS, MAX_FIND_RESULTS),
+             "whole number in 1..{1}) or --asset-search-once (default: 5; must "
+             "be a whole number in 1..20)".format(DEFAULT_FIND_MAX_RESULTS, MAX_FIND_RESULTS),
+    )
+    parser.add_argument(
+        "--asset-type", default=None,
+        help="optional Creator Store category filter for --asset-search-once, one "
+             "of Audio, Model, Decal, Plugin, MeshPart, Video, FontFamily",
     )
     parser.add_argument(
         "--timeout", type=float, default=30.0,
@@ -1599,6 +1794,16 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.inspect_instance(args.path, args.request_timeout) else 4
+        if args.asset_search_once:
+            if not args.query:
+                rbx.error("--asset-search-once requires --query <text>")
+                return 2
+            # Deliberately no wait_for_plugin: asset_search is a local HTTP
+            # call over the Open Cloud API, not a WebSocket/plugin request.
+            return 0 if rbx.asset_search(
+                args.query, asset_type=args.asset_type,
+                max_results=args.max_results, timeout=args.request_timeout,
+            ) else 4
         repl(rbx, console)
     finally:
         rbx.stop()

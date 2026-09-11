@@ -262,6 +262,35 @@ speaks Groq's OpenAI-compatible chat API (`POST {base_url}/chat/completions`), s
 
 **Explicitly NOT included:** Anything that cannot be verified inside the open Studio project.
 
+### Phase 7A — Asset Discovery (Open Cloud Creator Store)
+
+> **Status:** Implementing / done. `asset_search` (read-only Creator Store search over the
+> Open Cloud API) is implemented and verified with automated tests.
+
+**Goal:** let the agent discover **real** Roblox assets (models, decals, audio, plugins,
+meshes, videos, font families) without touching the open Studio project.
+
+**Deliverables:**
+
+- `cli/roblox_assets.py`: a read-only Open Cloud Creator Store search client (API key from the
+  environment, `x-api-key` header, HTTP 429 retry with backoff, typed errors, defensive parsing).
+- `asset_search` tool registered in the CLI `ToolRegistry` and exposed to the REPL
+  (`asset_search <query> [max_results]`), the one-shot CLI (`--asset-search-once`), and the
+  agent (never an action tool — it does not end the loop).
+- Bounded structured results: `{ query, asset_type, max_results, count, total, truncated,
+  results }`.
+
+**Verification criteria:**
+
+- Automated tests cover config, request/response parsing, HTTP errors, rate limiting,
+  timeouts, schema validation, REPL/one-shot exit codes, and agent exposure.
+- The tool never sends a WebSocket `request` and never modifies the project/plugin.
+
+**Dependencies:** Phases 3, 4.
+
+**Explicitly NOT included:** inserting/cloning/downloading/purchasing assets; the general
+autonomous-development goals of Phase 7.
+
 ---
 
 ## No Dates
@@ -286,4 +315,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`; 4D AI project context / bounded multi-step agent loop done; 4E hosted Groq provider done; 6C verification behavior extensions) |
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
-| Phase 7 — Autonomous Game Development | Not started |
+| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop) |

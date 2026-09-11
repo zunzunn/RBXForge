@@ -1,8 +1,8 @@
 # RBXForge — Tool System
 
-> **Status:** Six tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Seven tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
-> modify_instance in Phase 6B); the rest is conceptual. The
+> modify_instance in Phase 6B, asset_search in Phase 7A); the rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
 > of these tools without adding any new tool.
 >
@@ -26,6 +26,12 @@
 > - **Implemented (Phase 6B):** `modify_instance` changes a small **allowlisted** set of
 >   properties on one live instance, identified by its full path. Same registry/validation/protocol
 >   flow.
+> - **Implemented (Phase 7A):** `asset_search` searches the public Roblox **Creator Store** via
+>   the official Open Cloud **Creator Store** API and returns a **bounded** candidate list (id,
+>   name, type, creator, description, thumbnail). It is the first tool that does **not** go over
+>   the WebSocket/plugin path: it runs as a **local HTTP call** from this process (read-only —
+>   nothing is inserted, cloned, downloaded, or purchased) and needs an Open Cloud API key in the
+>   environment. Same registry, but no plugin `request` (see [PROTOCOL.md](./PROTOCOL.md)).
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -171,11 +177,56 @@ as a one-shot flag. The query must be a non-empty string and `max_results` a who
 > the model (lists capped, strings truncated, a fixed character budget), so the model never sees
 > unbounded hierarchy/property data. `create_part`, `create_script`, and `modify_instance` are the
 > current *action* tools; after one of them reports success the loop stops (see [AI.md](./AI.md)).
+> `asset_search` (Phase 7A) is exposed to the model like any other tool but is **not** an action
+> tool — a successful search never ends the loop, and it never issues a plugin request.
 
 The CLI exposes `inspect_instance <path>` as a REPL command and
 `--inspect-instance-once --path <path>` as a one-shot flag. The path must be a non-empty string;
 format and existence are checked by the plugin, which returns a `not_found` error for paths that
 don't resolve.
+
+### asset_search (Phase 7A)
+
+- **Purpose:** Search the **public Roblox Creator Store** for assets (models, decals, audio,
+  plugins, meshes, videos, font families) matching a query, and return a **bounded** list of
+  candidates the agent can act on. It is a read-only **discovery** tool — the first RBXForge tool
+  that does not target the open project in Studio at all. Nothing is inserted, cloned, downloaded,
+  or purchased.
+- **Execution model (deliberately different):** this tool does **not** send a plugin `request`
+  over the WebSocket. It makes a **local HTTP `POST`** to the official Open Cloud Creator Store
+  API, `https://apis.roblox.com/toolbox-service/v2/assets:search` (BETA), authenticated with an
+  Open Cloud **API key** carried in the `x-api-key` header (scope `creator-store-product:read`).
+  It still lives in the same `ToolRegistry` and validates arguments through the same schema.
+- **Configuration (environment, never hard-coded):**
+  - `RBXFORGE_OPEN_CLOUD_API_KEY` (primary) — falls back to `ROBLOX_OPEN_CLOUD_API_KEY`.
+  - `RBXFORGE_OPEN_CLOUD_BASE_URL` — optional override (tests point it at a fake server).
+  - `RBXFORGE_OPEN_CLOUD_TIMEOUT` — optional override (default 30s).
+- **Inputs (schema, validated by the CLI before calling):**
+  - `query` — required non-empty string, length-capped (`200` chars).
+  - `asset_type` — optional, one of the official `searchCategoryType` values: `"Audio"`,
+    `"Model"`, `"Decal"`, `"Plugin"`, `"MeshPart"`, `"Video"`, `"FontFamily"`.
+  - `max_results` — optional whole number (`1..20`, default `5`). The request always sends its
+    own `maxPageSize`.
+- **Expected output (the tool's structured result, bounded):**
+  - `query`, `asset_type`, `max_results` — echoed inputs
+  - `count` — number of parsed results; `total` — the API's `totalResults`
+  - `truncated` — `true` when more matches exist than were returned
+  - `results` — array of `{ asset_id, name, asset_type, creator, creator_id, description,
+    thumbnail_url }` (only fields the API actually provided; the API has no relevance score)
+- **Failure modes (all logged as `asset_search FAILED: ...` and returned as `False`):** missing or
+  invalid configuration (`AssetConfigError`), HTTP errors (`AssetResponseError`), persistent rate
+  limiting (`AssetRateLimitError`), unreachable endpoint (`AssetConnectionError`), timeout
+  (`AssetTimeoutError`). HTTP `429` is retried with exponential backoff up to a bounded number of
+  attempts.
+- **Why the agent might use it:** the prompt asks for real Roblox assets by name/keyword
+  ("find me a good sword model").
+- **Non-goals:** no insertion/cloning/downloading/purchasing; no catalog/avatar/Marketplace API;
+  no arbitrary URL/HTTP input.
+
+The CLI exposes `asset_search <query> [max_results]` as a REPL command (a trailing integer token
+is parsed as `max_results`) and `--asset-search-once --query <text> [--asset-type TYPE]
+[--max-results N]` as a one-shot flag. One-shot execution is local HTTP, so it does **not** wait
+for the plugin: exit `0` on success, `2` when `--query` is missing, `4` on search failure.
 
 ## Conceptual Tool List
 
@@ -215,12 +266,14 @@ Each tool is described conceptually by:
 - **Expected output:** What the agent can expect back (success/failure, plus data).
 - **Why the agent might use it:** Typical situations where the tool is the right choice.
 
-> **Implemented tool anatomy (Phase 2B/4A/4B/4C/6A/6B):** every registered tool carries machine-readable
+> **Implemented tool anatomy (Phase 2B/4A/4B/4C/6A/6B/7A):** every registered tool carries machine-readable
 > metadata — `name`, `description`, and an `input_schema` — and the CLI validates arguments
 > against that schema before sending a `request`. `create_part` (Phase 2B), `inspect_hierarchy`
-> (Phase 4A), `find_instances` (Phase 4B), and `inspect_instance` (Phase 4C) are the implemented
-> tools; the Phase 4D agent loop calls exactly these tools (no new tool) and the conceptual
-> entries below are still being designed.
+> (Phase 4A), `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), and `create_script`
+> (Phase 6A) are plugin tools; `modify_instance` (Phase 6B) also runs over the plugin protocol;
+> `asset_search` (Phase 7A) is the first **local-HTTP** tool (same registry, no plugin `request`).
+> The Phase 4D agent loop calls exactly these tools and the conceptual entries below are still
+> being designed.
 
 ---
 
@@ -369,7 +422,9 @@ Each tool is described conceptually by:
   (Phase 4B), `inspect_instance` (Phase 4C), and `create_script` (Phase 6A) demonstrate this: each
   shipped with no protocol changes, only a new client-side `Tool` and a matching plugin-side handler.
   The Phase 4D multi-step agent loop shipped with **no** registry/protocol changes at all — it
-  reuses the existing tools.
+  reuses the existing tools. `asset_search` (Phase 7A) extended the pattern one step further: no
+  plugin-side handler at all, because its execution is a local HTTP call (see
+  [PROTOCOL.md](./PROTOCOL.md)).
 - Some tools overlap with what the plugin natively does; the tool layer adds agent-facing
   semantics on top.
 - Verification should not necessarily be a separate tool call — it may be folded into tool

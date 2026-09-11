@@ -16,6 +16,11 @@ modify_instance), at which point the loop stops (modify_instance may be
 followed by exactly one optional inspect_instance verification step) and a
 concise final AgentResult is returned.
 
+The read-only asset_search tool (Phase 7A) is intentionally NOT a Studio /
+plugin tool: it searches the public Creator Store over the official Open Cloud
+API with a local HTTP request, so it is exposed to the model alongside the
+plugin tools but never ends the loop.
+
 Each step's reply is one JSON object - either a tool call:
 
     {"tool": "<tool name>", "arguments": { ... }}
@@ -249,7 +254,13 @@ def compact_tool_result(call, output, response_payload):
         except (TypeError, ValueError):
             text = repr(output)
     else:
-        text = repr(output)
+        # A local call like asset_search (Phase 7A) produces no send_request
+        # response payload, so compact the tool's own structured output the
+        # same way instead of dumping a raw repr of the dict.
+        try:
+            text = json.dumps(_compact_value(output), sort_keys=True)
+        except (TypeError, ValueError):
+            text = repr(output)
     if len(text) > MAX_TOOL_RESULT_CHARS:
         suffix = "...\n[result truncated for length]"
         keep = max(0, MAX_TOOL_RESULT_CHARS - len(suffix))
@@ -293,6 +304,12 @@ class CapturingRBX:
 
     def log(self, message):
         return self._rbx.log(message)
+
+    def assets(self):
+        resolver = getattr(self._rbx, "assets", None)
+        if resolver is not None:
+            return resolver()
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -375,6 +392,9 @@ def build_system_prompt(registry):
         "are returned to you on the next step.\n"
         "- find_instances locates instances by name; inspect_instance reads the "
         "safe properties of one instance by full path.\n"
+        "- asset_search reads the public Roblox Creator Store over the Open "
+        "Cloud API (read-only, nothing is inserted or purchased); use it to "
+        "find real assets when the prompt asks for them.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "

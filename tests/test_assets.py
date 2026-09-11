@@ -340,7 +340,7 @@ def scenario_client_validation_and_clamps():
     results = []
     original_post = client._post_json
 
-    def intercept_post(body):
+    def intercept_post(body, timeout=None):
         results.append(body)
         return {"creatorStoreAssets": []}
 
@@ -552,6 +552,29 @@ def scenario_search_connection_and_timeout():
     print("OK  connection refused -> AssetConnectionError; slow server -> AssetTimeoutError")
 
 
+def scenario_search_per_call_timeout():
+    mod = assets_mod
+    # A per-call timeout override bounds a single request even when the client
+    # was configured with a large timeout.
+    with FakeStoreServer(mode="sleep") as server:
+        client = client_for(server.port, timeout=10.0)
+        try:
+            client.search("sword", timeout=0.15)
+            raise AssertionError("expected AssetTimeoutError")
+        except mod.AssetTimeoutError:
+            pass
+
+    # A non-positive per-call timeout is rejected as a config error.
+    client = client_for(free_port())
+    for bad in (0, -1):
+        try:
+            client.search("sword", timeout=bad)
+            raise AssertionError("expected AssetConfigError for timeout {0!r}".format(bad))
+        except mod.AssetConfigError:
+            pass
+    print("OK  per-call timeout override bounds the request; non-positive values rejected")
+
+
 # --------------------------------------------------------------------------- #
 # Registry + tool layer (cli/rbxforge.py)
 # --------------------------------------------------------------------------- #
@@ -632,6 +655,21 @@ def scenario_tool_execution_failures():
         assert result is False
         assert any("asset_search FAILED" in line and "HTTP 500" in line for line in logs), logs
 
+    # The tool forwards its request timeout to the client, so a slow API is
+    # bounded by the tool timeout instead of the env-configured default (30s).
+    with FakeStoreServer(mode="sleep") as server:
+        os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
+        os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"] = full_server_url(server.port)
+        try:
+            logs = []
+            rbx = mod.RBXForge(console=_CapturingConsole(logs))
+            result = rbx.execute_tool("asset_search", {"query": "sword"}, timeout=0.15)
+        finally:
+            del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
+            del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
+        assert result is False
+        assert any("asset_search FAILED" in line and "timed out" in line for line in logs), logs
+
     # Schema-invalid params are rejected before any HTTP call.
     with FakeStoreServer() as server:
         os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
@@ -649,7 +687,7 @@ def scenario_tool_execution_failures():
             del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
             del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
         assert server.total_calls == 0  # nothing reached the fake API
-    print("OK  asset_search tool failures (missing key / HTTP error / schema reject)")
+    print("OK  asset_search tool failures (missing key / HTTP error / timeout / schema reject)")
 
 
 # --------------------------------------------------------------------------- #
@@ -766,7 +804,26 @@ def scenario_cli_one_shot_success():
         assert server.bodies[-1] == {
             "query": "sword", "maxPageSize": 3, "searchCategoryType": "Model",
         }, server.bodies[-1]
-    print("OK  --asset-search-once success (exit 0, log line, body); type+max-results flags")
+
+        # --asset-search-once is a local HTTP call: no WebSocket server, no
+        # "load the plugin" / "listening on ws://" guidance.
+        assert "listening on ws://" not in proc.stdout, proc.stdout
+        assert "load the RBXForge plugin" not in proc.stdout, proc.stdout
+    print("OK  --asset-search-once success (exit 0, log line, body); type+max-results flags; no server start")
+
+
+def scenario_cli_one_shot_invalid_asset_type():
+    # --asset-type is an argparse choice now: an unknown value is a usage
+    # error (exit 2), not a runtime execution failure (exit 4), and nothing
+    # reaches the API.
+    with FakeStoreServer() as server:
+        proc = run_cli(["--asset-search-once", "--query", "sword",
+                        "--asset-type", "Bogus"], env_with_server(server.port))
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 2, combined
+        assert "invalid choice" in combined, combined
+        assert server.total_calls == 0
+    print("OK  --asset-search-once --asset-type Bogus is an argparse usage error (exit 2)")
 
 
 def scenario_cli_one_shot_errors():
@@ -850,12 +907,14 @@ def main():
     scenario_search_response_shapes()
     scenario_search_rate_limit()
     scenario_search_connection_and_timeout()
+    scenario_search_per_call_timeout()
     scenario_registry_exposes_asset_search()
     scenario_tool_execution_injected_client()
     scenario_tool_execution_failures()
     scenario_agent_exposure()
     scenario_asset_search_does_not_end_loop()
     scenario_cli_one_shot_success()
+    scenario_cli_one_shot_invalid_asset_type()
     scenario_cli_one_shot_errors()
     scenario_cli_repl_asset_search()
     print("\nAll asset-discovery scenarios passed.")

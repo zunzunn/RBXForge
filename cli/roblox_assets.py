@@ -114,17 +114,19 @@ class RobloxAssetClient:
         self.max_attempts = max_attempts
         self.retry_backoff_base = retry_backoff_base
 
-    def search(self, query, asset_type=None, max_results=DEFAULT_MAX_RESULTS):
+    def search(self, query, asset_type=None, max_results=DEFAULT_MAX_RESULTS,
+               timeout=None):
         """Search the Creator Store and return a bounded structured result.
 
         ``query`` is required (non-empty, length-capped). ``asset_type`` is
         optional and must be one of :data:`ASSET_TYPES`. ``max_results`` is the
         result cap (1..20); the request always sends our own ``maxPageSize``.
-        Returns a dict ``{query, asset_type, max_results, count, total,
-        truncated, results}`` where each result is ``{asset_id, name,
-        asset_type, creator, creator_id, description, thumbnail_url}`` (only
-        fields the API actually provided). Raises an :class:`AssetError`
-        subclass on any failure.
+        ``timeout`` overrides the configured per-request timeout for this call
+        (None keeps the client's configured value). Returns a dict ``{query,
+        asset_type, max_results, count, total, truncated, results}`` where each
+        result is ``{asset_id, name, asset_type, creator, creator_id,
+        description, thumbnail_url}`` (only fields the API actually provided).
+        Raises an :class:`AssetError` subclass on any failure.
         """
         if not isinstance(query, str) or not query.strip():
             raise AssetConfigError("asset_search requires a non-empty query")
@@ -133,6 +135,8 @@ class RobloxAssetClient:
             raise AssetConfigError(
                 "asset_search query too long (max {0} characters)".format(MAX_QUERY_LENGTH)
             )
+        if timeout is not None and timeout <= 0:
+            raise AssetConfigError("timeout must be positive, got: {0!r}".format(timeout))
         max_results = min(max(int(max_results), 1), MAX_RESULTS)
         if asset_type is not None and asset_type not in ASSET_TYPES:
             raise AssetConfigError(
@@ -143,12 +147,12 @@ class RobloxAssetClient:
         body = {"query": query, "maxPageSize": max_results}
         if asset_type is not None:
             body["searchCategoryType"] = asset_type
-        data = self._post_json(body)
+        data = self._post_json(body, timeout=timeout)
         return self._parse_search_response(data, query, asset_type, max_results)
 
     # -- transport --------------------------------------------------------- #
 
-    def _post_json(self, body):
+    def _post_json(self, body, timeout=None):
         url = self.base_url + CREATOR_STORE_SEARCH_PATH
         request = urllib.request.Request(
             url,
@@ -161,13 +165,15 @@ class RobloxAssetClient:
             },
             method="POST",
         )
+        request_timeout = self.timeout if timeout is None else timeout
         backoff = self.retry_backoff_base
         for attempt in range(1, self.max_attempts + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=request_timeout) as response:
                     raw = response.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", "replace")[:500]
+                with exc:
+                    detail = exc.read().decode("utf-8", "replace")[:500]
                 if exc.code == 429 and attempt < self.max_attempts:
                     time.sleep(backoff)
                     backoff *= 2.0
@@ -185,7 +191,7 @@ class RobloxAssetClient:
                 # Python versions; must be caught before the generic OSError
                 # below because TimeoutError is also an OSError subclass.
                 raise AssetTimeoutError(
-                    "Creator Store search timed out after {0:g}s".format(self.timeout)
+                    "Creator Store search timed out after {0:g}s".format(request_timeout)
                 ) from exc
             except OSError as exc:
                 raise AssetConnectionError(

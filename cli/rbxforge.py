@@ -984,6 +984,11 @@ def asset_search_tool():
             "query": params["query"],
             "asset_type": params.get("asset_type"),
             "max_results": max_results,
+            # Bound each HTTP request with the tool's own request timeout so
+            # --request-timeout / execute_tool(timeout=...) really bounds the
+            # call instead of silently falling back to the env-configured
+            # client timeout (which defaults to 30s).
+            "timeout": timeout,
         }
         try:
             result = client.search(**search_kwargs)
@@ -1005,12 +1010,20 @@ def asset_search_tool():
 
     module = _import_assets()
     if module is None:
-        raise RuntimeError("cli/roblox_assets.py could not be imported")
+        # The tool must still construct even when cli/roblox_assets.py cannot
+        # be imported so the registry (and CLI startup) is not taken down.
+        # ``run`` reports the failure gracefully; only the schema enum needs a
+        # static copy of the official searchCategoryType allowlist.
+        asset_types = [
+            "Audio", "Model", "Decal", "Plugin", "MeshPart", "Video", "FontFamily",
+        ]
+    else:
+        asset_types = list(module.ASSET_TYPES)
     schema = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "min_length": 1},
-            "asset_type": {"type": "string", "enum": list(module.ASSET_TYPES)},
+            "asset_type": {"type": "string", "enum": asset_types},
             "max_results": {
                 "type": "number", "integer": True,
                 "minimum": 1, "maximum": MAX_ASSET_RESULTS,
@@ -1716,8 +1729,11 @@ def main(argv=None):
              "whole number in 1..{1}) or --asset-search-once (default: 5; must "
              "be a whole number in 1..20)".format(DEFAULT_FIND_MAX_RESULTS, MAX_FIND_RESULTS),
     )
+    ASSET_SEARCH_CLI_ASSET_TYPES = [
+        "Audio", "Model", "Decal", "Plugin", "MeshPart", "Video", "FontFamily",
+    ]
     parser.add_argument(
-        "--asset-type", default=None,
+        "--asset-type", default=None, choices=ASSET_SEARCH_CLI_ASSET_TYPES,
         help="optional Creator Store category filter for --asset-search-once, one "
              "of Audio, Model, Decal, Plugin, MeshPart, Video, FontFamily",
     )
@@ -1734,6 +1750,23 @@ def main(argv=None):
 
     console = REPLConsole()
     rbx = RBXForge(args.host, args.port, console=console)
+
+    if args.asset_search_once:
+        # Phase 7A --asset-search-once is a local HTTP call over the Open Cloud
+        # API: it deliberately does not start the WebSocket server, and there is
+        # nothing to wait for plugin-wise. Validate the required flag first,
+        # then run the search and exit.
+        if not args.query:
+            rbx.error("--asset-search-once requires --query <text>")
+            return 2
+        rbx.log("tools registered: {0}".format(
+            ", ".join(tool.name for tool in rbx.registry.list())
+        ))
+        return 0 if rbx.asset_search(
+            args.query, asset_type=args.asset_type,
+            max_results=args.max_results, timeout=args.request_timeout,
+        ) else 4
+
     try:
         address = rbx.start()
     except OSError as exc:
@@ -1794,16 +1827,6 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.inspect_instance(args.path, args.request_timeout) else 4
-        if args.asset_search_once:
-            if not args.query:
-                rbx.error("--asset-search-once requires --query <text>")
-                return 2
-            # Deliberately no wait_for_plugin: asset_search is a local HTTP
-            # call over the Open Cloud API, not a WebSocket/plugin request.
-            return 0 if rbx.asset_search(
-                args.query, asset_type=args.asset_type,
-                max_results=args.max_results, timeout=args.request_timeout,
-            ) else 4
         repl(rbx, console)
     finally:
         rbx.stop()

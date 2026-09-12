@@ -1045,6 +1045,104 @@ def scenario_agent_recommend_flow():
           "no plugin request sent")
 
 
+def scenario_agent_insert_flow():
+    """Agent-level Phase 7C flow: search -> rank -> select -> insert -> verify.
+
+    The model searches the store, ranks the results, picks the ranked asset,
+    inserts it exactly by the id the search returned (never invented), and
+    verifies the placed instance once. Only insert_asset and inspect_instance
+    touch the plugin/WebSocket path; the id is enforced against the ids the
+    search/ranking recorded in this session."""
+    mod = agent_mod
+    with FakeStoreServer(body=recommend_body()) as server:
+        client = assets_mod.RobloxAssetClient(_KEY, base_url=full_server_url(server.port))
+
+        class FakeRBX:
+            def __init__(self, client):
+                self.client = client
+                self.requests = []
+                self.logs = []
+                self.known = {}
+
+            def send_request(self, tool, params, timeout):
+                self.requests.append((tool, params))
+                if tool == "insert_asset":
+                    return {
+                        "ok": True,
+                        "result": {
+                            "asset_id": params["asset_id"],
+                            "name": "Enchanted Sword",
+                            "class": "Model",
+                            "parent_path": "Workspace",
+                            "path": "Workspace/Enchanted Sword",
+                            "positioned": True,
+                            "placement": "default",
+                            "position": {"x": 5, "y": 0, "z": 0},
+                        },
+                    }
+                if tool == "inspect_instance":
+                    return {
+                        "ok": True,
+                        "result": {
+                            "name": "Enchanted Sword", "className": "Model",
+                            "path": "Workspace/Enchanted Sword", "properties": {},
+                        },
+                    }
+                return {"ok": True, "result": {"anything": True}}
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def assets(self):
+                return self.client
+
+            def remember_assets(self, results):
+                for entry in results or []:
+                    if isinstance(entry, dict) and entry.get("asset_id") is not None:
+                        self.known[str(entry["asset_id"])] = entry
+
+            def asset_known(self, asset_id):
+                return str(asset_id) in self.known
+
+            def known_asset(self, asset_id):
+                return self.known.get(str(asset_id))
+
+        provider = RecordingProvider([
+            asset_call("sword"),
+            recommend_call("sword", limit=2),
+            json.dumps({"tool": "insert_asset", "arguments": {"asset_id": "3"}}),
+            json.dumps({
+                "tool": "inspect_instance",
+                "arguments": {"path": "Workspace/Enchanted Sword"},
+            }),
+        ])
+        rbx = FakeRBX(client)
+        registry = rbxforge.default_registry()
+        result = mod.Agent(provider, registry=registry, rbx=rbx).run(
+            "find a good sword, pick the best, and put it in the project"
+        )
+
+        assert result.ok is True, result
+        assert result.tool.name == "insert_asset", result
+        assert [step["tool"] for step in result.steps] == [
+            "asset_search", "recommend_assets", "insert_asset", "inspect_instance",
+        ], result.steps
+        assert all(step["ok"] for step in result.steps), result.steps
+        # Loop ended after the single verification step - exactly four chats.
+        assert len(provider.chat_calls) == 4, provider.chat_calls
+        # The id inserted came exactly from the search/ranking results.
+        assert rbx.requests[0] == ("insert_asset", {"asset_id": "3"}), rbx.requests
+        assert rbx.requests[1] == (
+            "inspect_instance", {"path": "Workspace/Enchanted Sword"},
+        ), rbx.requests
+        assert len(rbx.requests) == 2, rbx.requests
+        # asset_search + recommend_assets ran locally only (no plugin request).
+        assert any("asset_search OK" in line for line in rbx.logs), rbx.logs
+        assert any("insert_asset OK" in line for line in rbx.logs), rbx.logs
+    print("OK  agent flow search -> rank -> select -> insert -> verify; only the "
+          "insert/verify steps touch the plugin")
+
+
 # --------------------------------------------------------------------------- #
 # CLI one-shot + REPL (subprocess, against the in-process fake server)
 # --------------------------------------------------------------------------- #
@@ -1280,6 +1378,7 @@ def main():
     scenario_agent_exposure()
     scenario_asset_search_does_not_end_loop()
     scenario_agent_recommend_flow()
+    scenario_agent_insert_flow()
     scenario_cli_one_shot_success()
     scenario_cli_one_shot_invalid_asset_type()
     scenario_cli_one_shot_errors()

@@ -60,9 +60,8 @@ _HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import rbxforge   # Phase 2B tool layer (Tool, ToolRegistry, ...) - noqa: E402
 import providers  # Phase 3A provider layer (Provider, ProviderError, ...) - noqa: E402
-
+import rbxforge  # Phase 2B tool layer (Tool, ToolRegistry, ...) - noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Structured tool call parsing
@@ -123,7 +122,7 @@ def _first_json_object(text):
         elif char == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                return text[start:index + 1]
+                return text[start : index + 1]
     return None
 
 
@@ -203,16 +202,24 @@ def parse_agent_reply(text):
 
 #: Tool names that change the project. Calling an action tool ends the loop
 #: (Phase 6B: modify_instance allows exactly one optional inspect_instance
-#: verification step before the loop ends).
-ACTION_TOOLS = frozenset({"create_part", "create_script", "modify_instance"})
+#: verification step before the loop ends; Phase 7C: insert_asset does the
+#: same so the model can verify the placed asset).
+ACTION_TOOLS = frozenset(
+    {
+        "create_part",
+        "create_script",
+        "modify_instance",
+        "insert_asset",
+    }
+)
 
 #: Hard bound on executed tool calls per user request.
 MAX_TOOL_CALLS = 5
 
 #: Bounds applied to tool results before they are shown to the model.
-MAX_TOOL_RESULT_ITEMS = 20       # cap on list/dict entries (e.g. matches, children)
-MAX_TOOL_RESULT_STRING = 200     # per-string truncation length
-MAX_TOOL_RESULT_CHARS = 2000     # serialized result budget
+MAX_TOOL_RESULT_ITEMS = 20  # cap on list/dict entries (e.g. matches, children)
+MAX_TOOL_RESULT_STRING = 200  # per-string truncation length
+MAX_TOOL_RESULT_CHARS = 2000  # serialized result budget
 
 
 def _compact_value(value, depth=0):
@@ -234,7 +241,9 @@ def _compact_value(value, depth=0):
             return value
         return value[:MAX_TOOL_RESULT_STRING] + "..."
     if isinstance(value, list):
-        return [_compact_value(item, depth + 1) for item in value[:MAX_TOOL_RESULT_ITEMS]]
+        return [
+            _compact_value(item, depth + 1) for item in value[:MAX_TOOL_RESULT_ITEMS]
+        ]
     if isinstance(value, dict):
         return {
             key: _compact_value(item, depth + 1)
@@ -273,15 +282,11 @@ def compact_tool_result(call, output, response_payload):
 def tool_result_message(index, call, output, response_payload):
     """The message appended after a tool executes, so the next model turn can
     act on what actually happened in Studio."""
-    return (
-        "Tool call #{0}: {1}\n"
-        "Arguments: {2}\n"
-        "Result: {3}".format(
-            index,
-            call.name,
-            json.dumps(call.arguments, sort_keys=True),
-            compact_tool_result(call, output, response_payload),
-        )
+    return "Tool call #{0}: {1}\nArguments: {2}\nResult: {3}".format(
+        index,
+        call.name,
+        json.dumps(call.arguments, sort_keys=True),
+        compact_tool_result(call, output, response_payload),
     )
 
 
@@ -313,6 +318,27 @@ class CapturingRBX:
             return resolver()
         return None
 
+    def remember_assets(self, results):
+        """Delegate the Phase 7C known-assets recording to the wrapped
+        connection so asset ids persist even though tools run through this
+        wrapper (insert_asset validates ids against them)."""
+        remember = getattr(self._rbx, "remember_assets", None)
+        if remember is not None:
+            return remember(results)
+        return None
+
+    def asset_known(self, asset_id):
+        lookup = getattr(self._rbx, "asset_known", None)
+        if lookup is not None:
+            return lookup(asset_id)
+        return None
+
+    def known_asset(self, asset_id):
+        lookup = getattr(self._rbx, "known_asset", None)
+        if lookup is not None:
+            return lookup(asset_id)
+        return None
+
 
 # --------------------------------------------------------------------------- #
 # Tool definitions for the model
@@ -335,8 +361,8 @@ def _model_schema(schema):
         return {
             "type": "object",
             "description": "a 3D vector as an object with numeric x, y, z, "
-                           'e.g. {"x": 0, "y": 5, "z": 0} - never an array or '
-                           'a string like "0,5,0"',
+            'e.g. {"x": 0, "y": 5, "z": 0} - never an array or '
+            'a string like "0,5,0"',
             "properties": {
                 "x": {"type": "number"},
                 "y": {"type": "number"},
@@ -381,9 +407,7 @@ def build_system_prompt(registry):
         "You are the RBXForge building agent. You act in short steps, calling "
         "RBXForge tools to inspect the project before deciding, then to make "
         "changes.\n"
-        "Available tools:\n"
-        + tools_json
-        + "\n"
+        "Available tools:\n" + tools_json + "\n"
         "Reply with exactly one JSON object per step, either:\n"
         '  - a tool call: {"tool": "<tool name>", "arguments": { ... }}\n'
         '  - a final report: {"message": "<what you did or decided>"} - only '
@@ -403,6 +427,16 @@ def build_system_prompt(registry):
         "creator, rating/usage). Prefer it when the user asks for a "
         "recommendation ('what should I use', 'best ...'); it is also "
         "read-only and never downloads, inserts, or purchases anything.\n"
+        "- insert_asset inserts the Creator Store asset whose 'asset_id' came "
+        "exactly from a prior asset_search / recommend_assets result (ids are "
+        "never invented - an id that was not returned by a search is "
+        "rejected). It validates the asset, then the plugin loads it and "
+        "places it: give a vec3 'position', or a 'reference_path' to place it "
+        "near an existing instance (e.g. when the user says 'near the "
+        "SpawnLocation', inspect the scene first for its path), or neither to "
+        "use the plugin's default spot. After it succeeds you may call "
+        "inspect_instance exactly once to verify the placed asset at its "
+        "reported path, then report; do not call any other tools afterwards.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "
@@ -422,7 +456,7 @@ def build_system_prompt(registry):
         "3D vectors (e.g. position, size) are JSON objects of the form "
         '{"x": number, "y": number, "z": number} - never arrays like [0,5,0] '
         'and never strings like "0,5,0".\n'
-        'Example call:\n'
+        "Example call:\n"
         '{"tool": "create_part", "arguments": {"name": "RedCube", '
         '"position": {"x": 0, "y": 5, "z": 0}, '
         '"size": {"x": 4, "y": 4, "z": 4}, "color": "red"}}\n'
@@ -457,8 +491,16 @@ class AgentResult:
     - ``provider_text``: the raw last provider text, for diagnostics.
     """
 
-    def __init__(self, ok, tool=None, output=None, error=None, provider_text=None,
-                 message=None, steps=None):
+    def __init__(
+        self,
+        ok,
+        tool=None,
+        output=None,
+        error=None,
+        provider_text=None,
+        message=None,
+        steps=None,
+    ):
         self.ok = ok
         self.tool = tool
         self.output = output
@@ -489,10 +531,18 @@ class Agent:
     - ``max_tool_calls``: hard bound on tool calls per request.
     """
 
-    def __init__(self, provider, registry=None, rbx=None, timeout=10.0,
-                 max_tool_calls=MAX_TOOL_CALLS):
+    def __init__(
+        self,
+        provider,
+        registry=None,
+        rbx=None,
+        timeout=10.0,
+        max_tool_calls=MAX_TOOL_CALLS,
+    ):
         self.provider = provider
-        self.registry = registry if registry is not None else rbxforge.default_registry()
+        self.registry = (
+            registry if registry is not None else rbxforge.default_registry()
+        )
         self.rbx = rbx if rbx is not None else rbxforge.RBXForge()
         self.timeout = timeout
         self.max_tool_calls = max_tool_calls
@@ -594,9 +644,11 @@ class Agent:
             # the provider returns a scripted response that has already been
             # handled (e.g. RecordingProvider returning the same call text).
             skip_tool_execution = False
-            if (pending_verify is not None and
-                call.name == pending_verify["call"].name and
-                call.arguments == pending_verify["call"].arguments):
+            if (
+                pending_verify is not None
+                and call.name == pending_verify["call"].name
+                and call.arguments == pending_verify["call"].arguments
+            ):
                 skip_tool_execution = True
                 output = pending_verify["output"]
 
@@ -604,8 +656,9 @@ class Agent:
                 output = None
                 failure = None
                 try:
-                    output = self.registry.execute(capturer, call.name, call.arguments,
-                                                   self.timeout)
+                    output = self.registry.execute(
+                        capturer, call.name, call.arguments, self.timeout
+                    )
                 except rbxforge.UnknownToolError as exc:
                     failure = {"code": "unknown_tool", "message": str(exc)}
                 except rbxforge.InvalidParamsError as exc:
@@ -613,7 +666,9 @@ class Agent:
                 if failure is None and not output:
                     failure = {
                         "code": "execution_failed",
-                        "message": "tool {0!r} did not report success".format(call.name),
+                        "message": "tool {0!r} did not report success".format(
+                            call.name
+                        ),
                     }
 
             if not skip_tool_execution and failure is None and not output:
@@ -626,17 +681,21 @@ class Agent:
                 capturer.responses[-1]["response"] if capturer.responses else None
             )
             compacted = (
-                _compact_value(response_payload) if response_payload is not None else None
+                _compact_value(response_payload)
+                if response_payload is not None
+                else None
             )
             issued += 1
-            steps.append({
-                "tool": call.name,
-                "arguments": call.arguments,
-                "output": output,
-                "data": compacted,
-                "result": compact_tool_result(call, output, response_payload),
-                "ok": failure is None,
-            })
+            steps.append(
+                {
+                    "tool": call.name,
+                    "arguments": call.arguments,
+                    "output": output,
+                    "data": compacted,
+                    "result": compact_tool_result(call, output, response_payload),
+                    "ok": failure is None,
+                }
+            )
 
             # Track if inspection tools were called, so we can conditionally
             # enable verification after create_part/create_script when the
@@ -661,20 +720,29 @@ class Agent:
                 # result when the target can be resolved and verification is
                 # useful; verification is skipped when the tool result already
                 # provides sufficient information.
-                # modify_instance always permits verification; create_part and
-                # create_script only permit it when the model has previously
-                # called an inspection tool to gather project context.
+                # modify_instance and insert_asset (Phase 7C) always permit
+                # verification; create_part and create_script only permit it
+                # when the model has previously called an inspection tool to
+                # gather project context.
                 if pending_verify is None:
-                    if call.name == "modify_instance":
+                    if call.name in ("modify_instance", "insert_asset"):
                         pending_verify = {"call": call, "output": output}
-                    elif call.name in ("create_part", "create_script") and inspection_called:
+                    elif (
+                        call.name in ("create_part", "create_script")
+                        and inspection_called
+                    ):
                         pending_verify = {"call": call, "output": output}
 
                     if pending_verify is not None:
                         messages.append(providers.message("assistant", last_text))
-                        messages.append(providers.message(
-                            "user", tool_result_message(issued, call, output, response_payload)
-                        ))
+                        messages.append(
+                            providers.message(
+                                "user",
+                                tool_result_message(
+                                    issued, call, output, response_payload
+                                ),
+                            )
+                        )
                         continue
                 return AgentResult(
                     ok=True,
@@ -704,20 +772,22 @@ class Agent:
                     error={
                         "code": "max_tool_calls",
                         "message": "tool call budget exhausted after {0} call(s) "
-                                   "without completing the task".format(
-                                       self.max_tool_calls),
+                        "without completing the task".format(self.max_tool_calls),
                     },
                 )
 
             # -- feed the bounded result back and continue ------------------- #
             messages.append(providers.message("assistant", last_text))
-            messages.append(providers.message(
-                "user", tool_result_message(issued, call, output, response_payload)
-            ))
+            messages.append(
+                providers.message(
+                    "user", tool_result_message(issued, call, output, response_payload)
+                )
+            )
 
 
-def agent_from_env(registry=None, rbx=None, timeout=10.0,
-                   max_tool_calls=MAX_TOOL_CALLS):
+def agent_from_env(
+    registry=None, rbx=None, timeout=10.0, max_tool_calls=MAX_TOOL_CALLS
+):
     """Build an :class:`Agent` with the provider configured from the environment
     (see :func:`providers.build_provider`; defaults to Ollama)."""
     return Agent(
@@ -735,7 +805,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="rbxforge-agent",
         description="Run one natural-language prompt through the RBXForge agent. "
-                    "The provider is configured from the environment (see cli/providers.py).",
+        "The provider is configured from the environment (see cli/providers.py).",
     )
     parser.add_argument("prompt", help='e.g. "create a red cube"')
     args = parser.parse_args()
@@ -747,9 +817,11 @@ if __name__ == "__main__":
         raise SystemExit(1)
     result = agent.run(args.prompt)
     if result.ok:
-        print("OK  {0!r} -> tool {1!r}: {2!r}".format(
-            args.prompt, result.tool.name, result.output
-        ))
+        print(
+            "OK  {0!r} -> tool {1!r}: {2!r}".format(
+                args.prompt, result.tool.name, result.output
+            )
+        )
     else:
         print("FAILED: {0}".format(result.error))
         raise SystemExit(1)

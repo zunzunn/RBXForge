@@ -1,12 +1,13 @@
 --!nonstrict
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
 -- + Phase 4B (find_instances) + Phase 4C (inspect_instance) + Phase 6A (create_script)
--- + Phase 6B (modify_instance)
+-- + Phase 6B (modify_instance) + Phase 7C (insert_asset)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and six Studio operations: create_part, create_script, modify_instance,
--- inspect_hierarchy, find_instances, and inspect_instance (request/response).
+-- and seven Studio operations: create_part, create_script, modify_instance,
+-- insert_asset, inspect_hierarchy, find_instances, and inspect_instance
+-- (request/response).
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -1024,6 +1025,247 @@ end
 -- registerTool(); handleRequest looks the tool up here.
 local toolHandlers = {}
 
+-- --------------------------------------------------------------------------- #
+-- Phase 7C: Creator Store asset insertion (insert_asset)
+-- --------------------------------------------------------------------------- --
+
+local InsertService = game:GetService("InsertService")
+
+-- Offset applied when placing an asset "near" a referenced instance or the
+-- project's SpawnLocation (Phase 7C). Fixed and small so the outcome is
+-- deterministic and explainable.
+local PLACEMENT_OFFSET = Vector3.new(5, 0, 0)
+
+-- Default fallback position used when the project has no SpawnLocation.
+local DEFAULT_INSERT_POSITION = Vector3.new(0, 5, 0)
+
+-- Generates a sibling-unique Name for `instance` inside `parent`: when the
+-- plain name already exists a numeric suffix is appended ("Cat", "Cat2",
+-- "Cat3", ...). The scan is hard-bounded so it can never loop forever.
+local function uniqueSiblingName(parent, baseName)
+	local name = baseName
+	local counter = 2
+	while parent:FindFirstChild(name) and counter <= 1000 do
+		name = baseName .. tostring(counter)
+		counter = counter + 1
+	end
+	return name
+end
+
+-- Positions a loaded asset at `pos`. Models are pivoted (modern PivotTo with a
+-- SetPrimaryPartCFrame fallback); bare BaseParts get an absolute Position.
+-- Returns (positioned, actualPos); positioned=false for assets with no
+-- transform (e.g. decals/audio/textures), which is reported to the caller
+-- instead of silently adjusted.
+local function positionLoadedAsset(asset, pos)
+	if asset:IsA("BasePart") then
+		asset.Position = pos
+		return true, pos
+	elseif asset:IsA("Model") then
+		local okPivot = pcall(function() asset:PivotTo(CFrame.new(pos)) end)
+		if okPivot then
+			return true, pos
+		end
+		local primary = asset.PrimaryPart or asset:FindFirstChildWhichIsA("BasePart")
+		if primary then
+			asset.PrimaryPart = primary
+			local okPrimary = pcall(function() asset:SetPrimaryPartCFrame(CFrame.new(pos)) end)
+			if okPrimary then
+				return true, primary.Position
+			end
+		end
+	end
+	return false, nil
+end
+
+-- Resolves a DataModel-rooted reference path (e.g. "Workspace.SpawnLocation")
+-- to a position to place an asset near. Returns (pos, err).
+local function referencePosition(refPath)
+	local segments = splitPathSegments(refPath)
+	for _, segment in ipairs(segments) do
+		if segment == "" then
+			return nil, "params.reference_path contains an empty segment"
+		end
+	end
+	local target = resolveGameSegments(segments)
+	if not target then
+		return nil, "reference instance not found at path: " .. refPath
+	end
+	if target:IsA("BasePart") then
+		return target.Position, nil
+	elseif target:IsA("Model") and target.PrimaryPart then
+		return target.PrimaryPart.Position, nil
+	end
+	return nil, "reference instance class '" .. target.ClassName .. "' has no position to place near"
+end
+
+local function handleInsertAsset(id, params)
+	params = params or {}
+	local assetId = params.asset_id
+	if type(assetId) ~= "string" or not string.match(assetId, "^%d+$") then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.asset_id must be a non-empty string of digits",
+		})
+	end
+	local numericId = tonumber(assetId)
+	if not numericId or numericId < 1 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.asset_id must be a positive integer",
+		})
+	end
+
+	local parent
+	local parentPath = params.parent_path
+	if parentPath ~= nil then
+		if type(parentPath) ~= "string" or parentPath == "" then
+			return sendResponse(id, false, {
+				code = "invalid_params",
+				message = "params.parent_path must be a non-empty string",
+			})
+		end
+		local segments = splitPathSegments(parentPath)
+		for _, segment in ipairs(segments) do
+			if segment == "" then
+				return sendResponse(id, false, {
+					code = "invalid_params",
+					message = "params.parent_path contains an empty segment",
+				})
+			end
+		end
+		local okResolve, resolved = pcall(resolveGameSegments, segments)
+		if not okResolve then
+			log("insert_asset resolve error: " .. tostring(resolved))
+			return sendResponse(id, false, {
+				code = "execution_failed",
+				message = tostring(resolved),
+			})
+		end
+		if not resolved then
+			return sendResponse(id, false, {
+				code = "not_found",
+				message = "parent not found at path: " .. parentPath,
+			})
+		end
+		parent = resolved
+	else
+		parent = workspace
+	end
+
+	-- Mutual exclusion of absolute position and reference instance (the CLI
+	-- rejects both up front; the plugin re-validates independently).
+	local position = params.position
+	local referencePath = params.reference_path
+	if position ~= nil and referencePath ~= nil then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.position and params.reference_path may not both be provided",
+		})
+	end
+
+	local placementLabel = "default"
+	local placementPos
+	if position ~= nil then
+		local vec, vecErr = validateVec3(position, "params.position")
+		if not vec then
+			return sendResponse(id, false, { code = "invalid_params", message = vecErr })
+		end
+		placementPos = vec
+		placementLabel = "explicit"
+	elseif referencePath ~= nil then
+		local refPos, refErr = referencePosition(referencePath)
+		if refPos == nil then
+			return sendResponse(id, false, { code = "invalid_params", message = refErr })
+		end
+		placementPos = refPos + PLACEMENT_OFFSET
+		placementLabel = "reference"
+	end
+
+	-- Load a single asset from the Roblox Catalog / Creator Store by id. The
+	-- CLI only sends ids a prior asset_search / recommend_assets returned, so
+	-- invalid/nonexistent ids surface here as clear errors instead of being
+	-- invented upstream.
+	local okLoad, loaded = pcall(function()
+		return InsertService:LoadAsset(numericId)
+	end)
+	if not okLoad then
+		log("insert_asset LoadAsset error: " .. tostring(loaded))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = "could not load asset " .. assetId .. ": " .. tostring(loaded),
+		})
+	end
+	if not loaded then
+		return sendResponse(id, false, {
+			code = "not_found",
+			message = "asset not found or not insertable: " .. assetId,
+		})
+	end
+
+	-- Ensure a sibling-unique name so an existing instance is never shadowed.
+	local finalName = uniqueSiblingName(parent, loaded.Name)
+	loaded.Name = finalName
+
+	local okParent, parentErr = pcall(function()
+		loaded.Parent = parent
+	end)
+	if not okParent then
+		pcall(function() loaded:Destroy() end)
+		log("insert_asset parent error: " .. tostring(parentErr))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = "could not parent asset into the project: " .. tostring(parentErr),
+		})
+	end
+
+	-- Placement: explicit position / near reference / default (beside the
+	-- first SpawnLocation, else a sensible spot above the origin).
+	local positioned = false
+	local finalPosition
+	if placementPos then
+		local okPlaced, actualPos = positionLoadedAsset(loaded, placementPos)
+		positioned = okPlaced
+		finalPosition = actualPos
+	else
+		local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+		if spawn then
+			placementPos = spawn.Position + PLACEMENT_OFFSET
+		else
+			placementPos = DEFAULT_INSERT_POSITION
+		end
+		local okPlaced, actualPos = positionLoadedAsset(loaded, placementPos)
+		positioned = okPlaced
+		finalPosition = actualPos
+	end
+
+	local result = {
+		asset_id = tostring(numericId),
+		name = finalName,
+		class = loaded.ClassName,
+		parent_path = buildGamePath(parent),
+		path = buildGamePath(loaded),
+		positioned = positioned,
+		placement = placementLabel,
+	}
+	if positioned then
+		result.position = { x = finalPosition.X, y = finalPosition.Y, z = finalPosition.Z }
+	end
+
+	log(string.format(
+		"inserted asset %d as %s (%s) into %s (placement: %s%s)",
+		numericId,
+		finalName,
+		loaded.ClassName,
+		buildGamePath(parent),
+		placementLabel,
+		positioned and " " .. tostring(finalPosition) or " - not positionable"
+	))
+	return sendResponse(id, true, result)
+end
+
+-- Registered tool handlers (dispatch happens in handleRequest).
+
 local function registerTool(name, handler)
 	if toolHandlers[name] then
 		log("duplicate tool handler registration: " .. tostring(name))
@@ -1039,6 +1281,7 @@ registerTool("modify_instance", handleModifyInstance)
 registerTool("inspect_hierarchy", handleInspectHierarchy)
 registerTool("find_instances", handleFindInstances)
 registerTool("inspect_instance", handleInspectInstance)
+registerTool("insert_asset", handleInsertAsset)
 
 local function handleRequest(id, payload)
 	local tool = payload.tool

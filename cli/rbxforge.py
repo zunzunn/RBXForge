@@ -26,6 +26,14 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   same protocol. A real prompt like "create a red cube" reaches Studio via
   create_part. Existing commands (ping / status / create_part / help / quit)
   still work, and 'ask' runs the agent explicitly.
+- insert_asset (Phase 7C) inserts a Creator Store asset (by the exact id a
+  prior asset_search / recommend_assets returned in this session) into the
+  Studio project via the plugin, so the AI can search, rank, select, and
+  place a real asset. The CLI refuses ids that never came from a search
+  (the model can never invent one), validates the asset before anything is
+  sent, and the plugin resolves the parent, places the asset (explicit
+  position, near a referenced instance, or beside the SpawnLocation), and
+  reports the resulting instance path.
 
 Standard library only; no external dependencies.
 
@@ -47,6 +55,9 @@ Usage:
     rbxforge --recommend-assets-once --query TEXT [--asset-type TYPE] [--creator NAME]
                   [--max-results N] [--max-recommendations N]
                   [--host HOST] [--port PORT] [--request-timeout SEC]
+    rbxforge --insert-asset-once --asset-id ID [--parent-path PATH]
+                  [--position JSON] [--reference-path PATH]
+                  [--host HOST] [--port PORT] [--timeout SEC] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
@@ -56,6 +67,12 @@ Creator Store over the Open Cloud API and needs RBXFORGE_OPEN_CLOUD_API_KEY
 into a bounded, explainable recommendation list (see cli/asset_ranking.py).
 Both run locally and do not touch the plugin.
 
+insert_asset (Phase 7C) goes over the WebSocket to the plugin and needs a
+connected Studio session. It only accepts asset ids that a prior
+asset_search / recommend_assets call in the same RBXForge session returned,
+so the AI can never invent an id; --insert-asset-once is the explicit
+human exception (the id is typed on the command line).
+
 Protocol details: see docs/PROTOCOL.md.
 """
 
@@ -63,6 +80,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import socket
 import struct
 import sys
@@ -448,6 +466,10 @@ def _validate_value(value, spec, path):
             return path + " must be a string"
         if "min_length" in spec and len(value) < spec["min_length"]:
             return path + " must be at least {0} character(s)".format(spec["min_length"])
+        if "max_length" in spec and len(value) > spec["max_length"]:
+            return path + " must be at most {0} character(s)".format(spec["max_length"])
+        if "pattern" in spec and re.fullmatch(spec["pattern"], value) is None:
+            return path + " must match the pattern " + spec["pattern"]
         if "enum" in spec and value not in spec["enum"]:
             choices = ", ".join(repr(choice) for choice in spec["enum"])
             return path + " must be one of " + choices
@@ -1021,6 +1043,9 @@ def recommend_assets_tool():
         except assets_mod.AssetError as exc:
             rbx.log("recommend_assets FAILED: asset_search: {0}".format(exc))
             return False
+        # Phase 7C: remember the search-result ids so insert_asset can accept
+        # exactly an asset the model discovered (never an invented id).
+        _remember_results(rbx, result.get("results") or [])
         try:
             ranked = ranking_mod.rank_assets(
                 result.get("results") or [],
@@ -1092,6 +1117,129 @@ def recommend_assets_tool():
     )
 
 
+# Phase 7C asset insertion into the Studio project. `insert_asset` only accepts
+# an asset id that a prior asset_search / recommend_assets call returned in this
+# session (RBXForge.remember_assets records them), so the AI can never invent an
+# id. ``INSERTABLE_ASSET_TYPES`` is the CLI-side allowlist of Creator Store
+# categories the plugin knows how to load and place into the project (Plugin and
+# Video assets cannot be inserted into the Workspace this way).
+INSERTABLE_ASSET_TYPES = frozenset({"Model", "MeshPart", "Decal", "Audio"})
+
+#: Hard bound on how many asset ids are retained from search results so the
+#: known-assets registry can never grow without bound.
+MAX_KNOWN_ASSETS = 200
+
+INSERT_ASSET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        # Digits-only string id, bounded in length so absurd ids are rejected
+        # before anything is sent. The plugin re-validates and converts it.
+        "asset_id": {
+            "type": "string", "min_length": 1, "max_length": 16,
+            "pattern": "^[0-9]+$",
+        },
+        # Optional game-rooted container path (e.g. "Workspace"). When omitted
+        # the plugin places the asset directly under Workspace.
+        "parent_path": {"type": "string", "min_length": 1},
+        # Optional absolute placement. Mutually exclusive with reference_path:
+        # give one or neither, never both.
+        "position": {"type": "vec3"},
+        # Optional full path of an existing instance to place the asset near
+        # (e.g. "Workspace.SpawnLocation"); the plugin offsets from it.
+        "reference_path": {"type": "string", "min_length": 1},
+    },
+    "required": ["asset_id"],
+}
+
+
+def insert_asset_tool():
+    """Build the insert_asset tool (Phase 7C).
+
+    Inserts a Creator Store asset into the currently connected Studio project
+    via the plugin (request/response over the WebSocket, like create_part).
+    The step before insertion is a completed asset_search / recommend_assets
+    call; this tool refuses any asset id that was not among those results, so
+    the model can never fabricate an id. The CLI validates the id format,
+    the known-ids requirement, the insertable asset type, and the position /
+    reference_path exclusivity before anything is sent; the plugin
+    independently re-validates, loads the asset (InsertService:LoadAsset),
+    resolves the parent, ensures a sibling-unique name, and positions the
+    asset (explicit position, near the referenced instance, or beside the
+    project's SpawnLocation). Returns clear success/error information.
+    """
+
+    def run(rbx, params, timeout):
+        asset_id = params["asset_id"]
+        # Phase 7C safety: the model may only insert an asset id that a prior
+        # discover/rank step returned in this session. Connections that track
+        # known assets (RBXForge) enforce it; test doubles without tracking
+        # skip it, keeping every other tool's behavior unchanged.
+        known = getattr(rbx, "known_asset", None)
+        if known is not None:
+            record = known(asset_id)
+            if record is None:
+                rbx.log(
+                    "insert_asset REJECTED: asset_id {0!r} was not returned by a "
+                    "prior asset_search / recommend_assets call - search first and "
+                    "use an id exactly as it appears in the results".format(asset_id)
+                )
+                return False
+            asset_type = record.get("asset_type")
+            if asset_type is not None and asset_type not in INSERTABLE_ASSET_TYPES:
+                rbx.log(
+                    "insert_asset REJECTED: asset_id {0!r} is type {1!r}, which "
+                    "cannot be inserted into the project (supported: {2})".format(
+                        asset_id, asset_type,
+                        ", ".join(sorted(INSERTABLE_ASSET_TYPES)),
+                    )
+                )
+                return False
+        if params.get("position") is not None and params.get("reference_path") is not None:
+            rbx.log(
+                "insert_asset REJECTED: provide either 'position' or "
+                "'reference_path', not both"
+            )
+            return False
+        response = rbx.send_request("insert_asset", params, timeout)
+        if response is None:
+            rbx.log("insert_asset failed: no response from the plugin")
+            return False
+        if response.get("ok"):
+            result = response.get("result") or {}
+            summary = "insert_asset OK: asset {0} inserted as {1} ({2}) at {3}".format(
+                result.get("asset_id", "?"),
+                result.get("name", "?"),
+                result.get("class", "?"),
+                result.get("path", "?"),
+            )
+            if result.get("positioned"):
+                summary += " at {0}".format(json.dumps(result.get("position"), sort_keys=True))
+            rbx.log(summary)
+            return True
+        error = response.get("error") or {}
+        rbx.log("insert_asset FAILED: [{0}] {1}".format(
+            error.get("code"), error.get("message")
+        ))
+        return False
+
+    return Tool(
+        "insert_asset",
+        "Insert a Creator Store asset into the Studio project at a chosen or "
+        "sensible location. The 'asset_id' MUST be the exact id of an asset "
+        "already returned by asset_search or recommend_assets (ids are never "
+        "invented); it is validated before anything is sent and the plugin "
+        "loads it, gives it a unique name, and reports the resulting instance "
+        "path. 'parent_path' (game-rooted, default Workspace) is the target "
+        "container; supply exactly one of 'position' (absolute vec3) or "
+        "reference_path (a path like 'Workspace.SpawnLocation' to place near) "
+        "or neither (the plugin places the asset beside the project's "
+        "SpawnLocation). Insertable asset types: Model, MeshPart, Decal, "
+        "Audio. Read-only search never inserts; this tool does.",
+        INSERT_ASSET_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
@@ -1103,7 +1251,22 @@ def default_registry():
     registry.register(inspect_instance_tool())
     registry.register(asset_search_tool())
     registry.register(recommend_assets_tool())
+    registry.register(insert_asset_tool())
     return registry
+
+
+def _remember_results(rbx, results):
+    """Record search-result asset metadata on the connection (Phase 7C).
+
+    ``insert_asset`` only accepts ids that a prior asset_search /
+    recommend_assets call returned in the same session. The connection
+    (RBXForge) stores a bounded ``{asset_id: record}`` table; test
+    doubles without tracking simply skip this, which keeps every read-only
+    tool's behavior unchanged.
+    """
+    remember = getattr(rbx, "remember_assets", None)
+    if remember is not None:
+        remember(results)
 
 
 def asset_search_tool():
@@ -1158,6 +1321,9 @@ def asset_search_tool():
         except assets_mod.AssetError as exc:
             rbx.log("asset_search FAILED: {0}".format(exc))
             return False
+        # Phase 7C: remember the returned ids so insert_asset can later accept
+        # exactly these (never an invented id) and validate before sending.
+        _remember_results(rbx, result.get("results") or [])
         summary = "asset_search OK: {0} result(s) for query {1!r}".format(
             len(result.get("results") or []), result.get("query")
         )
@@ -1313,6 +1479,10 @@ class RBXForge:
         self.request_lock = threading.Lock()
         self._next_id = 0
         self._agent = None
+        # Phase 7C: bounded table of asset ids returned by prior
+        # asset_search / recommend_assets calls; insert_asset only accepts ids
+        # recorded here, so the model can never invent one.
+        self._known_assets = {}
 
     # -- logging ----------------------------------------------------------- #
 
@@ -1333,6 +1503,42 @@ class RBXForge:
         if self._asset_client is None:
             self._asset_client = _asset_client_from_env()
         return self._asset_client
+
+    # -- Phase 7C: known-asset registry ------------------------------------ #
+
+    def remember_assets(self, results):
+        """Record asset ids from search results as known (bounded).
+
+        Each non-dict / id-less entry is skipped; the first metadata snapshot
+        for an id is kept. Kept hard-bounded: when the table would exceed
+        :data:`MAX_KNOWN_ASSETS` entries the oldest records are dropped, so a
+        long REPL/agent session can never grow the registry without bound
+        (each record is small: name/asset_type/creator).
+        """
+        for entry in results or []:
+            if not isinstance(entry, dict):
+                continue
+            asset_id = entry.get("asset_id")
+            if asset_id is None:
+                continue
+            asset_id = str(asset_id).strip()
+            if not asset_id:
+                continue
+            self._known_assets.setdefault(asset_id, {
+                "name": entry.get("name"),
+                "asset_type": entry.get("asset_type"),
+                "creator": entry.get("creator"),
+            })
+            while len(self._known_assets) > MAX_KNOWN_ASSETS:
+                self._known_assets.pop(next(iter(self._known_assets)))
+
+    def asset_known(self, asset_id):
+        """True when ``asset_id`` was returned by a prior search/ranking call."""
+        return str(asset_id) in self._known_assets
+
+    def known_asset(self, asset_id):
+        """The recorded metadata snapshot for ``asset_id``, or None."""
+        return self._known_assets.get(str(asset_id))
 
     # -- server callbacks -------------------------------------------------- #
 
@@ -1624,6 +1830,27 @@ class RBXForge:
             params["limit"] = limit
         return self.execute_tool("recommend_assets", params, timeout)
 
+    def insert_asset(self, asset_id, parent_path=None, position=None,
+                     reference_path=None, timeout=10.0):
+        """Insert a Creator Store asset into the Studio project (Phase 7C).
+
+        ``asset_id`` must be the exact id of an asset returned by a prior
+        ``asset_search`` / ``recommend_assets`` call in this session (the tool
+        rejects ids it has not seen, so ids are never invented). ``parent_path``
+        is the optional game-rooted container (default Workspace); give at most
+        one of ``position`` (absolute vec3) and ``reference_path`` (a path to
+        place near, e.g. "Workspace.SpawnLocation"), or neither. Returns True
+        when the plugin reports the insertion, else False.
+        """
+        params = {"asset_id": asset_id}
+        if parent_path is not None:
+            params["parent_path"] = parent_path
+        if position is not None:
+            params["position"] = position
+        if reference_path is not None:
+            params["reference_path"] = reference_path
+        return self.execute_tool("insert_asset", params, timeout)
+
     def ask(self, prompt):
         """Run one natural-language prompt through the AI agent (Phase 3B-4D).
 
@@ -1814,6 +2041,17 @@ def repl(rbx, console, prompt="RBXForge> "):
                         limit = parsed
                         after = " ".join(words[:-1])
                 rbx.recommend_assets(after, limit=limit)
+        elif command == "insert_asset":
+            after = line.strip()[len(command):].strip()
+            if not after:
+                rbx.log("insert_asset: no asset_id given (e.g. "
+                        "'insert_asset 135522 Workspace' - the id must come from an "
+                        "earlier asset_search / recommend_assets, it is never invented)")
+            else:
+                words = after.split()
+                asset_id = words[0]
+                parent_path = words[1] if len(words) > 1 else None
+                rbx.insert_asset(asset_id, parent_path=parent_path)
         elif command == "status":
             with rbx.connection_lock:
                 client = rbx.connection
@@ -1854,6 +2092,10 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("              - search the Creator Store and rank the results into")
             print("                a bounded, explainable recommendation list")
             print("                (read-only; default limit: 3, max: 5)")
+            print("  insert_asset <asset_id> [parent_path]")
+            print("              - insert a Creator Store asset into the project; the")
+            print("                id must come from an earlier asset_search /")
+            print("                recommend_assets (ids are never invented)")
             print("  status      - show connection status")
             print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
@@ -1928,6 +2170,13 @@ def main(argv=None):
              "local HTTP, no plugin needed), report, then exit",
     )
     parser.add_argument(
+        "--insert-asset-once", action="store_true",
+        help="wait for the plugin to connect, insert the Creator Store asset "
+             "--asset-id into the project, report, then exit (the agent path "
+             "instead requires the id to come from a prior asset_search / "
+             "recommend_assets call)",
+    )
+    parser.add_argument(
         "--depth", type=int, default=None,
         help="maximum hierarchy depth for --inspect-hierarchy-once (default: 3; "
              "must be a whole number in 1..{0})".format(MAX_HIERARCHY_DEPTH),
@@ -1972,6 +2221,28 @@ def main(argv=None):
         "--creator", default=None,
         help="optional creator-name bias for --recommend-assets-once "
              "(ranking favors assets whose creator matches)",
+    )
+    parser.add_argument(
+        "--asset-id", default=None,
+        help="Creator Store asset id for --insert-asset-once (digits only; "
+             "the agent path never invents ids)",
+    )
+    parser.add_argument(
+        "--parent-path", default=None,
+        help="game-rooted container path for --insert-asset-once "
+             "(default: Workspace)",
+    )
+    parser.add_argument(
+        "--position", default=None,
+        help='absolute 3D position JSON for --insert-asset-once, e.g. '
+             '{"x": 0, "y": 5, "z": 0} (mutually exclusive with '
+             '--reference-path)',
+    )
+    parser.add_argument(
+        "--reference-path", default=None,
+        help="full path of an existing instance to place the inserted asset "
+             "near for --insert-asset-once (e.g. Workspace.SpawnLocation; "
+             "mutually exclusive with --position)",
     )
     parser.add_argument(
         "--timeout", type=float, default=30.0,
@@ -2078,6 +2349,38 @@ def main(argv=None):
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
             return 0 if rbx.inspect_instance(args.path, args.request_timeout) else 4
+        if args.insert_asset_once:
+            # Phase 7C --insert-asset-once: the human types the id explicitly,
+            # so it is recorded as a known asset before execution (the Agent
+            # path instead enforces that ids come from search results).
+            if not args.asset_id:
+                rbx.error("--insert-asset-once requires --asset-id <id>")
+                return 2
+            if args.position and args.reference_path:
+                rbx.error("--position and --reference-path may not both be given")
+                return 2
+            position = None
+            if args.position:
+                try:
+                    position = json.loads(args.position)
+                except ValueError:
+                    rbx.error('--position must be valid JSON, e.g. {"x": 0, "y": 5, "z": 0}')
+                    return 2
+                if not isinstance(position, dict):
+                    rbx.error("--position must be a JSON object with numeric x, y, z")
+                    return 2
+            if not wait_for_plugin(rbx, args.timeout):
+                return 2
+            rbx.remember_assets([{"asset_id": args.asset_id}])
+            rbx.log(
+                "insert_asset: accepting --asset-id {0!r} provided directly on "
+                "the command line (the Agent path requires ids from "
+                "asset_search / recommend_assets)".format(args.asset_id)
+            )
+            return 0 if rbx.insert_asset(
+                args.asset_id, parent_path=args.parent_path, position=position,
+                reference_path=args.reference_path, timeout=args.request_timeout,
+            ) else 4
         repl(rbx, console)
     finally:
         rbx.stop()

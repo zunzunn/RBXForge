@@ -4,16 +4,18 @@
 >
 > - **Current / Implemented:** the transport and the message types below are
 >   implemented and verified — the CLI side in `cli/rbxforge.py`, the plugin side in
->   `plugin/rbxforge.lua`. Six Studio operations are implemented as registered tools,
+>   `plugin/rbxforge.lua`. Seven Studio operations are implemented as registered tools,
 >   dispatched through registries on both sides, with CLI-side argument validation before any
 >   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A),
 >   `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A),
->   and `modify_instance` (Phase 6B).
+>   `modify_instance` (Phase 6B), and `insert_asset` (Phase 7C).
 > - **Deliberate exception (Phase 7A/7B):** `asset_search` and `recommend_assets` are registered
 >   tools but are **not** dispatched through the plugin. They execute as **local HTTP calls** to
 >   the Open Cloud Creator Store API from `cli/roblox_assets.py` / `cli/asset_ranking.py`, so they
 >   never produce or consume a WebSocket `request`/`response`; only their bounded result is
->   surfaced (in the CLI log and to the agent).
+>   surfaced (in the CLI log and to the agent). `insert_asset` (Phase 7C) re-crosses the
+>   WebSocket boundary as a normal plugin `request`/`response` tool — it is the CLI-side known-id
+>   registry plus the plugin's `InsertService:LoadAsset` handling that completes the loop.
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -211,6 +213,7 @@ Implemented tools and their `params`:
 | `modify_instance` | `path` (non-empty string, full path from Workspace), `properties` (non-empty object with at least one allowlisted property, see below) | `{ path, className, changed }` |
 | `asset_search` | `query` (non-empty string, max 200 chars), `asset_type` (optional string, one of `"Audio"`, `"Model"`, `"Decal"`, `"Plugin"`, `"MeshPart"`, `"Video"`, `"FontFamily"`), `max_results` (optional integer, `1..20`, default `5`) — **local HTTP, no `request` message** | `{ query, asset_type, max_results, count, total, truncated, results }` |
 | `recommend_assets` | `query` (non-empty string, max 200 chars), `asset_type` (optional, as `asset_search`), `creator` (optional string), `max_results` (optional integer, `1..20`, default `5`), `limit` (optional integer, `1..5`, default `3`) — **local HTTP, no `request` message** | `{ query, asset_type, creator, evaluated, limit, count, recommendations: [{ rank, score, reason, asset }], tiebreak, note }` |
+| `insert_asset` | `asset_id` (digits-only string, max 16 chars — must be an id a prior `asset_search`/`recommend_assets` returned in this session, never invented), `parent_path` (optional game-rooted string, default `"Workspace"`), `position` (optional object with numeric `x`, `y`, `z`), `reference_path` (optional non-empty string, a path to place near; `position` and `reference_path` are mutually exclusive) | `{ asset_id, name, class, parent_path, path, positioned, placement: "explicit" \| "reference" \| "default", position? }` |
 
 `inspect_hierarchy` example request:
 
@@ -563,7 +566,11 @@ schema-validated exactly like the others, but their execution **does not produce
 `cli/roblox_assets.py` (search) and rank purely in-process in `cli/asset_ranking.py`
 (recommendation — no extra API calls beyond the search; no robot changes to Studio). Their
 structured result is returned directly (and logged / shown to the agent); there is no plugin
-handler and no `response` message. See [TOOLS.md](./TOOLS.md).
+handler and no `response` message. `insert_asset` (Phase 7C) is the counterpart that **does**
+produce a normal `request`/`response` pair: the CLI accepts an `asset_id` only if a prior
+search/ranking recorded it in the bounded per-session known-id registry (or the human typed it
+via `--insert-asset-once`), and the plugin loads it with `InsertService:LoadAsset` and reports
+the final instance path. See [TOOLS.md](./TOOLS.md).
 
 ## Future Streaming / Events (Planned)
 
@@ -576,9 +583,10 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only six Studio operations (`create_part`, `create_script`, `modify_instance`,
-  `inspect_hierarchy`, `find_instances`, `inspect_instance`) plus the local-HTTP `asset_search`
-  (Phase 7A) and `recommend_assets` (Phase 7B), which are not Studio operations at all. Other
+- Only seven Studio operations (`create_part`, `create_script`, `modify_instance`,
+  `insert_asset`, `inspect_hierarchy`, `find_instances`, `inspect_instance`) plus the
+  local-HTTP `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B), which are not Studio
+  operations at all. Other
   object/script/UI operations and generalized
   search (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by

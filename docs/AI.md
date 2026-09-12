@@ -9,7 +9,7 @@
 > (`find_instances`, `inspect_instance`, `inspect_hierarchy`) to gather live project context;
 > each tool result is returned to the model as a bounded, compacted payload, so it can decide
 > the next step. It eventually executes an action tool (`create_part`, `create_script`,
-> `modify_instance`). The loop is capped at **5 tool calls per request**, only executes through
+> `modify_instance`, `insert_asset`). The loop is capped at **5 tool calls per request**, only executes through
 > the existing `ToolRegistry`, and never exposes unbounded hierarchy/property data to the model.
 >
 > **Implemented (Phase 7A):** `asset_search` is exposed to the model as a read-only Creator
@@ -22,6 +22,12 @@
 > likewise read-only and not an action tool: a successful recommendation never ends the loop,
 > and the paired flow `asset_search` → `recommend_assets` → report lets the model state *why* an
 > asset was chosen.
+>
+> **Implemented (Phase 7C):** `insert_asset` closes the loop — it inserts the Creator Store
+> asset whose `asset_id` the model selected from a prior search/ranking result (ids are never
+> invented; the connection records them in a bounded known-id registry). It **is** an action
+> tool: after it succeeds the loop pauses for exactly one optional `inspect_instance` verification
+> step (mirroring `modify_instance`), then ends with a report.
 
 ## Purpose
 
@@ -197,7 +203,8 @@ action tool succeeds → loop permits exactly one optional inspect_instance
   verification step before ending (conditional on whether the model
   previously called an inspection tool during the same request to gather project context).
   modify_instance also permits exactly one optional inspect_instance verification step
-  after success (existing Phase 4D behavior).
+  after success (existing Phase 4D behavior). insert_asset (Phase 7C) likewise permits
+  exactly one optional inspect_instance verification step of the placed asset.
 ```
 
 `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) participate in the same loop but
@@ -205,18 +212,21 @@ execute as **local HTTP calls** (no plugin `request`), so `ToolRegistry.execute 
 (plugin)` does not apply to them. `asset_search` returns the bounded candidate list;
 `recommend_assets` ranks that metadata in-process into a bounded, explainable recommendation
 list (no extra API calls). Their structured dict results take the place of the plugin `response`
-payload when the loop compacts what to show the model.
+payload when the loop compacts what to show the model. `insert_asset` (Phase 7C) is the
+counterpart that does cross to the plugin: it only accepts an `asset_id` that a prior
+`asset_search` / `recommend_assets` result recorded in the session's bounded known-id registry,
+so the model bases every insertion on real discovered assets.
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
   budget remains.
 - **Stopping:** the loop ends on an executed **action tool** (`create_part`, `create_script`,
-  `modify_instance`), a final model report (`{"message": ...}`), a hard rejection
+  `modify_instance`, `insert_asset`), a final model report (`{"message": ...}`), a hard rejection
   (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
   `execution_failed`), or the **5-call budget** being exhausted (`max_tool_calls`). It stops
   rather than guessing when it cannot determine what to do. `asset_search` and
   `recommend_assets` are **not** action tools, so a successful search/recommendation alone never
-  ends the loop.
+  ends the loop — the loop ends when the model inserts (7C) or otherwise acts.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never

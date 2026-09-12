@@ -1,8 +1,9 @@
 # RBXForge — Tool System
 
-> **Status:** Eight tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Nine tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
-> modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B); the
+> modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B,
+> insert_asset in Phase 7C); the
 > rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
 > of these tools without adding any new tool.
@@ -40,6 +41,16 @@
 >   local — ranking makes **no extra API calls** and never downloads/inserts/purchases anything.
 >   Exposed to the REPL (`recommend_assets <query> [limit]`), the one-shot CLI
 >   (`--recommend-assets-once`), and the agent (never an action tool — it does not end the loop).
+> - **Implemented (Phase 7C):** `insert_asset` completes the loop the other two asset tools open
+>   up: it **inserts a Creator Store asset into the Studio project at a specified or sensible
+>   location**. It only accepts an `asset_id` that a prior `asset_search` / `recommend_assets`
+>   call returned in this session — recorded in a **bounded** per-session registry, so ids are
+>   never invented — and the plugin validates, loads, names uniquely, parents, and positions the
+>   asset (explicit `position`, near a `reference_path`, or beside the first `SpawnLocation`).
+>   Unlike search/ranking it **is** an action tool: the agent loop ends after one optional
+>   `inspect_instance` verification step. Exposed to the REPL (`insert_asset <asset_id>
+>   [parent_path]`) and the one-shot CLI (`--insert-asset-once`, whose `--asset-id` is the one
+>   explicit human exception to the search-sourced-id rule).
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -235,6 +246,45 @@ The CLI exposes `asset_search <query> [max_results]` as a REPL command (a traili
 is parsed as `max_results`) and `--asset-search-once --query <text> [--asset-type TYPE]
 [--max-results N]` as a one-shot flag. One-shot execution is local HTTP, so it does **not** wait
 for the plugin: exit `0` on success, `2` when `--query` is missing, `4` on search failure.
+
+### insert_asset (Phase 7C)
+
+- **Purpose:** Insert a **Creator Store** asset into the currently connected Studio project at
+  a specified or sensible location. This is the **action counterpart** to `asset_search` (7A) and
+  `recommend_assets` (7B): it completes the loop those two tools open up, but it only accepts an
+  `asset_id` that a prior search/ranking call returned in the same session — the model never
+  invents an id.
+- **Execution model:** this tool **does** go over the WebSocket to the plugin, like `create_part`
+  and `modify_instance`. The CLI validates first; the plugin re-validates, loads, parents, and
+  positions.
+- **Inputs (schema, validated before sending):**
+  - `asset_id` — required, digits-only string (`^[0-9]+$`, max 16 chars). Must be the exact id of
+    an asset returned by a prior `asset_search` / `recommend_assets` call; the connection tracks
+    known ids in a bounded registry (`MAX_KNOWN_ASSETS = 200`).
+  - `parent_path` — optional game-rooted path (e.g. `"Workspace"`). Default: `Workspace`.
+  - `position` — optional vec3 `{"x", "y", "z"}` absolute placement. **Mutually exclusive**
+    with `reference_path`.
+  - `reference_path` — optional full path of an existing instance to place the asset near (e.g.
+    `"Workspace.SpawnLocation"`). The plugin offsets from it by `PLACEMENT_OFFSET` (5 studs).
+- **Placement logic (plugin):** explicit `position` first, then near `reference_path` (+ offset),
+  then beside the first `SpawnLocation` descendant, then a sensible default above the origin.
+  Models pivot via `PivotTo`; bare parts get a `Position` assignment; assets that carry no
+  transform (e.g. decal/audio) are reported `positioned: false` instead of silently adjusted.
+  Sibling names are kept unique by appending a bounded numeric suffix.
+- **Expected output (success):** `{ asset_id, name, class, parent_path, path, positioned,
+  placement, position? }` where `placement` is one of `"explicit"`, `"reference"`, or
+  `"default"`.
+- **Agent behavior (action tool):** unlike search/ranking, `insert_asset` is an **action tool** —
+  the agent loop ends after one optional `inspect_instance` verification step. The id must be
+  search-sourced for the agent path; the `--insert-asset-once` CLI is the explicit human exception
+  that seeds the registry directly.
+- **Non-goals:** no purchasing, no arbitrary external downloads, no asset deletion, no unrelated
+  changes.
+
+The CLI exposes `insert_asset <asset_id> [parent_path]` as a REPL command and
+`--insert-asset-once --asset-id ID [--parent-path PATH] [--position JSON] [--reference-path PATH]`
+as a one-shot flag. The one-shot CLI seeds the id as known before execution. Exit `0` on success,
+`2` on usage error, `4` on insertion failure.
 
 ## Conceptual Tool List
 

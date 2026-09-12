@@ -57,12 +57,17 @@ class FakeRBX:
 
     ``response_payload`` is what ``send_request`` returns (the plugin's reply).
     Every request is recorded so tests can prove what was actually sent.
+    ``known_assets`` pre-seeds the Phase 7C known-assets registry the way a
+    prior asset_search / recommend_assets call would (``{asset_id: record}``);
+    with the default empty table insert_asset rejects every id before sending,
+    which is exactly the invented-id protection.
     """
 
-    def __init__(self, response_payload=None):
+    def __init__(self, response_payload=None, known_assets=None):
         self.response_payload = response_payload
         self.requests = []
         self.logs = []
+        self.known_assets = dict(known_assets) if known_assets else {}
 
     def send_request(self, tool, params, timeout):
         self.requests.append((tool, params))
@@ -70,6 +75,30 @@ class FakeRBX:
 
     def log(self, message):
         self.logs.append(message)
+
+    def remember_assets(self, results):
+        count = 0
+        for entry in results or []:
+            if not isinstance(entry, dict):
+                continue
+            asset_id = entry.get("asset_id")
+            if asset_id is None:
+                continue
+            asset_id = str(asset_id).strip()
+            if asset_id:
+                self.known_assets.setdefault(asset_id, {
+                    "name": entry.get("name"),
+                    "asset_type": entry.get("asset_type"),
+                    "creator": entry.get("creator"),
+                })
+                count += 1
+        return count
+
+    def asset_known(self, asset_id):
+        return str(asset_id) in self.known_assets
+
+    def known_asset(self, asset_id):
+        return self.known_assets.get(str(asset_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -1218,15 +1247,15 @@ def scenario_interactive_create_part_registered():
 
 def scenario_tool_registry_metadata():
     """The tool registry must expose create_part, create_script, modify_instance,
-    find_instances, inspect_hierarchy, inspect_instance, asset_search, and
-    recommend_assets with metadata."""
+    find_instances, inspect_hierarchy, inspect_instance, asset_search,
+    recommend_assets, and insert_asset with metadata."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
         "asset_search", "create_part", "create_script", "find_instances",
-        "inspect_hierarchy", "inspect_instance", "modify_instance",
-        "recommend_assets",
+        "insert_asset", "inspect_hierarchy", "inspect_instance",
+        "modify_instance", "recommend_assets",
     ], tools
 
     tool = registry.get("create_part")
@@ -1309,8 +1338,24 @@ def scenario_tool_registry_metadata():
     assert path_prop["type"] == "string"
     assert path_prop["min_length"] == 1
     assert set(inspector.input_schema["required"]) == {"path"}
+
+    inserter = registry.get("insert_asset")
+    assert inserter is not None
+    assert isinstance(inserter.description, str) and inserter.description
+    assert inserter.input_schema["type"] == "object"
+    assert set(inserter.input_schema["required"]) == {"asset_id"}
+    asset_id_prop = inserter.input_schema["properties"]["asset_id"]
+    assert asset_id_prop == {
+        "type": "string", "min_length": 1, "max_length": 16, "pattern": "^[0-9]+$",
+    }, asset_id_prop
+    assert inserter.input_schema["properties"]["parent_path"] == {"type": "string", "min_length": 1}
+    assert inserter.input_schema["properties"]["position"] == {"type": "vec3"}
+    assert inserter.input_schema["properties"]["reference_path"] == {"type": "string", "min_length": 1}
+    assert mod.INSERTABLE_ASSET_TYPES == frozenset({"Model", "MeshPart", "Decal", "Audio"})
+    assert mod.MAX_KNOWN_ASSETS == 200
     print("OK  registry registers create_part, create_script, modify_instance, "
-          "find_instances, inspect_hierarchy, and inspect_instance with metadata")
+          "find_instances, inspect_hierarchy, inspect_instance, and "
+          "insert_asset with metadata")
 
 
 def scenario_tool_validation():
@@ -1813,6 +1858,330 @@ def scenario_modify_instance_failure():
             proc.proc.kill()
 
 
+def scenario_insert_asset_validation():
+    """insert_asset must validate its schema: an asset_id must be a digits-only
+    string (bounded length), optional params have the right shapes, and a
+    position + reference_path pair is rejected before anything is sent."""
+    mod = load_cli_module()
+    tool = mod.default_registry().get("insert_asset")
+    rbx = FakeRBX({"ok": True, "result": {"asset_id": "135522", "name": "Cafe Shop"}})
+    rbx.remember_assets([{"asset_id": "135522", "asset_type": "Model", "name": "Cafe Shop"}])
+
+    # Valid: id alone, and each optional param alone.
+    tool.validate({"asset_id": "135522"})
+    tool.validate({"asset_id": "135522", "parent_path": "Workspace"})
+    tool.validate({"asset_id": "135522", "position": {"x": 0, "y": 5, "z": 0}})
+    tool.validate({"asset_id": "135522", "reference_path": "Workspace.SpawnLocation"})
+
+    # Invalid ids: missing, empty, non-digits, absurdly long.
+    invalid_cases = [
+        ("missing asset_id", {}),
+        ("empty asset_id", {"asset_id": ""}),
+        ("non-digit asset_id", {"asset_id": "1355a2"}),
+        ("decimal asset_id", {"asset_id": "1355.2"}),
+        ("spaced asset_id", {"asset_id": "135 522"}),
+        ("overlong asset_id", {"asset_id": "1" * 17}),
+        ("asset_id not a string", {"asset_id": 135522}),
+        ("position not vec3", {"asset_id": "1", "position": "5,5,5"}),
+        ("parent_path empty", {"asset_id": "1", "parent_path": ""}),
+    ]
+    for label, bad_params in invalid_cases:
+        try:
+            tool.validate(bad_params)
+        except mod.InvalidParamsError:
+            pass
+        else:
+            raise AssertionError("insert_asset accepted invalid params: " + label)
+
+    # Nothing reached the wire for the rejected cases.
+    assert rbx.requests == [], rbx.requests
+    print("OK  insert_asset schema rejects malformed ids and wrong param shapes")
+
+
+def scenario_insert_asset_known_ids_enforced():
+    """insert_asset must only accept an asset id that a prior search/ranking
+    recorded (Phase 7C known-id enforcement) and only insertable asset types;
+    anything else is rejected locally and never sent."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+
+    # Invented id: never sent, clear rejection log.
+    rbx = FakeRBX({"ok": True})
+    ok = registry.execute(rbx, "insert_asset", {"asset_id": "999999"})
+    assert ok is False, ok
+    assert rbx.requests == [], rbx.requests
+    assert any("not returned by a prior asset_search" in line for line in rbx.logs), rbx.logs
+
+    # Recorded id of a non-insertable type: rejected, never sent.
+    rbx = FakeRBX({"ok": True}, known_assets={"42": {"asset_type": "Plugin"}})
+    ok = registry.execute(rbx, "insert_asset", {"asset_id": "42"})
+    assert ok is False, ok
+    assert rbx.requests == [], rbx.requests
+    assert any("cannot be inserted" in line for line in rbx.logs), rbx.logs
+
+    # recorded id of a missing asset_type is allowed through (metadata may be
+    # absent); the plugin re-validates at load time.
+    rbx = FakeRBX({"ok": True}, known_assets={"7": {"name": "Mystery"}})
+    ok = registry.execute(rbx, "insert_asset", {"asset_id": "7"})
+    assert ok is True, ok
+    assert rbx.requests == [("insert_asset", {"asset_id": "7"})], rbx.requests
+
+    # Recorded id of an insertable type succeeds and is sent exactly as given.
+    rbx = FakeRBX({"ok": True}, known_assets={"135522": {"asset_type": "Model"}})
+    ok = registry.execute(rbx, "insert_asset", {"asset_id": "135522"})
+    assert ok is True, ok
+    assert rbx.requests == [("insert_asset", {"asset_id": "135522"})], rbx.requests
+
+    # position + reference_path are mutually exclusive: rejected before send.
+    rbx = FakeRBX({"ok": True}, known_assets={"1": {"asset_type": "Model"}})
+    ok = registry.execute(rbx, "insert_asset", {
+        "asset_id": "1", "position": {"x": 0, "y": 1, "z": 0},
+        "reference_path": "Workspace.SpawnLocation",
+    })
+    assert ok is False, ok
+    assert rbx.requests == [], rbx.requests
+    assert any("not both" in line for line in rbx.logs), rbx.logs
+
+    # remember_assets records the snapshot needed for later insertion.
+    rbx = FakeRBX({"ok": True})
+    assert rbx.remember_assets([{"asset_id": "A", "name": "Shop", "asset_type": "Model"}]) == 1
+    assert rbx.asset_known("A") is True
+    assert rbx.known_asset("A")["asset_type"] == "Model"
+    print("OK  insert_asset enforces known ids, insertable types, and one placement mode")
+
+
+def scenario_insert_asset_bounded_registry():
+    """The known-assets registry stays bounded (MAX_KNOWN_ASSETS): after the
+    limit is exceeded the oldest records are dropped, newest survive."""
+    mod = load_cli_module()
+    rbx = mod.RBXForge()
+    try:
+        records = [{"asset_id": str(i), "name": "asset{0}".format(i)} for i in range(mod.MAX_KNOWN_ASSETS + 25)]
+        rbx.remember_assets(records)
+        # Oldest are evicted once the table exceeds the bound.
+        assert rbx.asset_known("0") is False
+        assert rbx.asset_known("1") is False
+        # Newest retained.
+        assert rbx.asset_known(str(mod.MAX_KNOWN_ASSETS + 24)) is True
+        assert len(rbx._known_assets) == mod.MAX_KNOWN_ASSETS
+
+        # Non-dict / id-less entries are skipped gracefully.
+        rbx.remember_assets([None, {}, {"name": "no id"}, {"asset_id": "  ", "name": "blank"}])
+        assert len(rbx._known_assets) == mod.MAX_KNOWN_ASSETS
+    finally:
+        rbx.stop()
+    print("OK  known-assets registry is bounded and tolerates junk entries")
+
+
+def scenario_insert_asset_success():
+    """--insert-asset-once must wait for the plugin, send an insert_asset request
+    carrying only the seeded asset_id (no invented position), accept a success
+    response including the plugin's final name/path, and exit 0."""
+    proc = Proc("--insert-asset-once", "--asset-id", "135522", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "insert_asset", req
+        assert req["payload"]["params"] == {"asset_id": "135522"}, req["payload"]["params"]
+        assert "position" not in req["payload"]["params"], req["payload"]["params"]
+        assert "reference_path" not in req["payload"]["params"], req["payload"]["params"]
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": True,
+                "result": {
+                    "asset_id": "135522",
+                    "name": "Cafe Shop2",
+                    "class": "Model",
+                    "parent_path": "Workspace",
+                    "path": "Workspace/Cafe Shop2",
+                    "positioned": True,
+                    "placement": "default",
+                    "position": {"x": 0, "y": 5, "z": 0},
+                },
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("insert_asset OK"), proc._output()
+        assert proc.reader.contains("Cafe Shop2"), proc._output()
+        assert proc.reader.contains("Workspace/Cafe Shop2"), proc._output()
+        print("OK  insert_asset request sent; unique-name/placement result handled; clean exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_insert_asset_failure():
+    """A failed insert_asset (plugin replies ok:false, e.g. not_found) must be
+    reported and yield a non-zero exit code."""
+    proc = Proc("--insert-asset-once", "--asset-id", "135522", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        assert req["payload"]["tool"] == "insert_asset", req
+
+        send_json(sock, {
+            "type": "response",
+            "id": req["id"],
+            "version": PROTOCOL_VERSION,
+            "timestamp": 0.0,
+            "payload": {
+                "ok": False,
+                "error": {"code": "not_found", "message": "asset not found or not insertable: 135522"},
+            },
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 4, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("insert_asset FAILED"), proc._output()
+        assert proc.reader.contains("not_found"), proc._output()
+        print("OK  insert_asset failure response (plugin-side) reported; non-zero exit")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_insert_asset_placement_modes():
+    """--insert-asset-once placement: an explicit --position JSON or a
+    --reference-path is carried through untouched, and neither triggers an
+    invented-parent default."""
+    proc = Proc("--insert-asset-once", "--asset-id", "135522",
+                "--reference-path", "Workspace.SpawnLocation", "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        params = req["payload"]["params"]
+        assert params["asset_id"] == "135522", params
+        assert params["reference_path"] == "Workspace.SpawnLocation", params
+        assert "position" not in params, params
+        send_json(sock, {
+            "type": "response", "id": req["id"], "version": PROTOCOL_VERSION,
+            "timestamp": 0.0, "payload": {"ok": True, "result": {
+                "asset_id": "135522", "name": "Cafe Shop", "class": "Model",
+                "parent_path": "Workspace", "path": "Workspace/Cafe Shop",
+                "positioned": True, "placement": "reference",
+                "position": {"x": 5, "y": 0, "z": 0},
+            }},
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("insert_asset OK"), proc._output()
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+    proc = Proc("--insert-asset-once", "--asset-id", "135522",
+                "--position", '{"x": 1, "y": 6, "z": -2}', "--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        sock = connect_ws(host, port)
+        send_json(sock, HELLO)
+        assert recv_json(sock)["type"] == "welcome", proc._output()
+        req = recv_json(sock)
+        assert req["type"] == "request", req
+        params = req["payload"]["params"]
+        assert params["asset_id"] == "135522", params
+        assert params["position"] == {"x": 1, "y": 6, "z": -2}, params
+        assert "reference_path" not in params, params
+        send_json(sock, {
+            "type": "response", "id": req["id"], "version": PROTOCOL_VERSION,
+            "timestamp": 0.0, "payload": {"ok": True, "result": {
+                "asset_id": "135522", "name": "Cafe Shop", "class": "Model",
+                "parent_path": "Workspace", "path": "Workspace/Cafe Shop",
+                "positioned": True, "placement": "explicit",
+                "position": {"x": 1, "y": 6, "z": -2},
+            }},
+        })
+        sock.close()
+        rc = proc.wait()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("insert_asset OK"), proc._output()
+        print("OK  insert_asset carries --position and --reference-path through untouched")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
+def scenario_insert_asset_cli_rejects_usage():
+    """--insert-asset-once usage errors exit 2 before any insertion: a missing
+    --asset-id, a position+reference_path conflict, and unparsable JSON."""
+    proc = Proc("--insert-asset-once", "--asset-id", "1",
+                "--position", '{"x": 0, "y": 0, "z": 0}',
+                "--reference-path", "Workspace.SpawnLocation", "--port", "0")
+    try:
+        rc = proc.wait()
+        assert rc == 2, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("may not both be given"), proc._output()
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+    proc = Proc("--insert-asset-once", "--asset-id", "1",
+                "--position", "not-json", "--port", "0")
+    try:
+        rc = proc.wait()
+        assert rc == 2, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("must be valid JSON"), proc._output()
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+    proc = Proc("--insert-asset-once", "--port", "0")
+    try:
+        rc = proc.wait()
+        assert rc == 2, "exit code {}; output:\n{}".format(rc, proc._output())
+        assert proc.reader.contains("--insert-asset-once requires --asset-id"), proc._output()
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+    print("OK  --insert-asset-once usage errors exit 2 without inserting")
+
+
+def scenario_interactive_insert_asset_registered():
+    """The interactive REPL must recognize the 'insert_asset' command.
+
+    Mirror of scenario_interactive_create_part_registered: the command must be
+    dispatched (to the no-connection path) rather than rejected as unknown.
+    """
+    proc = Proc("--port", "0")
+    try:
+        host, port = proc.listening_addr()
+        assert proc.reader.wait_for("Type 'help'"), proc._output()
+
+        proc.proc.stdin.write(b"insert_asset 135522 Workspace\n")
+        proc.proc.stdin.flush()
+        proc.reader.wait_for("cannot execute insert_asset")
+        assert not proc.reader.contains("unknown command"), proc._output()
+
+        rc = proc.quit()
+        assert rc == 0, "exit code {}; output:\n{}".format(rc, proc._output())
+        print("OK  interactive REPL recognizes insert_asset (not 'unknown command')")
+    finally:
+        if proc.proc.poll() is None:
+            proc.proc.kill()
+
+
 def scenario_interactive_modify_instance_registered():
     """The interactive REPL must recognize the 'modify_instance' command.
 
@@ -2093,6 +2462,14 @@ def main():
     scenario_create_script_failure()
     scenario_modify_instance_success_roundtrip()
     scenario_modify_instance_failure()
+    scenario_insert_asset_validation()
+    scenario_insert_asset_known_ids_enforced()
+    scenario_insert_asset_bounded_registry()
+    scenario_insert_asset_success()
+    scenario_insert_asset_failure()
+    scenario_insert_asset_placement_modes()
+    scenario_insert_asset_cli_rejects_usage()
+    scenario_interactive_insert_asset_registered()
     scenario_inspect_hierarchy_roundtrip()
     scenario_find_instances_roundtrip()
     scenario_find_instances_roundtrip_truncated()

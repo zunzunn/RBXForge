@@ -150,8 +150,8 @@ def scenario_tool_definitions_sent_to_ai():
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
     assert names == ["asset_search", "create_part", "create_script", "find_instances",
-                     "inspect_hierarchy", "inspect_instance", "modify_instance",
-                     "recommend_assets"], names
+                     "insert_asset", "inspect_hierarchy", "inspect_instance",
+                     "modify_instance", "recommend_assets"], names
     asset_search = defs[0]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
     assert asset_search["parameters"]["type"] == "object"
@@ -520,12 +520,16 @@ class SequenceProvider(providers.MockProvider):
 
 class MultiFakeRBX:
     """Fake RBXForge connection that returns a per-tool plugin payload and
-    records every request/log line (the multi-step counterpart to FakeRBX)."""
+    records every request/log line (the multi-step counterpart to FakeRBX).
+    ``known_assets`` pre-seeds the Phase 7C known-id registry. Without it the
+    insert_asset tool's known-id check (active through CapturingRBX) rejects
+    every id, which is the correct invented-id protection."""
 
-    def __init__(self, payloads):
+    def __init__(self, payloads, known_assets=None):
         self.payloads = dict(payloads)
         self.requests = []
         self.logs = []
+        self.known_assets = dict(known_assets) if known_assets else {}
 
     def send_request(self, tool, params, timeout):
         self.requests.append((tool, params))
@@ -533,6 +537,20 @@ class MultiFakeRBX:
 
     def log(self, message):
         self.logs.append(message)
+
+    def remember_assets(self, results):
+        count = 0
+        for entry in results or []:
+            if isinstance(entry, dict) and entry.get("asset_id") is not None:
+                self.known_assets.setdefault(str(entry["asset_id"]), entry)
+                count += 1
+        return count
+
+    def asset_known(self, asset_id):
+        return str(asset_id) in self.known_assets
+
+    def known_asset(self, asset_id):
+        return self.known_assets.get(str(asset_id))
 
 
 def find_payload(query="Baseplate", total=1, matches=None, max_results=20):
@@ -722,6 +740,87 @@ def scenario_create_script_action_tool():
     print("OK  create_script failure in agent loop reported as execution_failed")
 
 
+def scenario_insert_asset_action_tool():
+    """insert_asset must be an action tool (Phase 7C): listed in ACTION_TOOLS,
+    exposed to the model, executed with the id decided from search, and — like
+    modify_instance — the loop pauses for exactly one optional inspect_instance
+    verification step before ending."""
+    mod = load_agent_module()
+    assert "insert_asset" in mod.ACTION_TOOLS, mod.ACTION_TOOLS
+
+    insert_result = {
+        "ok": True,
+        "result": {
+            "asset_id": "135522", "name": "Cafe Shop", "class": "Model",
+            "parent_path": "Workspace", "path": "Workspace/Cafe Shop",
+            "positioned": True, "placement": "default",
+            "position": {"x": 0, "y": 5, "z": 0},
+        },
+    }
+    insert_call = json.dumps({
+        "tool": "insert_asset",
+        "arguments": {"asset_id": "135522"},
+    })
+
+    # With verification: insert + one inspect_instance, then the loop ends
+    # immediately (no third provider reply is consumed).
+    provider = SequenceProvider([
+        insert_call,
+        json.dumps({"tool": "inspect_instance", "arguments": {"path": "Workspace/Cafe Shop"}}),
+    ])
+    rbx = MultiFakeRBX({
+        "insert_asset": insert_result,
+        "inspect_instance": inspect_payload("Cafe Shop"),
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}})
+    result = make_agent(provider, rbx=rbx).run("add a shop model near the SpawnLocation")
+
+    assert result.ok is True, result
+    assert result.error is None, result
+    assert result.tool.name == "insert_asset", result
+    assert result.message is None, result
+    assert [step["tool"] for step in result.steps] == ["insert_asset", "inspect_instance"], result.steps
+    assert rbx.requests == [
+        ("insert_asset", {"asset_id": "135522"}),
+        ("inspect_instance", {"path": "Workspace/Cafe Shop"}),
+    ], rbx.requests
+    assert len(provider.chat_calls) == 2, len(provider.chat_calls)
+    assert any("insert_asset OK" in line for line in rbx.logs), rbx.logs
+    print("OK  insert_asset is an action tool; one optional verify step then loop ends")
+
+    # Without a verification call the model's final report completes the task
+    # (one extra chat turn gives it that choice, then it reports).
+    provider2 = SequenceProvider([
+        insert_call,
+        json.dumps({"message": "inserted a cafe shop model into Workspace"}),
+    ])
+    rbx2 = MultiFakeRBX({"insert_asset": insert_result},
+                        known_assets={"135522": {"asset_id": "135522",
+                                                 "asset_type": "Model"}})
+    result2 = make_agent(provider2, rbx=rbx2).run("insert the shop")
+    assert result2.ok is True, result2
+    assert result2.tool.name == "insert_asset", result2
+    assert result2.message == "inserted a cafe shop model into Workspace", result2
+    assert [step["tool"] for step in result2.steps] == ["insert_asset"], result2.steps
+    assert len(provider2.chat_calls) == 2, len(provider2.chat_calls)
+    print("OK  insert_asset completes via final report when no verification is needed")
+
+    # A plugin-side failure (ok:false) is reported as execution_failed.
+    failing = dict(insert_result)
+    failing["ok"] = False
+    failing["error"] = {"code": "not_found", "message": "asset not found or not insertable: 999999"}
+    rbx_fail = MultiFakeRBX({"insert_asset": failing})
+    provider_fail = SequenceProvider([json.dumps({
+        "tool": "insert_asset", "arguments": {"asset_id": "999999"},
+    })])
+    result_fail = make_agent(provider_fail, rbx=rbx_fail).run("insert a ghost asset")
+    assert result_fail.ok is False, result_fail
+    assert result_fail.error["code"] == "execution_failed", result_fail
+    assert result_fail.steps[0]["tool"] == "insert_asset", result_fail.steps
+    assert result_fail.steps[0]["ok"] is False, result_fail.steps
+    print("OK  insert_asset failure in agent loop reported as execution_failed")
+
+
 def scenario_groq_compat_agent_passes_tools():
     """Agent-side half of the GPT-OSS/Groq compatibility fix: when the provider
     advertises ``supports_tools`` (Groq), the agent hands it the registry's tool
@@ -751,11 +850,11 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 8, tools
+    assert isinstance(tools, list) and len(tools) == 9, tools
     names = [tool["name"] for tool in tools]
     assert names == ["asset_search", "create_part", "create_script", "find_instances",
-                     "inspect_hierarchy", "inspect_instance", "modify_instance",
-                     "recommend_assets"], names
+                     "insert_asset", "inspect_hierarchy", "inspect_instance",
+                     "modify_instance", "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = [tool for tool in tools if tool["name"] == "create_part"][0]
@@ -952,6 +1051,7 @@ def main():
     scenario_multistep_inspect_then_create_part()
     scenario_multistep_single_call_still_single_step()
     scenario_create_script_action_tool()
+    scenario_insert_asset_action_tool()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

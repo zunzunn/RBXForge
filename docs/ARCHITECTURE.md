@@ -12,7 +12,10 @@
 > as is the **Phase 7A asset discovery** tool (`asset_search`), the first tool whose execution
 > is a read-only **local HTTP** call to the Roblox Open Cloud Creator Store API rather than a
 > plugin request, together with the **Phase 7B ranking** tool (`recommend_assets`), which ranks
-> the search metadata in-process into bounded, explainable recommendations (no extra API calls).
+> the search metadata in-process into bounded, explainable recommendations (no extra API calls),
+> and the **Phase 7C insertion** tool (`insert_asset`), which inserts a Creator Store asset into
+> the connected project by an id a prior search/ranking returned (never invented), validated on
+> the CLI and loaded/placed by the plugin.
 > A full verify → fix → report cycle remains planned.
 
 ## Overview
@@ -58,26 +61,27 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–4D + Phase 7A/7B)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`asset_search`/`recommend_assets`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` + `asset_search` + `recommend_assets` tools ([TOOLS.md](./TOOLS.md)) |
+| CLI | **Implemented (Phases 1–4D + Phase 7A/7B/7C)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`asset_search`/`recommend_assets`/`insert_asset`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` + `asset_search` + `recommend_assets` + `insert_asset` tools ([TOOLS.md](./TOOLS.md)) |
 | Interactive agent | **Implemented (bounded, Phase 3B → 4D)** — `prompt → provider → tool call → ... → action` multi-step loop in `cli/agent.py`: inspection tools feed bounded results back to the model (max 5 tool calls per request); single-step requests preserve the original behavior |
 | AI provider layer | **Implemented (Phase 3A + Phase 4E)** — `cli/providers.py`: provider interface, Ollama + Groq + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
-| Agent loop | **Implemented (Phase 4D → 6C)** — bounded multi-step loop with project inspection
+| Agent loop | **Implemented (Phase 4D → 6C → 7C)** — bounded multi-step loop with project inspection
   and optional verification. The model inspects the live Roblox project via the inspection
   tools, receives bounded tool results, and then acts through an action tool. After an action
   tool succeeds, the model may call `inspect_instance` for verification under two conditions:
-  - For `modify_instance`: always permitted (one optional verification step after success).
+  - For `modify_instance` and `insert_asset`: always permitted (one optional verification step
+    after success).
   - For `create_part`/`create_script`: permitted only if the model previously called an inspection
     tool (`find_instances` or `inspect_instance`) during the same request, allowing it to verify
     the newly-created instance against gathered context. Verification is skipped when the tool
     result already provides sufficient information. Single-step requests preserve the original
   behavior: one model call → one tool call → done (unless inspection context was gathered).
   The full understand/plan/verify/fix autonomy is still planned. |
-| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7A + Phase 7B)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A), and `modify_instance` (Phase 6B) live end-to-end (CLI + plugin); `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) are schema-registered alongside them but execute as local HTTP calls (no plugin handler); more tools planned |
+| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7A + Phase 7B + Phase 7C)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A), `modify_instance` (Phase 6B), and `insert_asset` (Phase 7C) live end-to-end (CLI + plugin); `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) are schema-registered alongside them but execute as local HTTP calls (no plugin handler); more tools planned |
 | Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C + Phase 4D)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; the Phase 4D agent loop drives these live before acting; indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
-| Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, and `inspect_instance`, see [PLUGIN.md](./PLUGIN.md) |
-| Verification system | **Implemented (Phase 6C)** — optional verification after action tool success. After
-  a successful `modify_instance`, exactly one `inspect_instance` verification step is permitted.
+| Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7C)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, `inspect_instance`, `create_script`, `modify_instance`, and `insert_asset`, see [PLUGIN.md](./PLUGIN.md) |
+| Verification system | **Implemented (Phase 6C + Phase 7C)** — optional verification after action tool success. After
+  a successful `modify_instance` or `insert_asset`, exactly one `inspect_instance` verification step is permitted.
   After a successful `create_part`/`create_script`, one `inspect_instance` verification step is
   permitted if the model previously called an inspection tool during the same request. Verification
   is skipped when the tool result already provides sufficient information. The system distinguishes
@@ -228,7 +232,11 @@ optional Luau source at a game-rooted parent path (or the per-type default conta
 `asset_search` (Phase 7A) searches the public Roblox Creator Store over the Open Cloud API —
 a read-only local HTTP call that is deliberately **not** a Studio operation.
 `recommend_assets` (Phase 7B) ranks those results in-process into a bounded, explainable
-recommendation list (no extra API calls; still read-only). The remaining conceptual tools are
+recommendation list (no extra API calls; still read-only). `insert_asset` (Phase 7C) inserts
+a Creator Store asset into the project: the CLI only accepts an `asset_id` that a prior
+search/ranking returned (bounded known-id registry — ids are never invented) and the plugin
+loads, uniquely names, parents, and positions it (explicit position / near a reference / beside
+the SpawnLocation). The remaining conceptual tools are
 not implemented.
 
 ### Project Inspection / Index

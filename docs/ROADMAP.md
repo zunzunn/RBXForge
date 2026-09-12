@@ -330,6 +330,57 @@ into a short, **explainable** list of real Creator Store assets it can speak to 
 **Explicitly NOT included:** inserting/cloning/downloading/purchasing assets; any mutation; the
 general autonomous-development goals of Phase 7.
 
+### Phase 7C — Asset Selection and Studio Insertion
+
+> **Status:** Done. `insert_asset` (a plugin tool that loads a Creator Store asset
+> by the exact id a prior search/ranking returned and places it in the project)
+> is implemented and verified with automated tests.
+
+**Goal:** let the agent complete the full loop end-to-end — search real Creator Store
+assets (7A), rank them (7B), **select** the appropriate one, and **insert** it into the
+currently connected Studio project at a specified or sensible location.
+
+**Deliverables:**
+
+- **Known-id enforcement:** `asset_search` / `recommend_assets` record the asset ids they
+  returned in a **bounded** per-session registry (`MAX_KNOWN_ASSETS` = 200) on the
+  connection; `insert_asset` accepts **only** an id recorded there, so the model can never
+  invent an id. The plugin's id is digits-only and validated before anything is sent.
+- `insert_asset` tool registered in the CLI `ToolRegistry` (schema: `asset_id` required,
+  digits-only bounded string; optional `parent_path`, `position` (vec3), `reference_path` —
+  `position` and `reference_path` are mutually exclusive). Exposed to the REPL
+  (`insert_asset <asset_id> [parent_path]`), the one-shot CLI (`--insert-asset-once` plus
+  `--asset-id` / `--parent-path` / `--position` / `--reference-path`; the human-typed id is
+  an explicit exception that seeds the registry), and the agent as an **action tool** (the
+  loop ends after one optional `inspect_instance` verification step, mirroring
+  `modify_instance`).
+- Plugin handler (`plugin/rbxforge.lua`): re-validates, resolves the game-rooted
+  `parent_path`, `InsertService:LoadAsset` inside pcall, ensures a **sibling-unique name**
+  (bounded suffix scan), parents the asset, and positions it — explicit `position`, near a
+  `reference_path` (+ `PLACEMENT_OFFSET`), or defaulted beside the project's first
+  `SpawnLocation` (else a sensible spot above the origin). Models pivot (`PivotTo` with a
+  `SetPrimaryPartCFrame` fallback), bare parts get an absolute `Position`; assets that carry
+  no transform (e.g. decal/audio) are reported `positioned: false` instead of silently
+  adjusted. Result carries `asset_id`, `name`, `class`, `parent_path`, `path`,
+  `positioned`, `placement` (`explicit`/`reference`/`default`), and `position` when set.
+- No new protocol version: `insert_asset` uses the same `request`/`response` messages as
+  every other plugin tool. No purchase, download, or deletion features.
+
+**Verification criteria:**
+
+- Automated tests cover schema validation, invented/unknown-id rejection (never sent),
+  non-insertable asset-type rejection, missing-search-result rejection, `position` vs
+  `reference_path` exclusivity, the bounded registry, success/failure round-trips over the
+  protocol, `--insert-asset-once` usage errors, duplicate-name unique-suffix passthrough,
+  and the full agent flow `asset_search` → ranking → `insert_asset` → `inspect_instance`.
+- Insertion only ever follows an id the model actually discovered (or, for the one-shot
+  CLI, an id the human explicitly typed); every failure is a clear, loggable error.
+
+**Dependencies:** Phases 7A and 7B (plus the 6B verification behavior).
+
+**Explicitly NOT included:** purchasing assets, arbitrary external downloads, asset
+deletion, or unrelated project changes.
+
 ---
 
 ## No Dates
@@ -354,4 +405,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`; 4D AI project context / bounded multi-step agent loop done; 4E hosted Groq provider done; 6C verification behavior extensions) |
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
-| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed) |
+| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default, verification via one optional `inspect_instance`) |

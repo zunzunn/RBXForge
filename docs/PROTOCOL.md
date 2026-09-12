@@ -9,10 +9,11 @@
 >   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A),
 >   `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A),
 >   and `modify_instance` (Phase 6B).
-> - **Deliberate exception (Phase 7A):** `asset_search` is a seventh registered tool but is
->   **not** dispatched through the plugin. It executes as a **local HTTP call** to the Open Cloud
->   Creator Store API from `cli/roblox_assets.py`, so it never produces or consumes a WebSocket
->   `request`/`response`; only its bounded result is surfaced (in the CLI log and to the agent).
+> - **Deliberate exception (Phase 7A/7B):** `asset_search` and `recommend_assets` are registered
+>   tools but are **not** dispatched through the plugin. They execute as **local HTTP calls** to
+>   the Open Cloud Creator Store API from `cli/roblox_assets.py` / `cli/asset_ranking.py`, so they
+>   never produce or consume a WebSocket `request`/`response`; only their bounded result is
+>   surfaced (in the CLI log and to the agent).
 > - **Planned / Future:** additional tool execution, streaming, and plugin-initiated events
 >   are not implemented yet.
 
@@ -209,6 +210,7 @@ Implemented tools and their `params`:
 | `create_script` | `name` (non-empty string), `type` (optional string, default `"Script"`, one of `"Script"`, `"LocalScript"`, `"ModuleScript"`), `parent_path` (optional game-rooted string, e.g. `"ServerScriptService.Scripts"`; default container per type), `source` (optional string, default `""`) | `{ name, type, parent_path, path, source_length }` |
 | `modify_instance` | `path` (non-empty string, full path from Workspace), `properties` (non-empty object with at least one allowlisted property, see below) | `{ path, className, changed }` |
 | `asset_search` | `query` (non-empty string, max 200 chars), `asset_type` (optional string, one of `"Audio"`, `"Model"`, `"Decal"`, `"Plugin"`, `"MeshPart"`, `"Video"`, `"FontFamily"`), `max_results` (optional integer, `1..20`, default `5`) — **local HTTP, no `request` message** | `{ query, asset_type, max_results, count, total, truncated, results }` |
+| `recommend_assets` | `query` (non-empty string, max 200 chars), `asset_type` (optional, as `asset_search`), `creator` (optional string), `max_results` (optional integer, `1..20`, default `5`), `limit` (optional integer, `1..5`, default `3`) — **local HTTP, no `request` message** | `{ query, asset_type, creator, evaluated, limit, count, recommendations: [{ rank, score, reason, asset }], tiebreak, note }` |
 
 `inspect_hierarchy` example request:
 
@@ -555,11 +557,13 @@ Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.
 
-**Phase 7A exception (`asset_search`):** this tool is registered and schema-validated exactly
-like the others, but its execution **does not produce a WebSocket `request`**. It makes a local
-HTTP `POST` to the Open Cloud Creator Store API from `cli/roblox_assets.py` (no robot changes to
-Studio). The tool's structured result is returned directly (and logged / shown to the agent);
-there is no plugin handler and no `response` message. See [TOOLS.md](./TOOLS.md).
+**Phase 7A/7B exception (`asset_search`, `recommend_assets`):** these tools are registered and
+schema-validated exactly like the others, but their execution **does not produce a WebSocket
+`request`**. They make local HTTP `POST`s to the Open Cloud Creator Store API from
+`cli/roblox_assets.py` (search) and rank purely in-process in `cli/asset_ranking.py`
+(recommendation — no extra API calls beyond the search; no robot changes to Studio). Their
+structured result is returned directly (and logged / shown to the agent); there is no plugin
+handler and no `response` message. See [TOOLS.md](./TOOLS.md).
 
 ## Future Streaming / Events (Planned)
 
@@ -574,8 +578,8 @@ Not implemented; listed as future direction:
 
 - Only six Studio operations (`create_part`, `create_script`, `modify_instance`,
   `inspect_hierarchy`, `find_instances`, `inspect_instance`) plus the local-HTTP `asset_search`
-  (Phase 7A), which is not a Studio operation at all. Other object/script/UI operations
-  and generalized
+  (Phase 7A) and `recommend_assets` (Phase 7B), which are not Studio operations at all. Other
+  object/script/UI operations and generalized
   search (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
   `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`; only identity,

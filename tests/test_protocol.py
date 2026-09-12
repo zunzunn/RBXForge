@@ -1218,14 +1218,15 @@ def scenario_interactive_create_part_registered():
 
 def scenario_tool_registry_metadata():
     """The tool registry must expose create_part, create_script, modify_instance,
-    find_instances, inspect_hierarchy, inspect_instance, and asset_search with
-    metadata."""
+    find_instances, inspect_hierarchy, inspect_instance, asset_search, and
+    recommend_assets with metadata."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
         "asset_search", "create_part", "create_script", "find_instances",
         "inspect_hierarchy", "inspect_instance", "modify_instance",
+        "recommend_assets",
     ], tools
 
     tool = registry.get("create_part")

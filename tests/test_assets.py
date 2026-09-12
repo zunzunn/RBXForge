@@ -89,13 +89,27 @@ def asset_call(query, asset_type=None, max_results=None):
     return json.dumps({"tool": "asset_search", "arguments": arguments})
 
 
+def recommend_call(query, asset_type=None, creator=None, max_results=None, limit=None):
+    arguments = {"query": query}
+    if asset_type is not None:
+        arguments["asset_type"] = asset_type
+    if creator is not None:
+        arguments["creator"] = creator
+    if max_results is not None:
+        arguments["max_results"] = max_results
+    if limit is not None:
+        arguments["limit"] = limit
+    return json.dumps({"tool": "recommend_assets", "arguments": arguments})
+
+
 # --------------------------------------------------------------------------- #
 # A fake Open Cloud Creator Store /toolbox-service/v2/assets:search server
 # --------------------------------------------------------------------------- #
 
 
 def entry(asset_id, name, asset_type="Model", creator="Roblox", creator_id="1",
-          description=None, thumbnail=None):
+          description=None, thumbnail=None, rating=None, sales=None,
+          favorites=None):
     asset = {"assetId": asset_id, "name": name, "assetType": asset_type}
     if description is not None:
         asset["description"] = description
@@ -104,6 +118,12 @@ def entry(asset_id, name, asset_type="Model", creator="Roblox", creator_id="1",
             asset["thumbnail"] = thumbnail
         else:
             asset["thumbnailUrl"] = thumbnail
+    if rating is not None:
+        asset["rating"] = rating
+    if sales is not None:
+        asset["sales"] = sales
+    if favorites is not None:
+        asset["favorites"] = favorites
     creator_obj = {"displayName": creator, "id": creator_id}
     return {"asset": asset, "creator": creator_obj}
 
@@ -116,6 +136,20 @@ def ok_body():
             entry(135523, "Wooden Sword", "Model", "Roblox", "1"),
         ],
         "totalResults": 2,
+    }
+
+
+def recommend_body():
+    return {
+        "creatorStoreAssets": [
+            entry(1, "Steel Sword", "Model", "Roblox", "1",
+                  "A forged blade", rating=4.8, sales=320),
+            entry(2, "Wooden Sword", "Model", "Roblox", "1",
+                  "A blunt practice blade", rating=3.2),
+            entry(3, "Enchanted Sword", "Model", "BladeWorks", "9",
+                  "Shiny", rating=4.9, sales=999),
+        ],
+        "totalResults": 3,
     }
 
 
@@ -462,6 +496,42 @@ def scenario_search_defensive_parsing():
     print("OK  defensive parsing tolerates janky/partial entries; skips unusable ones")
 
 
+def scenario_search_rating_usage_metadata():
+    """Phase 7B: the parser captures optional rating/usage metadata only when
+    the API provides it (backward-compatible with the Phase 7A shape)."""
+    with FakeStoreServer(body={
+        "creatorStoreAssets": [
+            # Primary keys -> rating / sales / favorites.
+            entry(1, "A", rating=4.7, sales=100, favorites=25),
+            # Alternate API keys -> averageRating / totalSales.
+            {"asset": {"assetId": 2, "name": "B", "assetType": "Model",
+                       "averageRating": 3.5, "totalSales": 10}},
+            # rating is "bogus" (a string) -> rejected; favoriteCount still parses.
+            {"asset": {"assetId": 3, "name": "C", "assetType": "Model",
+                       "rating": "bogus", "favoriteCount": 5}},
+            # No usage metadata at all -> nothing added (the Phase 7A shape).
+            entry(4, "D"),
+        ],
+        "totalResults": 4,
+    }) as server:
+        client = client_for(server.port)
+        result = client.search("sword")
+        entries = {r["asset_id"]: r for r in result["results"]}
+        assert entries["1"]["rating"] == 4.7
+        assert entries["1"]["sales_count"] == 100
+        assert entries["1"]["favorite_count"] == 25
+        assert entries["2"]["rating"] == 3.5
+        assert entries["2"]["sales_count"] == 10
+        assert "favorite_count" not in entries["2"]
+        assert "rating" not in entries["3"] and "sales_count" not in entries["3"]
+        assert entries["3"]["favorite_count"] == 5
+        assert set(entries["4"]) == {
+            "asset_id", "name", "asset_type", "creator", "creator_id",
+        }, entries["4"]  # Phase 7A exact shape preserved when no usage present
+    print("OK  parser captures rating/sales/favorites (incl. alternate keys); "
+          "missing metadata absent; janky values rejected; old shape preserved")
+
+
 def scenario_search_response_shapes():
     mod = assets_mod
     # Response with no creatorStoreAssets field -> empty result list.
@@ -597,6 +667,154 @@ def scenario_registry_exposes_asset_search():
     }, schema["properties"]["max_results"]
     assert "asset_type" in schema["properties"] and "query" in schema["required"]
     print("OK  default registry exposes asset_search with schema (enum/queries/max 20)")
+
+
+def scenario_registry_exposes_recommend():
+    mod = cli_mod
+    registry = mod.default_registry()
+    names = [tool.name for tool in registry.list()]
+    assert "recommend_assets" in names, names
+    tool = registry.get("recommend_assets")
+    assert isinstance(tool.description, str) and tool.description
+    assert "read-only" in tool.description, tool.description
+    schema = tool.input_schema
+    assert schema["type"] == "object"
+    assert schema["required"] == ["query"], schema
+    assert set(schema["properties"]) == {
+        "query", "asset_type", "creator", "max_results", "limit",
+    }, schema
+    assert schema["properties"]["asset_type"]["enum"] == assets_mod.ASSET_TYPES
+    assert schema["properties"]["max_results"]["maximum"] == mod.MAX_ASSET_RESULTS
+    assert schema["properties"]["limit"] == {
+        "type": "number", "integer": True, "minimum": 1,
+        "maximum": mod.MAX_ASSET_RECOMMENDATIONS,
+    }, schema["properties"]["limit"]
+    print("OK  default registry exposes recommend_assets with schema "
+          "(query/type/creator/max_results/limit 1..5)")
+
+
+def scenario_tool_execution_recommend():
+    mod = cli_mod
+    with FakeStoreServer(body=recommend_body()) as server:
+        os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
+        os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"] = full_server_url(server.port)
+        try:
+            logs = []
+            rbx = mod.RBXForge(console=_CapturingConsole(logs))
+            result = rbx.execute_tool("recommend_assets", {"query": "sword"})
+        finally:
+            del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
+            del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
+        assert result is not False and isinstance(result, dict)
+        assert result["query"] == "sword" and result["evaluated"] == 3
+        assert result["count"] == 3  # 3 results, default limit 3
+        assert [r["asset"]["name"] for r in result["recommendations"]] == [
+            "Enchanted Sword", "Steel Sword", "Wooden Sword",
+        ], result["recommendations"]
+        # Enchanted (5) and Steel (5) tie at the top: deterministic name break.
+        assert [r["score"] for r in result["recommendations"]] == [5, 5, 3]
+        assert "usage metadata" in result["recommendations"][0]["reason"]
+        # Exactly one search was made: ranking performs NO extra API calls.
+        assert server.total_calls == 1, server.total_calls
+        assert any("recommend_assets OK: ranked 3 of 3 result(s) for query 'sword'" in line
+                   for line in logs), logs
+    print("OK  recommend_assets tool ranks search metadata deterministically; "
+          "one API call, no plugin traffic")
+
+
+def scenario_tool_execution_recommend_params():
+    mod = cli_mod
+    with FakeStoreServer(body=recommend_body()) as server:
+        os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
+        os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"] = full_server_url(server.port)
+        try:
+            logs = []
+            rbx = mod.RBXForge(console=_CapturingConsole(logs))
+            # asset_type + max_results flow into the HTTP request; creator and
+            # limit flow into ranking.
+            result = rbx.execute_tool("recommend_assets", {
+                "query": "sword", "asset_type": "Model", "creator": "BladeWorks",
+                "max_results": 3, "limit": 1,
+            })
+        finally:
+            del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
+            del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
+        assert server.bodies[-1] == {
+            "query": "sword", "maxPageSize": 3, "searchCategoryType": "Model",
+        }, server.bodies[-1]
+        assert result["creator"] == "BladeWorks"
+        assert result["limit"] == 1 and result["count"] == 1
+        top = result["recommendations"][0]
+        assert top["asset"]["name"] == "Enchanted Sword", result
+        assert "BladeWorks" in top["reason"], top["reason"]
+    print("OK  recommend_assets forwards type/max_results to the search and "
+          "creator/limit into ranking")
+
+
+def scenario_tool_execution_recommend_failures():
+    mod = cli_mod
+
+    # Missing API key: False + FAILED log (same handling as asset_search).
+    os.environ.pop("RBXFORGE_OPEN_CLOUD_API_KEY", None)
+    os.environ.pop("ROBLOX_OPEN_CLOUD_API_KEY", None)
+    os.environ.pop("RBXFORGE_OPEN_CLOUD_BASE_URL", None)
+    logs = []
+    rbx = mod.RBXForge(console=_CapturingConsole(logs))
+    result = rbx.execute_tool("recommend_assets", {"query": "sword"})
+    assert result is False
+    assert any("recommend_assets FAILED" in line and "API key" in line for line in logs), logs
+
+    # HTTP failure through the env client: False + FAILED log.
+    with FakeStoreServer(mode="error") as server:
+        os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
+        os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"] = full_server_url(server.port)
+        try:
+            logs = []
+            rbx = mod.RBXForge(console=_CapturingConsole(logs))
+            result = rbx.execute_tool("recommend_assets", {"query": "sword"})
+        finally:
+            del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
+            del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
+        assert result is False
+        assert any("recommend_assets FAILED" in line and "HTTP 500" in line for line in logs), logs
+
+    # The tool forwards its request timeout to the client, so a slow API is
+    # bounded by the tool timeout instead of the env-configured default (30s).
+    with FakeStoreServer(mode="sleep") as server:
+        os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
+        os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"] = full_server_url(server.port)
+        try:
+            logs = []
+            rbx = mod.RBXForge(console=_CapturingConsole(logs))
+            result = rbx.execute_tool("recommend_assets", {"query": "sword"}, timeout=0.15)
+        finally:
+            del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
+            del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
+        assert result is False
+        assert any("recommend_assets FAILED" in line and "timed out" in line for line in logs), logs
+
+    # Schema-invalid params are rejected before any HTTP call: empty query,
+    # out-of-range limit/max_results, unknown asset_type, empty creator.
+    with FakeStoreServer() as server:
+        os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"] = _KEY
+        os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"] = full_server_url(server.port)
+        try:
+            logs = []
+            rbx = mod.RBXForge(console=_CapturingConsole(logs))
+            for bad in ({"query": ""}, {"query": "sword", "limit": 0},
+                        {"query": "sword", "limit": 6},
+                        {"query": "sword", "max_results": 21},
+                        {"query": "sword", "asset_type": "Bogus"},
+                        {"query": "sword", "creator": ""}):
+                result = rbx.execute_tool("recommend_assets", bad)
+                assert result is False, (bad, result)
+                assert any("invalid parameters" in line for line in logs), (bad, logs)
+        finally:
+            del os.environ["RBXFORGE_OPEN_CLOUD_API_KEY"]
+            del os.environ["RBXFORGE_OPEN_CLOUD_BASE_URL"]
+        assert server.total_calls == 0  # nothing reached the fake API
+    print("OK  recommend_assets failures (missing key / HTTP error / timeout / "
+          "schema reject incl. limit bounds)")
 
 
 def scenario_tool_execution_injected_client():
@@ -773,6 +991,60 @@ def scenario_asset_search_does_not_end_loop():
     print("OK  asset_search mid-loop does not end the loop; no plugin request sent")
 
 
+def scenario_agent_recommend_flow():
+    """Agent-level Phase 7B flow: asset_search -> ranking -> recommendation.
+
+    The model first searches, then asks for a recommendation; recommend_assets
+    collects the ranked result and feeds it back, so the next step can report.
+    Neither asset_search nor recommend_assets ends the loop, and neither sends
+    a plugin request."""
+    mod = agent_mod
+    with FakeStoreServer(body=recommend_body()) as server:
+        client = assets_mod.RobloxAssetClient(_KEY, base_url=full_server_url(server.port))
+
+        class FakeRBX:
+            def __init__(self, client):
+                self.client = client
+                self.requests = []
+                self.logs = []
+
+            def send_request(self, tool, params, timeout):
+                self.requests.append((tool, params))
+                return {"ok": True, "result": {"anything": True}}
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def assets(self):
+                return self.client
+
+        provider = RecordingProvider([
+            asset_call("sword"),
+            recommend_call("sword", limit=2),
+            json.dumps({"message": "recommend the Enchanted Sword (4.9/5)"}),
+        ])
+        rbx = FakeRBX(client)
+        registry = rbxforge.default_registry()
+        result = mod.Agent(provider, registry=registry, rbx=rbx).run("find a sword and recommend one")
+
+        assert result.ok is True, result
+        assert [step["tool"] for step in result.steps] == [
+            "asset_search", "recommend_assets",
+        ], result.steps
+        assert all(step["ok"] for step in result.steps), result.steps
+        assert len(provider.chat_calls) == 3, provider.chat_calls
+        # The recommend step returned a bounded ranked result to the next turn.
+        step = result.steps[1]
+        assert step["output"]["recommendations"][0]["asset"]["name"] == "Enchanted Sword", step
+        assert step["output"]["count"] == 2, step  # limit=2 respected
+        # ..and it was compacted into the bounded text shown to the model.
+        assert json.loads(step["result"])["count"] == 2, step["result"]
+        # Neither local tool touched the plugin/WebSocket path.
+        assert rbx.requests == [], rbx.requests
+    print("OK  agent flow asset_search -> ranking -> recommendation; loop continues; "
+          "no plugin request sent")
+
+
 # --------------------------------------------------------------------------- #
 # CLI one-shot + REPL (subprocess, against the in-process fake server)
 # --------------------------------------------------------------------------- #
@@ -876,6 +1148,95 @@ def scenario_cli_repl_asset_search():
     print("OK  interactive REPL 'asset_search <query>' works; bare command is a gentle hint")
 
 
+def scenario_cli_one_shot_recommend():
+    with FakeStoreServer() as server:
+        env = env_with_server(server.port)
+        proc = run_cli(["--recommend-assets-once", "--query", "sword"], env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert ("recommend_assets OK: ranked 2 of 2 result(s) for query 'sword' "
+                "- #1 Steel Sword (score 2), #2 Wooden Sword (score 2)") in proc.stdout, proc.stdout
+        assert "recommend_assets" in proc.stdout and "tools registered:" in proc.stdout, proc.stdout
+        # One search request only: ranking adds no further API calls.
+        assert server.total_calls == 1, server.total_calls
+        assert server.bodies[0] == {"query": "sword", "maxPageSize": 5}, server.bodies
+
+        # asset_type/max_results/creator/max-recommendations flow through.
+        proc = run_cli(["--recommend-assets-once", "--query", "sword",
+                        "--asset-type", "Model", "--max-results", "3",
+                        "--creator", "Roblox", "--max-recommendations", "1"], env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "- #1 Steel Sword" in proc.stdout and "- #2 " not in proc.stdout, proc.stdout
+        assert server.bodies[-1] == {
+            "query": "sword", "maxPageSize": 3, "searchCategoryType": "Model",
+        }, server.bodies[-1]
+
+        # --recommend-assets-once is a local HTTP call: no WebSocket server.
+        assert "listening on ws://" not in proc.stdout, proc.stdout
+        assert "load the RBXForge plugin" not in proc.stdout, proc.stdout
+    print("OK  --recommend-assets-once success (exit 0, ranked log line, one search); "
+          "type/max-results/creator/max-recommendations flags; no server start")
+
+
+def scenario_cli_one_shot_recommend_errors():
+    # Missing query -> usage error, exit 2, no HTTP call.
+    with FakeStoreServer() as server:
+        proc = run_cli(["--recommend-assets-once"], env_with_server(server.port))
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 2, combined
+        assert "--recommend-assets-once requires --query" in combined, combined
+        assert server.total_calls == 0
+
+    # Server error -> failure, exit 4.
+    with FakeStoreServer(mode="error") as server:
+        proc = run_cli(["--recommend-assets-once", "--query", "sword"],
+                       env_with_server(server.port))
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 4, combined
+        assert "recommend_assets FAILED" in combined, combined
+
+    # No API key configured -> failure, exit 4.
+    env = dict(os.environ)
+    env.pop("RBXFORGE_OPEN_CLOUD_API_KEY", None)
+    env.pop("ROBLOX_OPEN_CLOUD_API_KEY", None)
+    proc = run_cli(["--recommend-assets-once", "--query", "sword"], env)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 4, combined
+    assert "recommend_assets FAILED" in combined and "API key" in combined, combined
+
+    # Unknown --asset-type is an argparse usage error (exit 2), nothing sent.
+    with FakeStoreServer() as server:
+        proc = run_cli(["--recommend-assets-once", "--query", "sword",
+                        "--asset-type", "Bogus"], env_with_server(server.port))
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 2, combined
+        assert "invalid choice" in combined, combined
+        assert server.total_calls == 0
+    print("OK  --recommend-assets-once errors (missing --query / bogus type exit 2; "
+          "server failure / no key exit 4)")
+
+
+def scenario_cli_repl_recommend():
+    with FakeStoreServer() as server:
+        env = env_with_server(server.port)
+        child = subprocess.Popen(
+            [sys.executable, CLI],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        out, _ = child.communicate(
+            input=("recommend_assets sword\nrecommend_assets\nquit\n").encode("utf-8"),
+            timeout=60,
+        )
+        output = out.decode("utf-8", "replace")
+        assert child.returncode == 0, output
+        assert "recommend_assets OK:" in output, output
+        assert "recommend_assets: no query given" in output, output
+        assert server.total_calls == 1, server.total_calls
+    print("OK  interactive REPL 'recommend_assets <query>' works; bare command is a gentle hint")
+
+
 # --------------------------------------------------------------------------- #
 # Internal helpers
 # --------------------------------------------------------------------------- #
@@ -904,19 +1265,28 @@ def main():
     scenario_search_truncated_and_clamp()
     scenario_search_asset_type_filter()
     scenario_search_defensive_parsing()
+    scenario_search_rating_usage_metadata()
     scenario_search_response_shapes()
     scenario_search_rate_limit()
     scenario_search_connection_and_timeout()
     scenario_search_per_call_timeout()
     scenario_registry_exposes_asset_search()
+    scenario_registry_exposes_recommend()
     scenario_tool_execution_injected_client()
+    scenario_tool_execution_recommend()
+    scenario_tool_execution_recommend_params()
+    scenario_tool_execution_recommend_failures()
     scenario_tool_execution_failures()
     scenario_agent_exposure()
     scenario_asset_search_does_not_end_loop()
+    scenario_agent_recommend_flow()
     scenario_cli_one_shot_success()
     scenario_cli_one_shot_invalid_asset_type()
     scenario_cli_one_shot_errors()
+    scenario_cli_one_shot_recommend()
+    scenario_cli_one_shot_recommend_errors()
     scenario_cli_repl_asset_search()
+    scenario_cli_repl_recommend()
     print("\nAll asset-discovery scenarios passed.")
 
 

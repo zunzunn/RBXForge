@@ -19,7 +19,9 @@ concise final AgentResult is returned.
 The read-only asset_search tool (Phase 7A) is intentionally NOT a Studio /
 plugin tool: it searches the public Creator Store over the official Open Cloud
 API with a local HTTP request, so it is exposed to the model alongside the
-plugin tools but never ends the loop.
+plugin tools but never ends the loop. recommend_assets (Phase 7B) ranks the
+search results into a bounded, deterministic, explainable recommendation list;
+it is likewise read-only, local, and never ends the loop.
 
 Each step's reply is one JSON object - either a tool call:
 
@@ -395,6 +397,12 @@ def build_system_prompt(registry):
         "- asset_search reads the public Roblox Creator Store over the Open "
         "Cloud API (read-only, nothing is inserted or purchased); use it to "
         "find real assets when the prompt asks for them.\n"
+        "- recommend_assets ranks asset_search results into a bounded, "
+        "deterministic, explainable list (each recommendation comes with a "
+        "score and a reason: title/description term matches, asset type, "
+        "creator, rating/usage). Prefer it when the user asks for a "
+        "recommendation ('what should I use', 'best ...'); it is also "
+        "read-only and never downloads, inserts, or purchases anything.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "

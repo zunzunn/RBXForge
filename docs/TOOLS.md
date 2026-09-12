@@ -1,8 +1,9 @@
 # RBXForge — Tool System
 
-> **Status:** Seven tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Eight tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
-> modify_instance in Phase 6B, asset_search in Phase 7A); the rest is conceptual. The
+> modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B); the
+> rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
 > of these tools without adding any new tool.
 >
@@ -32,6 +33,13 @@
 >   the WebSocket/plugin path: it runs as a **local HTTP call** from this process (read-only —
 >   nothing is inserted, cloned, downloaded, or purchased) and needs an Open Cloud API key in the
 >   environment. Same registry, but no plugin `request` (see [PROTOCOL.md](./PROTOCOL.md)).
+> - **Implemented (Phase 7B):** `recommend_assets` wraps `asset_search` with a **bounded,
+>   deterministic ranking layer** (`cli/asset_ranking.py`) that turns the returned metadata into
+>   an ordered, **explainable** recommendation list (each entry has a score and a reason:
+>   title/description terms, asset type, creator, rating/usage). It is likewise read-only and
+>   local — ranking makes **no extra API calls** and never downloads/inserts/purchases anything.
+>   Exposed to the REPL (`recommend_assets <query> [limit]`), the one-shot CLI
+>   (`--recommend-assets-once`), and the agent (never an action tool — it does not end the loop).
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged

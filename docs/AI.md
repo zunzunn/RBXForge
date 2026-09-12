@@ -16,6 +16,12 @@
 > Store search tool (local HTTP, not a plugin tool). It is **not** an action tool: a successful
 > search never ends the loop, and its dict result is compacted for the model the same way plugin
 > results are.
+>
+> **Implemented (Phase 7B):** `recommend_assets` ranks those search results into a bounded,
+> deterministic, explainable recommendation list (each entry has a score and a reason). It is
+> likewise read-only and not an action tool: a successful recommendation never ends the loop,
+> and the paired flow `asset_search` → `recommend_assets` → report lets the model state *why* an
+> asset was chosen.
 
 ## Purpose
 
@@ -194,10 +200,12 @@ action tool succeeds → loop permits exactly one optional inspect_instance
   after success (existing Phase 4D behavior).
 ```
 
-`asset_search` (Phase 7A) participates in the same loop but executes as a **local HTTP call**
-(no plugin `request`), so `ToolRegistry.execute  → Studio (plugin)` does not apply to it. Its
-structured dict result takes the place of the plugin `response` payload when the loop compacts
-what to show the model.
+`asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) participate in the same loop but
+execute as **local HTTP calls** (no plugin `request`), so `ToolRegistry.execute → Studio
+(plugin)` does not apply to them. `asset_search` returns the bounded candidate list;
+`recommend_assets` ranks that metadata in-process into a bounded, explainable recommendation
+list (no extra API calls). Their structured dict results take the place of the plugin `response`
+payload when the loop compacts what to show the model.
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
@@ -206,8 +214,9 @@ what to show the model.
   `modify_instance`), a final model report (`{"message": ...}`), a hard rejection
   (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
   `execution_failed`), or the **5-call budget** being exhausted (`max_tool_calls`). It stops
-  rather than guessing when it cannot determine what to do. `asset_search` is **not** an action
-  tool, so a successful search alone never ends the loop.
+  rather than guessing when it cannot determine what to do. `asset_search` and
+  `recommend_assets` are **not** action tools, so a successful search/recommendation alone never
+  ends the loop.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never

@@ -150,7 +150,8 @@ def scenario_tool_definitions_sent_to_ai():
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
     assert names == ["asset_search", "create_part", "create_script", "find_instances",
-                     "inspect_hierarchy", "inspect_instance", "modify_instance"], names
+                     "inspect_hierarchy", "inspect_instance", "modify_instance",
+                     "recommend_assets"], names
     asset_search = defs[0]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
     assert asset_search["parameters"]["type"] == "object"
@@ -158,6 +159,13 @@ def scenario_tool_definitions_sent_to_ai():
     assert set(asset_search["parameters"]["properties"]) == {
         "query", "asset_type", "max_results",
     }, asset_search
+    recommend = [entry for entry in defs if entry["name"] == "recommend_assets"][0]
+    assert isinstance(recommend["description"], str) and recommend["description"]
+    assert recommend["parameters"]["type"] == "object"
+    assert set(recommend["parameters"]["required"]) == {"query"}, recommend
+    assert set(recommend["parameters"]["properties"]) == {
+        "query", "asset_type", "creator", "max_results", "limit",
+    }, recommend
     create_part = [entry for entry in defs if entry["name"] == "create_part"][0]
     assert isinstance(create_part["description"], str) and create_part["description"]
     assert create_part["parameters"]["type"] == "object"
@@ -743,10 +751,11 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 7, tools
+    assert isinstance(tools, list) and len(tools) == 8, tools
     names = [tool["name"] for tool in tools]
     assert names == ["asset_search", "create_part", "create_script", "find_instances",
-                     "inspect_hierarchy", "inspect_instance", "modify_instance"], names
+                     "inspect_hierarchy", "inspect_instance", "modify_instance",
+                     "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = [tool for tool in tools if tool["name"] == "create_part"][0]

@@ -291,6 +291,45 @@ meshes, videos, font families) without touching the open Studio project.
 **Explicitly NOT included:** inserting/cloning/downloading/purchasing assets; the general
 autonomous-development goals of Phase 7.
 
+### Phase 7B — Asset Ranking / Recommendation (Open Cloud Creator Store)
+
+> **Status:** Done. `recommend_assets` (a bounded, deterministic ranking layer on top of the
+> Phase 7A read-only search) is implemented and verified with automated tests.
+
+**Goal:** let the agent turn a natural-language request (e.g. "recommend a good shop model")
+into a short, **explainable** list of real Creator Store assets it can speak to with confidence.
+
+**Deliverables:**
+
+- `cli/asset_ranking.py`: a pure, deterministic, read-only ranking layer. Scores each returned
+  result from its metadata (title/description term matches, exact-phrase bonus, asset-type
+  synonym/hint, creator match, and a capped rating/usage bonus), sorts by score then name then
+  id, bounds the output to `MAX_RECOMMENDATIONS` (5, default 3), and emits a human-readable
+  `reason` per recommendation. Typed `RankingError` (subclass of the Phase 7A `AssetError`).
+- The Phase 7A parser now also captures optional `rating`/`sales_count`/`favorite_count` usage
+  metadata when the API provides it (backward-compatible — the Phase 7A shape is unchanged when
+  it is absent).
+- `recommend_assets` tool registered in the CLI `ToolRegistry` and exposed to the REPL
+  (`recommend_assets <query> [limit]`), the one-shot CLI (`--recommend-assets-once`, plus
+  `--creator` / `--max-recommendations`), and the agent (never an action tool — it does not end
+  the loop).
+- Bounded structured result: `{ query, asset_type, creator, evaluated, limit, count,
+  recommendations[{rank, score, reason, asset}], tiebreak, note }`.
+
+**Verification criteria:**
+
+- Unit tests cover ranking signals, deterministic ties, missing metadata, invalid inputs, empty
+  results, and result limits; integration/agent tests cover parser metadata, tool execution
+  (params, failures, exactly-one-API-call), and the full `asset_search` → ranking →
+  `recommend_assets` → report agent flow.
+- Ranking makes **no additional API calls**, never sends a WebSocket `request`, and never
+  modifies the project/plugin.
+
+**Dependencies:** Phase 7A.
+
+**Explicitly NOT included:** inserting/cloning/downloading/purchasing assets; any mutation; the
+general autonomous-development goals of Phase 7.
+
 ---
 
 ## No Dates
@@ -315,4 +354,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`; 4D AI project context / bounded multi-step agent loop done; 4E hosted Groq provider done; 6C verification behavior extensions) |
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
-| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop) |
+| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed) |

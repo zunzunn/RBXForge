@@ -125,7 +125,8 @@ class RobloxAssetClient:
         (None keeps the client's configured value). Returns a dict ``{query,
         asset_type, max_results, count, total, truncated, results}`` where each
         result is ``{asset_id, name, asset_type, creator, creator_id,
-        description, thumbnail_url}`` (only fields the API actually provided).
+        description, thumbnail_url}`` plus optional ``rating``/``sales_count``/
+        ``favorite_count`` usage metadata only when the API provided it.
         Raises an :class:`AssetError` subclass on any failure.
         """
         if not isinstance(query, str) or not query.strip():
@@ -273,6 +274,19 @@ def _stringify(value):
     return None
 
 
+def _numeric(value):
+    """Return the numeric value of an API field if it is a usable number.
+
+    Accepts int/float; rejects bools, strings, None and anything else so that
+    malformed API payloads never propagate bogus numbers into ranking/tests.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
+
+
 def _parse_asset_entry(entry):
     """Parse one CreatorStoreAsset item defensively.
 
@@ -323,6 +337,19 @@ def _parse_asset_entry(entry):
     thumb_text = _stringify(thumbnail_url) if thumbnail_url is not None else None
     if thumb_text is not None:
         result["thumbnail_url"] = thumb_text
+
+    # Optional rating/usage metadata (Phase 7B). Only added when the API gave a
+    # usable number, so older results and the Phase 7A fixture assertions keep
+    # their exact shape. The ranking layer treats these as modest bonuses.
+    rating = _numeric(_dig(asset, ("rating",), ("averageRating",), ("assetRating",)))
+    sales_count = _numeric(_dig(asset, ("salesCount",), ("totalSales",), ("sales",)))
+    favorite_count = _numeric(_dig(asset, ("favorites",), ("favoriteCount",)))
+    if rating is not None:
+        result["rating"] = rating
+    if sales_count is not None:
+        result["sales_count"] = sales_count
+    if favorite_count is not None:
+        result["favorite_count"] = favorite_count
     return result or None
 
 

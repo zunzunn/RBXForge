@@ -14,9 +14,11 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   inspect_hierarchy (Phase 4A) snapshots the Workspace instance tree,
   find_instances (Phase 4B) searches the live Workspace hierarchy by name,
   inspect_instance (Phase 4C) inspects one instance by its full path
-  (request/response over the same socket), and asset_search (Phase 7A) searches
+  (request/response over the same socket), asset_search (Phase 7A) searches
   the Roblox Creator Store over the Open Cloud API -- a read-only local HTTP
-  call that intentionally does NOT use the WebSocket/plugin path
+  call that intentionally does NOT use the WebSocket/plugin path, and
+  recommend_assets (Phase 7B) ranks those search results into a bounded,
+  explainable recommendation list (also read-only, local, no WebSocket)
 - an interactive AI REPL: ordinary text input is sent to the AI agent
   (cli/agent.py, Phase 4D), which drives a bounded multi-step loop - the model
   can call the inspection tools for project context, then an action tool such
@@ -42,12 +44,17 @@ Usage:
                   [--host HOST] [--port PORT] [--timeout SEC] [--request-timeout SEC]
     rbxforge --asset-search-once --query TEXT [--asset-type TYPE] [--max-results N]
                   [--host HOST] [--port PORT] [--request-timeout SEC]
+    rbxforge --recommend-assets-once --query TEXT [--asset-type TYPE] [--creator NAME]
+                  [--max-results N] [--max-recommendations N]
+                  [--host HOST] [--port PORT] [--request-timeout SEC]
 
 AI configuration comes from the environment (see cli/providers.py): set
 RBXFORGE_PROVIDER/RBXFORGE_MODEL for the provider used by 'ask' and by plain
 prompt input. The read-only asset_search tool (Phase 7A) searches the Roblox
 Creator Store over the Open Cloud API and needs RBXFORGE_OPEN_CLOUD_API_KEY
-(see cli/roblox_assets.py); it runs locally and does not touch the plugin.
+(see cli/roblox_assets.py); recommend_assets (Phase 7B) ranks those results
+into a bounded, explainable recommendation list (see cli/asset_ranking.py).
+Both run locally and do not touch the plugin.
 
 Protocol details: see docs/PROTOCOL.md.
 """
@@ -945,6 +952,159 @@ def inspect_instance_tool():
 DEFAULT_ASSET_MAX_RESULTS = 5
 MAX_ASSET_RESULTS = 20
 
+# Phase 7B asset recommendation (cli/asset_ranking.py): the number of ranked
+# recommendations returned per call stays bounded. ``limit`` on the tool is
+# clamped to [1, MAX_ASSET_RECOMMENDATIONS]; when omitted it defaults to
+# DEFAULT_ASSET_RECOMMENDATIONS. These agree with the constants in
+# cli/asset_ranking.py (which owns the ranking logic).
+DEFAULT_ASSET_RECOMMENDATIONS = 3
+MAX_ASSET_RECOMMENDATIONS = 5
+
+
+def recommend_assets_tool():
+    """Build the recommend_assets tool (Phase 7B).
+
+    Runs the Phase 7A read-only Creator Store search (cli/roblox_assets.py)
+    for ``query`` and then ranks the returned metadata into a bounded,
+    deterministic, explainable recommendation list (cli/asset_ranking.py).
+    This is strictly READ-ONLY: ranking uses only the metadata already
+    returned by the search, no additional API calls are made, and nothing is
+    downloaded, inserted, or purchased. It runs locally like asset_search and
+    deliberately does NOT go over the WebSocket/plugin protocol.
+
+    Parameters mirror ``asset_search`` plus an optional ``creator`` bias and
+    a ``limit`` on the number of recommendations returned. The result dict
+    (truthy) is what the agent shows to the model as a bounded tool result;
+    on failure the tool logs and returns False.
+    """
+
+    def run(rbx, params, timeout):
+        ranking_mod = _import_ranking()
+        if ranking_mod is None:
+            rbx.log("recommend_assets FAILED: cli/asset_ranking.py could not be imported")
+            return False
+        assets_mod = _import_assets()
+        if assets_mod is None:
+            rbx.log("recommend_assets FAILED: cli/roblox_assets.py could not be imported")
+            return False
+        client = None
+        resolver = getattr(rbx, "assets", None)
+        if resolver is not None:
+            try:
+                client = resolver()
+            except assets_mod.AssetConfigError as exc:
+                rbx.log("recommend_assets FAILED: {0}".format(exc))
+                return False
+        if client is None:
+            try:
+                client = assets_mod.asset_client_from_env()
+            except assets_mod.AssetConfigError as exc:
+                rbx.log("recommend_assets FAILED: {0}".format(exc))
+                return False
+        query = params["query"]
+        max_results = params.get("max_results") or DEFAULT_ASSET_MAX_RESULTS
+        search_kwargs = {
+            "query": query,
+            "asset_type": params.get("asset_type"),
+            "max_results": max_results,
+            # Bound each HTTP request with the tool's own request timeout so
+            # --request-timeout / execute_tool(timeout=...) really bounds the
+            # call instead of silently falling back to the env-configured
+            # client timeout (which defaults to 30s).
+            "timeout": timeout,
+        }
+        try:
+            result = client.search(**search_kwargs)
+        except assets_mod.AssetConfigError as exc:
+            rbx.log("recommend_assets FAILED: asset_search: {0}".format(exc))
+            return False
+        except assets_mod.AssetError as exc:
+            rbx.log("recommend_assets FAILED: asset_search: {0}".format(exc))
+            return False
+        try:
+            ranked = ranking_mod.rank_assets(
+                result.get("results") or [],
+                query,
+                asset_type=params.get("asset_type"),
+                creator=params.get("creator"),
+                limit=params.get("limit", DEFAULT_ASSET_RECOMMENDATIONS),
+            )
+        except ranking_mod.RankingError as exc:
+            rbx.log("recommend_assets FAILED: {0}".format(exc))
+            return False
+        top = ", ".join(
+            "#{0} {1} (score {2})".format(
+                rec["rank"],
+                rec["asset"].get("name") or rec["asset"].get("asset_id") or "?",
+                rec["score"],
+            )
+            for rec in ranked["recommendations"]
+        )
+        summary = "recommend_assets OK: ranked {0} of {1} result(s) for query {2!r} - {3}".format(
+            ranked["count"], ranked["evaluated"], ranked["query"], top or "no matches"
+        )
+        rbx.log(summary)
+        return ranked
+
+    module = _import_assets()
+    if module is None:
+        # The tool must still construct even when cli/roblox_assets.py cannot
+        # be imported so the registry (and CLI startup) is not taken down.
+        # ``run`` reports the failure gracefully; the ranking layer is even
+        # more optional, so its import failure is deferred to ``run`` too.
+        asset_types = [
+            "Audio", "Model", "Decal", "Plugin", "MeshPart", "Video", "FontFamily",
+        ]
+    else:
+        asset_types = list(module.ASSET_TYPES)
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "min_length": 1},
+            "asset_type": {"type": "string", "enum": asset_types},
+            "creator": {"type": "string", "min_length": 1},
+            "max_results": {
+                "type": "number", "integer": True,
+                "minimum": 1, "maximum": MAX_ASSET_RESULTS,
+            },
+            "limit": {
+                "type": "number", "integer": True,
+                "minimum": 1, "maximum": MAX_ASSET_RECOMMENDATIONS,
+            },
+        },
+        "required": ["query"],
+    }
+    return Tool(
+        "recommend_assets",
+        "Search the public Roblox Creator Store for assets matching a query "
+        "(e.g. a player wants a 'shop model' or 'spooky audio') and return a "
+        "bounded list of the best-ranked recommendations, each with a score "
+        "and a human-readable reason (title/description term matches, asset "
+        "type, creator, rating/usage metadata) so the caller can state why "
+        "each asset was chosen. Always pairs with asset_search; ranking is "
+        "deterministic and read-only - nothing is downloaded, inserted, or "
+        "purchased. Accepts an optional 'creator' to bias toward a specific "
+        "creator and an optional 'limit' (1..{0}) for the number of "
+        "recommendations. Requires an Open Cloud API key set in "
+        "RBXFORGE_OPEN_CLOUD_API_KEY.".format(MAX_ASSET_RECOMMENDATIONS),
+        schema,
+        run,
+    )
+
+
+def default_registry():
+    """Build the registry with all built-in tools registered."""
+    registry = ToolRegistry()
+    registry.register(create_part_tool())
+    registry.register(create_script_tool())
+    registry.register(modify_instance_tool())
+    registry.register(inspect_hierarchy_tool())
+    registry.register(find_instances_tool())
+    registry.register(inspect_instance_tool())
+    registry.register(asset_search_tool())
+    registry.register(recommend_assets_tool())
+    return registry
+
 
 def asset_search_tool():
     """Build the asset_search tool (Phase 7A).
@@ -1044,19 +1204,6 @@ def asset_search_tool():
     )
 
 
-def default_registry():
-    """Build the registry with all built-in tools registered."""
-    registry = ToolRegistry()
-    registry.register(create_part_tool())
-    registry.register(create_script_tool())
-    registry.register(modify_instance_tool())
-    registry.register(inspect_hierarchy_tool())
-    registry.register(find_instances_tool())
-    registry.register(inspect_instance_tool())
-    registry.register(asset_search_tool())
-    return registry
-
-
 def _import_agent():
     """Lazily import cli/agent.py and return the module (or None).
 
@@ -1104,6 +1251,32 @@ def _import_assets():
         try:
             import roblox_assets  # reload after cli/ was added to sys.path
             return roblox_assets
+        except ImportError:
+            return None
+
+
+def _import_ranking():
+    """Lazily import cli/asset_ranking.py and return the module (or None).
+
+    Phase 7B: mirrors ``_import_assets``. ``cli/asset_ranking.py`` imports
+    ``cli/roblox_assets.py`` itself, so a successful ranking import also makes
+    the asset layer importable; if either is missing, ``run`` reports the
+    failure gracefully and the registry (and CLI startup) stays intact.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    try:
+        import asset_ranking
+        return asset_ranking
+    except ImportError:
+        here = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        try:
+            import asset_ranking  # reload after cli/ was added to sys.path
+            return asset_ranking
         except ImportError:
             return None
 
@@ -1427,6 +1600,30 @@ class RBXForge:
             params["max_results"] = max_results
         return self.execute_tool("asset_search", params, timeout)
 
+    def recommend_assets(self, query, asset_type=None, creator=None,
+                         max_results=None, limit=None, timeout=10.0):
+        """Search the Creator Store and rank the results (Phase 7B).
+
+        Runs the read-only Phase 7A search via ``asset_search`` and ranks the
+        returned metadata into a bounded, deterministic, explainable list via
+        the ``recommend_assets`` tool (see cli/asset_ranking.py). ``creator``
+        optionally biases toward a specific creator; ``limit`` bounds the
+        number of recommendations (clamped to 1..5, default 3). Read-only:
+        no API calls beyond the search, and nothing is downloaded, inserted,
+        or purchased. Returns the bounded result dict on success (truthy),
+        or False on failure.
+        """
+        params = {"query": query}
+        if asset_type is not None:
+            params["asset_type"] = asset_type
+        if creator is not None:
+            params["creator"] = creator
+        if max_results is not None:
+            params["max_results"] = max_results
+        if limit is not None:
+            params["limit"] = limit
+        return self.execute_tool("recommend_assets", params, timeout)
+
     def ask(self, prompt):
         """Run one natural-language prompt through the AI agent (Phase 3B-4D).
 
@@ -1600,6 +1797,23 @@ def repl(rbx, console, prompt="RBXForge> "):
                         max_results = parsed
                         after = " ".join(words[:-1])
                 rbx.asset_search(after, max_results=max_results)
+        elif command == "recommend_assets":
+            after = line.strip()[len(command):].strip()
+            if not after:
+                rbx.log("recommend_assets: no query given (e.g. "
+                        "'recommend_assets shop model')")
+            else:
+                limit = None
+                words = after.split()
+                if len(words) >= 2:
+                    try:
+                        parsed = int(words[-1])
+                    except ValueError:
+                        pass
+                    else:
+                        limit = parsed
+                        after = " ".join(words[:-1])
+                rbx.recommend_assets(after, limit=limit)
         elif command == "status":
             with rbx.connection_lock:
                 client = rbx.connection
@@ -1636,6 +1850,10 @@ def repl(rbx, console, prompt="RBXForge> "):
             print("  asset_search <query> [max_results]")
             print("              - search the Creator Store over the Open Cloud API")
             print("                (read-only; default max_results: 5)")
+            print("  recommend_assets <query> [limit]")
+            print("              - search the Creator Store and rank the results into")
+            print("                a bounded, explainable recommendation list")
+            print("                (read-only; default limit: 3, max: 5)")
             print("  status      - show connection status")
             print("  ask <text>  - send <text> to the AI agent (same as any other input)")
             print("  quit        - stop RBXForge")
@@ -1704,6 +1922,12 @@ def main(argv=None):
              "(read-only, local HTTP, no plugin needed), report, then exit",
     )
     parser.add_argument(
+        "--recommend-assets-once", action="store_true",
+        help="search the Creator Store for --query, rank the results, and "
+             "return a bounded list of ranked recommendations (read-only, "
+             "local HTTP, no plugin needed), report, then exit",
+    )
+    parser.add_argument(
         "--depth", type=int, default=None,
         help="maximum hierarchy depth for --inspect-hierarchy-once (default: 3; "
              "must be a whole number in 1..{0})".format(MAX_HIERARCHY_DEPTH),
@@ -1711,7 +1935,7 @@ def main(argv=None):
     parser.add_argument(
         "--query", default=None,
         help="instance name query for --find-instances-once, or Creator Store "
-             "query for --asset-search-once",
+             "query for --asset-search-once / --recommend-assets-once",
     )
     parser.add_argument(
         "--path", default=None,
@@ -1729,13 +1953,25 @@ def main(argv=None):
              "whole number in 1..{1}) or --asset-search-once (default: 5; must "
              "be a whole number in 1..20)".format(DEFAULT_FIND_MAX_RESULTS, MAX_FIND_RESULTS),
     )
+    parser.add_argument(
+        "--max-recommendations", type=int, default=None,
+        help="maximum ranked recommendations for --recommend-assets-once "
+             "(default: {0}; must be a whole number in 1..{1})".format(
+                 DEFAULT_ASSET_RECOMMENDATIONS, MAX_ASSET_RECOMMENDATIONS),
+    )
     ASSET_SEARCH_CLI_ASSET_TYPES = [
         "Audio", "Model", "Decal", "Plugin", "MeshPart", "Video", "FontFamily",
     ]
     parser.add_argument(
         "--asset-type", default=None, choices=ASSET_SEARCH_CLI_ASSET_TYPES,
-        help="optional Creator Store category filter for --asset-search-once, one "
-             "of Audio, Model, Decal, Plugin, MeshPart, Video, FontFamily",
+        help="optional Creator Store category filter for --asset-search-once / "
+             "--recommend-assets-once, one of Audio, Model, Decal, Plugin, "
+             "MeshPart, Video, FontFamily",
+    )
+    parser.add_argument(
+        "--creator", default=None,
+        help="optional creator-name bias for --recommend-assets-once "
+             "(ranking favors assets whose creator matches)",
     )
     parser.add_argument(
         "--timeout", type=float, default=30.0,
@@ -1765,6 +2001,21 @@ def main(argv=None):
         return 0 if rbx.asset_search(
             args.query, asset_type=args.asset_type,
             max_results=args.max_results, timeout=args.request_timeout,
+        ) else 4
+
+    if args.recommend_assets_once:
+        # Phase 7B --recommend-assets-once mirrors --asset-search-once: local
+        # HTTP only, no WebSocket server, nothing to wait for plugin-wise.
+        if not args.query:
+            rbx.error("--recommend-assets-once requires --query <text>")
+            return 2
+        rbx.log("tools registered: {0}".format(
+            ", ".join(tool.name for tool in rbx.registry.list())
+        ))
+        return 0 if rbx.recommend_assets(
+            args.query, asset_type=args.asset_type, creator=args.creator,
+            max_results=args.max_results, limit=args.max_recommendations,
+            timeout=args.request_timeout,
         ) else 4
 
     try:

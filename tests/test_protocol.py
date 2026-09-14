@@ -1253,9 +1253,9 @@ def scenario_tool_registry_metadata():
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
-        "asset_search", "create_part", "create_script", "find_instances",
-        "insert_asset", "inspect_hierarchy", "inspect_instance",
-        "modify_instance", "recommend_assets",
+        "asset_search", "build", "create_part", "create_script",
+        "find_instances", "insert_asset", "inspect_hierarchy",
+        "inspect_instance", "modify_instance", "recommend_assets",
     ], tools
 
     tool = registry.get("create_part")
@@ -1353,9 +1353,21 @@ def scenario_tool_registry_metadata():
     assert inserter.input_schema["properties"]["reference_path"] == {"type": "string", "min_length": 1}
     assert mod.INSERTABLE_ASSET_TYPES == frozenset({"Model", "MeshPart", "Decal", "Audio"})
     assert mod.MAX_KNOWN_ASSETS == 200
+
+    builder = registry.get("build")
+    assert builder is not None
+    assert isinstance(builder.description, str) and builder.description
+    assert builder.input_schema["type"] == "object"
+    assert set(builder.input_schema["required"]) == {"description"}
+    assert builder.input_schema["properties"]["description"] == {
+        "type": "string", "min_length": 1, "max_length": 500,
+    }
+    assert builder.input_schema["properties"]["reference_path"] == {
+        "type": "string", "min_length": 1,
+    }
     print("OK  registry registers create_part, create_script, modify_instance, "
-          "find_instances, inspect_hierarchy, inspect_instance, and "
-          "insert_asset with metadata")
+          "find_instances, inspect_hierarchy, inspect_instance, insert_asset, "
+          "and build with metadata")
 
 
 def scenario_tool_validation():

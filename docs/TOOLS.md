@@ -1,12 +1,13 @@
 # RBXForge — Tool System
 
-> **Status:** Nine tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Ten tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
 > modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B,
-> insert_asset in Phase 7C); the
+> insert_asset in Phase 7C, build in Phase 8A); the
 > rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
-> of these tools without adding any new tool.
+> of these tools; Phase 8A adds the `build` orchestration tool for multi-object scene-aware
+> construction.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -51,6 +52,11 @@
 >   `inspect_instance` verification step. Exposed to the REPL (`insert_asset <asset_id>
 >   [parent_path]`) and the one-shot CLI (`--insert-asset-once`, whose `--asset-id` is the one
 >   explicit human exception to the search-sourced-id rule).
+> - **Implemented (Phase 8A):** `build` is an **orchestration tool** for scene-aware multi-object
+>   construction. It activates build mode so the model can combine `create_part`, `create_script`,
+>   `insert_asset`, and `modify_instance` into a coherent structure (e.g. a shop near the
+>   SpawnLocation), with a bounded raised tool-call budget and automatic final verification of
+>   every created path. It does not change the project itself.
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -293,6 +299,36 @@ The CLI exposes `insert_asset <asset_id> [parent_path]` as a REPL command and
 `--insert-asset-once --asset-id ID [--parent-path PATH] [--position JSON] [--reference-path PATH]`
 as a one-shot flag. The one-shot CLI seeds the id as known before execution. Exit `0` on success,
 `2` on usage error, `4` on insertion failure.
+
+### build (Phase 8A)
+
+- **Purpose:** Orchestrate a **scene-aware multi-object build**. Use `build` when the user asks for
+  a structure that requires several objects working together (e.g. "build a small shop near the
+  SpawnLocation" or "make a garage next to the house"). It does **not** create anything itself; it
+  activates build mode so the Agent can execute multiple existing action tools in one bounded
+  request.
+- **Execution model:** this tool is **local orchestration only** — no WebSocket message is sent.
+  Calling it raises the per-request tool-call budget from the default 5 to a bounded
+  `BUILD_MODE_MAX_TOOL_CALLS` (12) and tells the Agent to track every created instance path for a
+  final verification pass.
+- **Inputs (schema, validated before sending):**
+  - `description` — required, non-empty string (max 500 chars). A clear statement of what the model
+    intends to build.
+  - `reference_path` — optional non-empty string. A full path to an existing instance the build
+    should be placed near (e.g. `"Workspace.SpawnLocation"` or `"Workspace.House"`). The model
+    should inspect this instance first when positioning depends on it.
+- **Agent behavior:** after `build`, the model should inspect the scene if needed, then call
+  `create_part`, `create_script`, `insert_asset`, and/or `modify_instance` for each piece. Action
+  tools do **not** end the loop in build mode. When the model sends a final report, the Agent
+  automatically verifies every recorded path with `inspect_instance`. If any step failed or any
+  path is missing, the result is `build_failed`.
+- **Bounded guarantees:** no uncontrolled recursive planning, no arbitrary code execution, no asset
+  purchasing/deletion. The loop ends on the final report or budget exhaustion. The final
+  verification pass is bounded by the number of paths the build actually created.
+- **Non-goals:** `build` is not a code generator, planner solver, or deletion tool; it only enables
+  the Agent to reuse the existing tool set for multi-object requests.
+
+`build` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
 
 ## Conceptual Tool List
 

@@ -12,6 +12,12 @@
 > `modify_instance`, `insert_asset`). The loop is capped at **5 tool calls per request**, only executes through
 > the existing `ToolRegistry`, and never exposes unbounded hierarchy/property data to the model.
 >
+> **Implemented (Phase 8A):** the `build` tool enables **scene-aware multi-object construction**.
+> The model declares a build plan, inspects the scene, executes a bounded sequence of action
+> tools, and the Agent verifies every created path before reporting success. Build mode raises
+> the per-request budget to a bounded **12 tool calls**; partial failures and verification
+> failures report `build_failed`, never a completed build.
+>
 > **Implemented (Phase 7A):** `asset_search` is exposed to the model as a read-only Creator
 > Store search tool (local HTTP, not a plugin tool). It is **not** an action tool: a successful
 > search never ends the loop, and its dict result is compacted for the model the same way plugin
@@ -199,10 +205,13 @@ bounded compacted result is appended to the conversation
    ↓
 model can call find_instances / inspect_instance / inspect_hierarchy again, or act
    ↓
-action tool succeeds → loop ends (create_part/create_script/modify_instance permit
-  one optional model-driven inspect_instance verification step before ending;
-  insert_asset automatically verifies with inspect_instance at the reported path
-  and fails closed if the instance is missing or does not match).
+action tool succeeds → loop ends, unless the model previously called `build`
+  (Phase 8A). In build mode action tools are intermediate steps; the loop ends
+  when the model sends a final report, at which point the Agent verifies every
+  created path (create_part/create_script/modify_instance permit one optional
+  model-driven inspect_instance verification step before ending when not in build
+  mode; insert_asset automatically verifies with inspect_instance at the reported
+  path and fails closed if the instance is missing or does not match).
 ```
 
 `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) participate in the same loop but
@@ -216,19 +225,22 @@ counterpart that does cross to the plugin: it only accepts an `asset_id` that a 
 so the model bases every insertion on real discovered assets. Phase 7D makes the verification
 automatic: after `insert_asset` succeeds, the Agent calls `inspect_instance` at the reported
 path and reports `verification_failed` if the instance is missing or its name/class/path does
-not match the insertion report.
+not match the insertion report. Phase 8A adds the `build` orchestration tool: after `build`,
+action tools continue until a final report, and the Agent verifies every recorded created path
+before reporting `build_failed` or success.
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
   budget remains.
 - **Stopping:** the loop ends on an executed **action tool** (`create_part`, `create_script`,
-  `modify_instance`, `insert_asset`), a final model report (`{"message": ...}`), a hard rejection
+  `modify_instance`, `insert_asset`) **unless the model previously called `build`** (Phase 8A),
+  a final model report (`{"message": ...}`), a hard rejection
   (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
-  `execution_failed` / `verification_failed`), or the **5-call budget** being exhausted
-  (`max_tool_calls`). It stops rather than guessing when it cannot determine what to do.
-  `asset_search` and `recommend_assets` are **not** action tools, so a successful
-  search/recommendation alone never ends the loop — the loop ends when the model inserts (7C/7D)
-  or otherwise acts.
+  `execution_failed` / `verification_failed` / `build_failed`), or the **5-call budget** being
+  exhausted (`max_tool_calls`; raised to a bounded 12 in build mode). It stops rather than
+  guessing when it cannot determine what to do. `asset_search` and `recommend_assets` are
+  **not** action tools, so a successful search/recommendation alone never ends the loop — the
+  loop ends when the model inserts (7C/7D), declares a build complete (8A), or otherwise acts.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never
@@ -237,8 +249,9 @@ not match the insertion report.
   small `CapturingRBX` so it can observe each `send_request` response without changing any tool,
   validation, or protocol behavior.
 - `Agent(provider, registry=..., rbx=..., timeout=..., max_tool_calls=5)` — `max_tool_calls` is
-  the per-request bound. `agent_from_env()` builds the agent with the provider configured from
-  the environment (defaults to Ollama, see Configuration above).
+  the per-request bound; it is raised to a bounded 12 when the model calls `build` (Phase 8A).
+  `agent_from_env()` builds the agent with the provider configured from the environment
+  (defaults to Ollama, see Configuration above).
 - **Simple prompts** (e.g. "create a red cube") behave exactly as under Phase 3B: the first
   model reply is a `create_part` or `create_script` call, it executes, and the loop returns —
   one chat call, one tool call. **If the model previously called an inspection tool** (`find_instances`
@@ -257,6 +270,12 @@ not match the insertion report.
     instance is missing or does not match, the result is `verification_failed` and the loop
     stops without reporting success. The model should not call `inspect_instance` itself after
     `insert_asset`.
+  - `build` (Phase 8A): when the model sends a final report after a `build` call, the Agent
+    **automatically** executes one `inspect_instance` call for every path created during the
+    build and confirms each instance exists. If any build step failed or any path cannot be
+    confirmed, the result is `build_failed` and the loop stops without reporting a completed
+    build. The model should not call `inspect_instance` itself to verify the build; the system
+    does it.
 - Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet; the loop
   relies on plain `chat` output parsed as JSON (one object per step). Normalizing
   provider-specific tool-call formats behind the provider abstraction is future work.

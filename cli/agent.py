@@ -216,6 +216,12 @@ ACTION_TOOLS = frozenset(
 #: Hard bound on executed tool calls per user request.
 MAX_TOOL_CALLS = 5
 
+#: Raised bound when the model explicitly enters build mode (Phase 8A). A
+#: build needs room for scene inspection, the build declaration, several
+#: create/insert actions, and a final verification pass, while still staying
+#: bounded and deterministic.
+BUILD_MODE_MAX_TOOL_CALLS = 12
+
 #: Bounds applied to tool results before they are shown to the model.
 MAX_TOOL_RESULT_ITEMS = 20  # cap on list/dict entries (e.g. matches, children)
 MAX_TOOL_RESULT_STRING = 200  # per-string truncation length
@@ -438,6 +444,17 @@ def build_system_prompt(registry):
         "automatically verifies the placed instance at its reported path, so "
         "do not call inspect_instance yourself; report as soon as insert_asset "
         "succeeds.\n"
+        "- build declares a scene-aware multi-object build plan (Phase 8A). "
+        "Use it when the user asks for a structure that requires several "
+        "objects (e.g. 'build a small shop near the SpawnLocation' or 'make a "
+        "garage next to the house'). Call build first with a clear description "
+        "and optional reference_path, inspect the scene if the position "
+        "depends on existing objects, then execute create_part / create_script "
+        "/ insert_asset / modify_instance for each piece. Action tools do not "
+        "end the loop in build mode. When you are done send a final report; "
+        "the system will verify every created path and fail the build if any "
+        "step failed or any path is missing. Do not use build for single-object "
+        "requests.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "
@@ -647,6 +664,73 @@ class Agent:
         )
         return True, info
 
+    @staticmethod
+    def _extract_created_path(tool_name, response_payload):
+        """Phase 8A: extract the reported instance path from a successful
+        action-tool response so build-mode final verification can confirm the
+        instance still exists. Returns None when the tool does not report a
+        path or the response is missing."""
+        if not response_payload or not response_payload.get("ok"):
+            return None
+        result = response_payload.get("result") or {}
+        return result.get("path")
+
+    def _verify_build_paths(self, paths, timeout):
+        """Phase 8A: verify that every path created during a build still exists
+        and matches the reported name/class.
+
+        Returns ``(verified: bool, info: dict)`` where ``info`` contains
+        ``arguments``, ``output``, ``data``, ``result``, ``message``, and a
+        ``paths`` list of ``{path, ok, name?, class?}``. On failure
+        ``info["message"]`` explains which path failed.
+        """
+        info = {
+            "arguments": None,
+            "output": True,
+            "data": [],
+            "result": [],
+            "message": None,
+            "paths": [],
+        }
+        if not paths:
+            info["message"] = "no created paths to verify"
+            return True, info
+
+        for path in paths:
+            capturer = CapturingRBX(self.rbx)
+            try:
+                output = self.registry.execute(
+                    capturer, "inspect_instance", {"path": path}, timeout
+                )
+            except (rbxforge.UnknownToolError, rbxforge.InvalidParamsError) as exc:
+                info["paths"].append({"path": path, "ok": False, "error": str(exc)})
+                info["output"] = False
+                continue
+
+            response_payload = (
+                capturer.responses[-1]["response"] if capturer.responses else None
+            )
+            ok = bool(output and response_payload and response_payload.get("ok"))
+            entry = {"path": path, "ok": ok}
+            if ok:
+                result = response_payload.get("result") or {}
+                entry["name"] = result.get("name")
+                entry["class"] = result.get("className") or result.get("class")
+            info["paths"].append(entry)
+            if not ok:
+                info["output"] = False
+
+        if not info["output"]:
+            failed = [p["path"] for p in info["paths"] if not p["ok"]]
+            info["message"] = (
+                "build verification failed: the following created paths could not "
+                "be confirmed: {0}".format(", ".join(failed))
+            )
+            return False, info
+
+        info["message"] = "build verified: {0} path(s) confirmed".format(len(paths))
+        return True, info
+
     def run(self, prompt, **chat_options):
         """Run ``prompt`` through the bounded multi-step loop.
 
@@ -661,7 +745,10 @@ class Agent:
         ``inspect_instance`` verification step, then ends. A successful
         ``insert_asset`` automatically runs one ``inspect_instance``
         verification step (Phase 7D) and fails if the instance is not found or
-        does not match the reported path/name/class.
+        does not match the reported path/name/class. A ``build`` call (Phase 8A)
+        enters multi-object build mode: action tools continue until the model
+        sends a final report, and the system verifies every created path before
+        reporting success.
         """
         messages = [
             providers.message("system", build_system_prompt(self.registry)),
@@ -678,6 +765,13 @@ class Agent:
         # this session, so we can conditionally enable verification after
         # create_part/create_script when the model has gathered context.
         inspection_called = False
+        # Phase 8A build-mode state. ``build`` is an orchestration tool: when
+        # the model calls it, the loop enters build mode so multiple action
+        # tools can be executed and verified as one coherent build.
+        build_mode = False
+        build_paths = []
+        build_failures = []
+        effective_max_tool_calls = self.max_tool_calls
 
         while True:
             # -- model ------------------------------------------------------- #
@@ -717,6 +811,52 @@ class Agent:
                 )
 
             if isinstance(reply, FinalMessage):
+                # Phase 8A: a final report in build mode triggers a verification
+                # pass over every created path. The build is only reported as
+                # successful when every step succeeded and every path exists.
+                if build_mode:
+                    verified, verify_info = self._verify_build_paths(
+                        build_paths, self.timeout
+                    )
+                    for entry in verify_info["paths"]:
+                        issued += 1
+                        steps.append(
+                            {
+                                "tool": "inspect_instance",
+                                "arguments": {"path": entry["path"]},
+                                "output": entry["ok"],
+                                "data": entry,
+                                "result": "verify {0}: {1}".format(
+                                    entry["path"],
+                                    "ok" if entry["ok"] else "missing",
+                                ),
+                                "ok": entry["ok"],
+                            }
+                        )
+                    if build_failures or not verified:
+                        messages = []
+                        if build_failures:
+                            messages.append(
+                                "{0} build step(s) failed".format(len(build_failures))
+                            )
+                        if not verified:
+                            messages.append(verify_info["message"])
+                        return AgentResult(
+                            ok=False,
+                            provider_text=last_text,
+                            steps=steps,
+                            message=reply.text,
+                            error={
+                                "code": "build_failed",
+                                "message": "; ".join(messages),
+                            },
+                        )
+                    return AgentResult(
+                        ok=True,
+                        provider_text=last_text,
+                        steps=steps,
+                        message=reply.text or verify_info["message"],
+                    )
                 if pending_verify is not None:
                     return AgentResult(
                         ok=True,
@@ -802,7 +942,41 @@ class Agent:
             if call.name in ("find_instances", "inspect_instance"):
                 inspection_called = True
 
+            # Phase 8A: the build tool activates multi-object build mode. It is
+            # an orchestration-only call: it does not change the project, but it
+            # raises the per-request tool-call budget and allows subsequent
+            # action tools to continue instead of ending the loop.
+            if call.name == "build" and failure is None and output:
+                build_mode = True
+                effective_max_tool_calls = max(
+                    self.max_tool_calls, BUILD_MODE_MAX_TOOL_CALLS
+                )
+                messages.append(providers.message("assistant", last_text))
+                messages.append(
+                    providers.message(
+                        "user",
+                        tool_result_message(issued, call, output, response_payload),
+                    )
+                )
+                continue
+
             if failure is not None:
+                if build_mode:
+                    # In build mode a single step failure is recorded so the
+                    # loop can continue (the model may abort with a final
+                    # report), but the final report will report the build as
+                    # failed rather than complete.
+                    build_failures.append(
+                        {"tool": call.name, "arguments": call.arguments, "error": failure}
+                    )
+                    messages.append(providers.message("assistant", last_text))
+                    messages.append(
+                        providers.message(
+                            "user",
+                            tool_result_message(issued, call, output, response_payload),
+                        )
+                    )
+                    continue
                 return AgentResult(
                     ok=False,
                     tool=call,
@@ -812,6 +986,25 @@ class Agent:
                     error=failure,
                 )
             if call.name in ACTION_TOOLS:
+                # Phase 8A: in build mode action tools are intermediate steps.
+                # Record the created instance path and continue so the model
+                # can execute the rest of the plan; final verification runs when
+                # the model sends a final report.
+                if build_mode:
+                    path = self._extract_created_path(call.name, response_payload)
+                    if path:
+                        build_paths.append(path)
+                    messages.append(providers.message("assistant", last_text))
+                    messages.append(
+                        providers.message(
+                            "user",
+                            tool_result_message(
+                                issued, call, output, response_payload
+                            ),
+                        )
+                    )
+                    continue
+
                 # Phase 7D: insert_asset automatically verifies the placed
                 # instance at the reported path before the loop ends. This makes
                 # the end-to-end asset workflow reliable: the agent never claims
@@ -901,7 +1094,7 @@ class Agent:
                     provider_text=last_text,
                     steps=steps,
                 )
-            if issued >= self.max_tool_calls:
+            if issued >= effective_max_tool_calls:
                 return AgentResult(
                     ok=False,
                     tool=call,
@@ -911,7 +1104,9 @@ class Agent:
                     error={
                         "code": "max_tool_calls",
                         "message": "tool call budget exhausted after {0} call(s) "
-                        "without completing the task".format(self.max_tool_calls),
+                        "without completing the task".format(
+                            effective_max_tool_calls
+                        ),
                     },
                 )
 

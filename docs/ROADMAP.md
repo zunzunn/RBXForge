@@ -432,6 +432,56 @@ properties do not match the insertion report.
 **Explicitly NOT included:** purchasing assets, arbitrary external downloads,
 asset deletion, or unrelated project changes.
 
+### Phase 8A — Scene-Aware Building
+
+> **Status:** Done. The Agent can declare a multi-object `build` plan, inspect the
+> existing scene, execute a bounded sequence of create/insert actions, and have
+> every created path verified before the build is reported complete.
+
+**Goal:** let RBXForge understand the existing Roblox scene and intelligently
+combine primitives, scripts, and Creator Store assets into a coherent structure
+for natural requests like "build a small shop near the SpawnLocation" or "make a
+simple garage next to the existing house".
+
+**Deliverables:**
+
+- **``build`` orchestration tool:** a new registered tool that does not change the
+  project but signals multi-object build mode. It accepts a `description` and an
+  optional `reference_path` to an existing instance to place near. When the Agent
+  executes `build`, the per-request tool-call budget is raised to a bounded
+  `BUILD_MODE_MAX_TOOL_CALLS` (12) so several create/insert actions can run in one
+  request.
+- **Reuses existing tools:** `build` is pure orchestration; the model still calls
+  `inspect_instance` / `find_instances` / `inspect_hierarchy` to read the scene,
+  then `create_part`, `create_script`, `insert_asset`, and `modify_instance` to
+  execute the plan. No new primitive/script/asset logic was duplicated.
+- **Bounded and deterministic:** no uncontrolled recursive planning, no arbitrary
+  code execution, no asset purchasing/deletion. The loop stays bounded by the
+  raised budget and ends on the model's final report or budget exhaustion.
+- **Tracked intermediate state:** during build mode the Agent records the path of
+  every successful action tool. Step failures are recorded but the loop continues
+  so the model can abort cleanly with a final report.
+- **Final verification:** when the model sends a final report in build mode, the
+  Agent automatically calls `inspect_instance` for every recorded path and
+  confirms the instance exists. If any step failed or any path cannot be
+  confirmed, the result is `build_failed` — the Agent never reports a completed
+  build when part of the plan failed.
+
+**Verification criteria:**
+
+- Automated tests cover scene inspection before building, multi-object
+  construction, relative positioning via `reference_path`, mixed primitive +
+  Creator Store asset builds, partial step failure, final verification failure,
+  raised tool-call budget in build mode, and natural-language final reporting.
+- The Agent never reports success when a build step fails or final verification
+  fails; every incomplete build produces a clear `build_failed` result.
+
+**Dependencies:** Phases 7A, 7B, 7C, and 7D.
+
+**Explicitly NOT included:** arbitrary external downloads, asset purchasing,
+asset deletion, unbounded planning loops, or generalized code generation beyond
+script creation through the existing `create_script` tool.
+
 ---
 
 ## No Dates
@@ -457,3 +507,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
 | Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default; 7D verification done: after `insert_asset` the Agent automatically verifies the placed instance with `inspect_instance` and fails closed on mismatch/missing/timeout, and the plugin defends against silent parenting failures, duplicate-name exhaustion, and inconsistent paths) |
+| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`) |

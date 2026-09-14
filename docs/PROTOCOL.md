@@ -11,6 +11,8 @@
 >   `modify_instance` (Phase 6B), and `insert_asset` (Phase 7C / 7D). Phase 7D keeps the same
 >   messages but adds automatic Agent-side verification after a successful `insert_asset`
 >   (`inspect_instance` at the reported path) and plugin-side post-insert reliability checks.
+>   Phase 8A adds the `build` orchestration tool (Agent-side only; no WebSocket message) that
+>   raises the bounded per-request tool budget and tracks created paths for final verification.
 > - **Deliberate exception (Phase 7A/7B):** `asset_search` and `recommend_assets` are registered
 >   tools but are **not** dispatched through the plugin. They execute as **local HTTP calls** to
 >   the Open Cloud Creator Store API from `cli/roblox_assets.py` / `cli/asset_ranking.py`, so they
@@ -216,6 +218,7 @@ Implemented tools and their `params`:
 | `asset_search` | `query` (non-empty string, max 200 chars), `asset_type` (optional string, one of `"Audio"`, `"Model"`, `"Decal"`, `"Plugin"`, `"MeshPart"`, `"Video"`, `"FontFamily"`), `max_results` (optional integer, `1..20`, default `5`) — **local HTTP, no `request` message** | `{ query, asset_type, max_results, count, total, truncated, results }` |
 | `recommend_assets` | `query` (non-empty string, max 200 chars), `asset_type` (optional, as `asset_search`), `creator` (optional string), `max_results` (optional integer, `1..20`, default `5`), `limit` (optional integer, `1..5`, default `3`) — **local HTTP, no `request` message** | `{ query, asset_type, creator, evaluated, limit, count, recommendations: [{ rank, score, reason, asset }], tiebreak, note }` |
 | `insert_asset` | `asset_id` (digits-only string, max 16 chars — must be an id a prior `asset_search`/`recommend_assets` returned in this session, never invented), `parent_path` (optional game-rooted string, default `"Workspace"`), `position` (optional object with numeric `x`, `y`, `z`), `reference_path` (optional non-empty string, a path to place near; `position` and `reference_path` are mutually exclusive) | `{ asset_id, name, class, parent_path, path, positioned, placement: "explicit" \| "reference" \| "default", position? }` |
+| `build` | `description` (required non-empty string, max 200 chars), `reference_path` (optional non-empty string to an existing instance) — **Agent-side orchestration only, no `request` message** | `true` (declares a multi-object build plan and activates build mode) |
 
 `inspect_hierarchy` example request:
 
@@ -562,19 +565,22 @@ Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.
 
-**Phase 7A/7B exception (`asset_search`, `recommend_assets`):** these tools are registered and
+**Phase 7A/7B/8A exception (`asset_search`, `recommend_assets`, `build`):** these tools are registered and
 schema-validated exactly like the others, but their execution **does not produce a WebSocket
-`request`**. They make local HTTP `POST`s to the Open Cloud Creator Store API from
-`cli/roblox_assets.py` (search) and rank purely in-process in `cli/asset_ranking.py`
-(recommendation — no extra API calls beyond the search; no robot changes to Studio). Their
-structured result is returned directly (and logged / shown to the agent); there is no plugin
-handler and no `response` message. `insert_asset` (Phase 7C/7D) is the counterpart that **does**
-produce normal `request`/`response` pairs: the CLI accepts an `asset_id` only if a prior
-search/ranking recorded it in the bounded per-session known-id registry (or the human typed it
-via `--insert-asset-once`), and the plugin loads it with `InsertService:LoadAsset`, applies
-Phase 7D reliability checks (parenting verification, bounded unique naming, path round-trip),
-and reports the final instance path. The Agent then reuses `inspect_instance` to verify the
-placed instance before reporting success. See [TOOLS.md](./TOOLS.md).
+`request`**. `asset_search` and `recommend_assets` make local HTTP `POST`s to the Open Cloud
+Creator Store API from `cli/roblox_assets.py` (search) and rank purely in-process in
+`cli/asset_ranking.py` (recommendation — no extra API calls beyond the search; no robot changes
+to Studio). `build` is Agent-side orchestration only: it activates multi-object build mode and
+raises the bounded per-request tool-call budget. Their structured result is returned directly
+(and logged / shown to the agent); there is no plugin handler and no `response` message.
+`insert_asset` (Phase 7C/7D) is the counterpart that **does** produce normal `request`/`response`
+pairs: the CLI accepts an `asset_id` only if a prior search/ranking recorded it in the bounded
+per-session known-id registry (or the human typed it via `--insert-asset-once`), and the plugin
+loads it with `InsertService:LoadAsset`, applies Phase 7D reliability checks (parenting
+verification, bounded unique naming, path round-trip), and reports the final instance path. The
+Agent then reuses `inspect_instance` to verify the placed instance before reporting success.
+Phase 8A reuses the same `inspect_instance` message for the final build verification pass. See
+[TOOLS.md](./TOOLS.md).
 
 ## Future Streaming / Events (Planned)
 
@@ -589,8 +595,8 @@ Not implemented; listed as future direction:
 
 - Only seven Studio operations (`create_part`, `create_script`, `modify_instance`,
   `insert_asset`, `inspect_hierarchy`, `find_instances`, `inspect_instance`) plus the
-  local-HTTP `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B), which are not Studio
-  operations at all. Other
+  local-HTTP `asset_search` (Phase 7A), `recommend_assets` (Phase 7B), and `build` (Phase 8A),
+  which are not Studio operations at all. Other
   object/script/UI operations and generalized
   search (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by

@@ -37,6 +37,13 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   reliable: after a successful insertion the agent automatically verifies
   the placed instance with inspect_instance at the reported path and fails
   closed if the instance is missing or does not match.
+- build (Phase 8A) is an Agent-side orchestration tool for scene-aware
+  multi-object construction. The model declares a build plan (e.g. "small
+  shop near the SpawnLocation"), inspects the scene, executes multiple
+  create_part / create_script / insert_asset / modify_instance steps in a
+  bounded loop, and the agent verifies every created path before reporting
+  success. It never allows unbounded planning, arbitrary code execution, or
+  asset deletion.
 
 Standard library only; no external dependencies.
 
@@ -1248,6 +1255,71 @@ def insert_asset_tool():
     )
 
 
+# Phase 8A: scene-aware multi-object builds. The ``build`` tool is an
+# orchestration/planning tool: the model calls it to declare that the current
+# request is a multi-object build, describes what it intends to build, and
+# optionally names a reference instance to place near. The tool itself does not
+# change the project; it activates build mode in the Agent loop so multiple
+# create_part / create_script / insert_asset / modify_instance calls can be
+# executed and verified as one coherent build.
+BUILD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 500,
+        },
+        "reference_path": {
+            "type": "string",
+            "min_length": 1,
+        },
+    },
+    "required": ["description"],
+}
+
+
+def build_tool():
+    """Build the scene-aware build orchestration tool (Phase 8A).
+
+    ``build`` does not touch the project. It lets the model declare a plan for
+    a multi-object build (e.g. "a small shop near the SpawnLocation") so the
+    Agent can enter build mode: action tools no longer end the loop after the
+    first success, created instance paths are tracked, and a final verification
+    pass confirms every declared object exists before the build is reported as
+    complete.
+    """
+
+    def run(rbx, params, timeout):
+        description = params["description"]
+        reference = params.get("reference_path")
+        if reference:
+            rbx.log(
+                "build PLAN: {0} (reference: {1})".format(description, reference)
+            )
+        else:
+            rbx.log("build PLAN: {0}".format(description))
+        return True
+
+    return Tool(
+        "build",
+        "Declare a scene-aware multi-object build plan. Use this when the user "
+        "asks for something that requires combining several primitives, scripts, "
+        "and/or Creator Store assets into a coherent structure (e.g. 'build a "
+        "small shop near the SpawnLocation' or 'make a garage next to the "
+        "house'). Provide a clear 'description' of what you intend to build and "
+        "an optional 'reference_path' to an existing instance to place near. "
+        "After calling build, inspect the scene if needed, then execute the "
+        "individual create_part / create_script / insert_asset / modify_instance "
+        "steps. The loop will stay in build mode until you send a final report; "
+        "the system then verifies every created path and reports failure if any "
+        "step failed or any path is missing. Do not use this for single-object "
+        "requests that fit one tool call.",
+        BUILD_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
@@ -1260,6 +1332,7 @@ def default_registry():
     registry.register(asset_search_tool())
     registry.register(recommend_assets_tool())
     registry.register(insert_asset_tool())
+    registry.register(build_tool())
     return registry
 
 

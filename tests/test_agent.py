@@ -149,9 +149,9 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["asset_search", "create_part", "create_script", "find_instances",
-                     "insert_asset", "inspect_hierarchy", "inspect_instance",
-                     "modify_instance", "recommend_assets"], names
+    assert names == ["asset_search", "build", "create_part", "create_script",
+                     "find_instances", "insert_asset", "inspect_hierarchy",
+                     "inspect_instance", "modify_instance", "recommend_assets"], names
     asset_search = defs[0]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
     assert asset_search["parameters"]["type"] == "object"
@@ -553,6 +553,38 @@ class MultiFakeRBX:
         return self.known_assets.get(str(asset_id))
 
 
+class BuildFakeRBX(MultiFakeRBX):
+    """MultiFakeRBX extended for Phase 8A build tests.
+
+    ``verify_map`` returns a per-path inspect_instance payload so final
+    verification can be scripted independently of the initial scene inspection.
+    ``per_tool_counts`` is an ordered list of payloads for a tool so successive
+    calls to the same tool can return different results (e.g. one create_part
+    succeeds and the next fails).
+    """
+
+    def __init__(self, payloads, known_assets=None, verify_map=None,
+                 per_tool_counts=None):
+        super().__init__(payloads, known_assets=known_assets)
+        self.verify_map = dict(verify_map) if verify_map else {}
+        self.per_tool_counts = dict(per_tool_counts) if per_tool_counts else {}
+        self._call_counts = {}
+
+    def send_request(self, tool, params, timeout):
+        self.requests.append((tool, params))
+        if tool == "inspect_instance":
+            path = params.get("path")
+            if path in self.verify_map:
+                return self.verify_map[path]
+        payloads = self.per_tool_counts.get(tool)
+        if payloads:
+            index = self._call_counts.get(tool, 0)
+            self._call_counts[tool] = index + 1
+            if index < len(payloads):
+                return payloads[index]
+        return self.payloads.get(tool)
+
+
 def find_payload(query="Baseplate", total=1, matches=None, max_results=20):
     """A plugin 'ok:true' find_instances response payload."""
     if matches is None:
@@ -888,6 +920,295 @@ def scenario_insert_asset_action_tool():
     print("OK  insert_asset failure in agent loop reported as execution_failed")
 
 
+def scenario_scene_aware_building():
+    """Phase 8A: the model can declare a multi-object build, inspect the scene,
+    execute a bounded sequence of create/insert actions, and have every created
+    path verified before the build is reported complete. Partial failures and
+    verification failures are reported as build_failed, not success."""
+    mod = load_agent_module()
+    assert "build" in [t.name for t in mod.rbxforge.default_registry().list()]
+
+    spawn_payload = {
+        "ok": True,
+        "result": {
+            "name": "SpawnLocation",
+            "className": "SpawnLocation",
+            "path": "Workspace/SpawnLocation",
+            "parent_path": "Workspace",
+            "properties": {"Position": {"x": 0, "y": 0, "z": 0}},
+        },
+    }
+
+    def part_payload(name, path=None):
+        return {
+            "ok": True,
+            "result": {
+                "name": name,
+                "parent_path": "Workspace",
+                "path": path or "Workspace/" + name,
+                "position": {"x": 5, "y": 0.5, "z": 0},
+                "size": {"x": 2, "y": 2, "z": 2},
+                "color": "gray",
+            },
+        }
+
+    sign_payload = {
+        "ok": True,
+        "result": {
+            "name": "ShopSign",
+            "type": "Script",
+            "parent_path": "ServerScriptService",
+            "path": "ServerScriptService/ShopSign",
+            "source_length": 20,
+        },
+    }
+
+    asset_payload = {
+        "ok": True,
+        "result": {
+            "asset_id": "135522",
+            "name": "Cafe Shop",
+            "class": "Model",
+            "parent_path": "Workspace",
+            "path": "Workspace/Cafe Shop",
+            "positioned": True,
+            "placement": "default",
+        },
+    }
+
+    build_call = json.dumps({
+        "tool": "build",
+        "arguments": {
+            "description": "small shop near the SpawnLocation",
+            "reference_path": "Workspace.SpawnLocation",
+        },
+    })
+    inspect_spawn = json.dumps({
+        "tool": "inspect_instance",
+        "arguments": {"path": "Workspace.SpawnLocation"},
+    })
+    create_floor = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopFloor",
+            "position": {"x": 5, "y": 0.5, "z": 0},
+            "size": {"x": 8, "y": 1, "z": 6},
+            "color": "gray",
+        },
+    })
+    create_wall = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopWall",
+            "position": {"x": 5, "y": 3, "z": -3},
+            "size": {"x": 8, "y": 5, "z": 1},
+            "color": "gray",
+        },
+    })
+    create_sign = json.dumps({
+        "tool": "create_script",
+        "arguments": {
+            "name": "ShopSign",
+            "type": "Script",
+            "source": 'print("Open!")',
+        },
+    })
+    insert_shop = json.dumps({
+        "tool": "insert_asset",
+        "arguments": {"asset_id": "135522"},
+    })
+    final_report = json.dumps({
+        "message": "Built a small shop near the SpawnLocation.",
+    })
+
+    # 1) Successful mixed build: inspect scene, create two parts + script + asset,
+    #    then final report. All paths verify.
+    verify_ok = {
+        "Workspace/ShopFloor": {
+            "ok": True,
+            "result": {
+                "name": "ShopFloor",
+                "className": "Part",
+                "path": "Workspace/ShopFloor",
+            },
+        },
+        "ServerScriptService/ShopSign": {
+            "ok": True,
+            "result": {
+                "name": "ShopSign",
+                "className": "Script",
+                "path": "ServerScriptService/ShopSign",
+            },
+        },
+        "Workspace/Cafe Shop": {
+            "ok": True,
+            "result": {
+                "name": "Cafe Shop",
+                "className": "Model",
+                "path": "Workspace/Cafe Shop",
+            },
+        },
+    }
+    provider = SequenceProvider([
+        build_call,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        create_sign,
+        insert_shop,
+        final_report,
+    ])
+    rbx = BuildFakeRBX(
+        {
+            "inspect_instance": spawn_payload,
+            "create_part": part_payload("ShopFloor"),
+            "create_script": sign_payload,
+            "insert_asset": asset_payload,
+        },
+        known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}},
+        verify_map=verify_ok,
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
+        },
+    )
+    result = make_agent(provider, rbx=rbx).run(
+        "build a small shop near the SpawnLocation"
+    )
+
+    assert result.ok is True, result
+    assert result.message == "Built a small shop near the SpawnLocation.", result
+    assert [step["tool"] for step in result.steps] == [
+        "build", "inspect_instance", "create_part", "create_part",
+        "create_script", "insert_asset",
+        "inspect_instance", "inspect_instance", "inspect_instance",
+        "inspect_instance",
+    ], [step["tool"] for step in result.steps]
+    assert all(step["ok"] for step in result.steps), result.steps
+    # Seven model-driven chats (build, inspect, four actions, final); verification
+    # is automatic and not a chat turn.
+    assert len(provider.chat_calls) == 7, len(provider.chat_calls)
+    # Created paths tracked for final verification.
+    assert rbx.requests[0] == (
+        "inspect_instance", {"path": "Workspace.SpawnLocation"}
+    ), rbx.requests
+    assert rbx.requests[1] == ("create_part", {
+        "name": "ShopFloor",
+        "position": {"x": 5, "y": 0.5, "z": 0},
+        "size": {"x": 8, "y": 1, "z": 6},
+        "color": "gray",
+    }), rbx.requests
+    assert rbx.requests[2] == ("create_part", {
+        "name": "ShopWall",
+        "position": {"x": 5, "y": 3, "z": -3},
+        "size": {"x": 8, "y": 5, "z": 1},
+        "color": "gray",
+    }), rbx.requests
+    assert rbx.requests[3] == ("create_script", {
+        "name": "ShopSign", "type": "Script", "source": 'print("Open!")',
+    }), rbx.requests
+    assert rbx.requests[4] == ("insert_asset", {"asset_id": "135522"}), rbx.requests
+    assert rbx.requests[5:] == [
+        ("inspect_instance", {"path": "Workspace/ShopFloor"}),
+        ("inspect_instance", {"path": "Workspace/ShopWall"}),
+        ("inspect_instance", {"path": "ServerScriptService/ShopSign"}),
+        ("inspect_instance", {"path": "Workspace/Cafe Shop"}),
+    ], rbx.requests
+    print("OK  scene-aware build: inspect scene, plan, multi-object execute, verify")
+
+    # 2) Partial failure: the floor succeeds but the wall fails. The loop
+    #    continues, the model sends a final report, and the result is
+    #    build_failed because one step failed.
+    wall_fail = {"ok": False, "error": {"code": "execution_failed", "message": "no room"}}
+    provider_partial = SequenceProvider([
+        build_call,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        final_report,
+    ])
+    rbx_partial = BuildFakeRBX(
+        {"inspect_instance": spawn_payload},
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), wall_fail],
+        },
+    )
+    result_partial = make_agent(provider_partial, rbx=rbx_partial).run(
+        "build a small shop near the SpawnLocation"
+    )
+    assert result_partial.ok is False, result_partial
+    assert result_partial.error["code"] == "build_failed", result_partial
+    assert any(step["tool"] == "create_part" and step["ok"] is False
+               for step in result_partial.steps), result_partial.steps
+    print("OK  scene-aware build reports build_failed when a step fails")
+
+    # 3) Verification failure: all steps report success but one created path is
+    #    missing during final verification. The build is not reported as complete.
+    verify_missing = dict(verify_ok)
+    verify_missing["Workspace/ShopFloor"] = {
+        "ok": False,
+        "error": {"code": "not_found", "message": "no instance"},
+    }
+    provider_verify = SequenceProvider([
+        build_call,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        create_sign,
+        insert_shop,
+        final_report,
+    ])
+    rbx_verify = BuildFakeRBX(
+        {
+            "inspect_instance": spawn_payload,
+            "create_part": part_payload("ShopFloor"),
+            "create_script": sign_payload,
+            "insert_asset": asset_payload,
+        },
+        known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}},
+        verify_map=verify_missing,
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
+        },
+    )
+    result_verify = make_agent(provider_verify, rbx=rbx_verify).run(
+        "build a small shop near the SpawnLocation"
+    )
+    assert result_verify.ok is False, result_verify
+    assert result_verify.error["code"] == "build_failed", result_verify
+    assert "Workspace/ShopFloor" in result_verify.error["message"], result_verify
+    print("OK  scene-aware build reports build_failed when final verification fails")
+
+    # 4) Tool-call budget: build mode must raise the effective budget enough to
+    #    execute several action tools. Without build mode the first create_part
+    #    would end the loop; here three action tools plus build/inspect fit.
+    provider_budget = SequenceProvider([
+        build_call,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        create_sign,
+        final_report,
+    ])
+    rbx_budget = BuildFakeRBX(
+        {
+            "inspect_instance": spawn_payload,
+            "create_script": sign_payload,
+        },
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
+        },
+    )
+    # Default max_tool_calls is 5; this build needs 5 model-driven calls plus
+    # verification, so it only succeeds if build mode raised the budget.
+    result_budget = make_agent(provider_budget, rbx=rbx_budget).run(
+        "build a small shop near the SpawnLocation"
+    )
+    assert result_budget.ok is True, result_budget
+    assert len([s for s in result_budget.steps if s["tool"] == "create_part"]) == 2, result_budget.steps
+    assert len([s for s in result_budget.steps if s["tool"] == "create_script"]) == 1, result_budget.steps
+    print("OK  scene-aware build raises the tool-call budget in build mode")
+
+
 def scenario_groq_compat_agent_passes_tools():
     """Agent-side half of the GPT-OSS/Groq compatibility fix: when the provider
     advertises ``supports_tools`` (Groq), the agent hands it the registry's tool
@@ -917,11 +1238,11 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 9, tools
+    assert isinstance(tools, list) and len(tools) == 10, tools
     names = [tool["name"] for tool in tools]
-    assert names == ["asset_search", "create_part", "create_script", "find_instances",
-                     "insert_asset", "inspect_hierarchy", "inspect_instance",
-                     "modify_instance", "recommend_assets"], names
+    assert names == ["asset_search", "build", "create_part", "create_script",
+                     "find_instances", "insert_asset", "inspect_hierarchy",
+                     "inspect_instance", "modify_instance", "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = [tool for tool in tools if tool["name"] == "create_part"][0]
@@ -1119,6 +1440,7 @@ def main():
     scenario_multistep_single_call_still_single_step()
     scenario_create_script_action_tool()
     scenario_insert_asset_action_tool()
+    scenario_scene_aware_building()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

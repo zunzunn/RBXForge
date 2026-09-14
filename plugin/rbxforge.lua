@@ -256,6 +256,8 @@ local function handleCreatePart(id, params)
 	))
 	return sendResponse(id, true, {
 		name = name,
+		parent_path = "Workspace",
+		path = "Workspace/" .. name,
 		position = { x = position.X, y = position.Y, z = position.Z },
 		size = { x = size.X, y = size.Y, z = size.Z },
 		color = params.color,

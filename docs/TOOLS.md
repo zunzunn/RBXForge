@@ -1,15 +1,17 @@
 # RBXForge — Tool System
 
-> **Status:** Fifteen tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Sixteen tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
 > modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B,
 > insert_asset in Phase 7C, build in Phase 8A, plan_build in Phase 8B, edit_build /
-> recent_build_context / delete_instance in Phase 8D, analyze_scene in Phase 9A); the rest is
-> conceptual. The **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project
-> context on top of these tools; Phase 8A adds the `build` orchestration tool for multi-object
-> scene-aware construction, Phase 8B adds the `plan_build` structured planning tool, Phase 8D
-> adds `edit_build`, `recent_build_context`, and `delete_instance` for iterative refinement, and
-> Phase 9A adds `analyze_scene` for bounded, deterministic scene summaries.
+> recent_build_context / delete_instance in Phase 8D, analyze_scene in Phase 9A,
+> decompose_intent in Phase 9B); the rest is conceptual. The **Phase 4D bounded multi-step
+> agent loop** (`cli/agent.py`) builds AI project context on top of these tools; Phase 8A adds
+> the `build` orchestration tool for multi-object scene-aware construction, Phase 8B adds the
+> `plan_build` structured planning tool, Phase 8D adds `edit_build`, `recent_build_context`, and
+> `delete_instance` for iterative refinement, Phase 9A adds `analyze_scene` for bounded,
+> deterministic scene summaries, and Phase 9B adds `decompose_intent` for natural-language
+> build/edit intent decomposition.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -79,6 +81,12 @@
 >   instances, class counts, and query-relevant objects. It is Agent-side orchestration: the model
 >   sees only the compact summary, not the individual inspection calls. It does not change the
 >   project.
+> - **Implemented (Phase 9B):** `decompose_intent` is a **read-only intent-decomposition tool**. It
+>   takes a natural-language build/edit request and an optional `scene_summary`, then returns a
+>   structured, bounded plan containing only actions the current toolset can perform. The plan
+>   includes the goal, action type, reference objects, required actions (with `tool`, `arguments`,
+>   `reason`, and `depends_on`), dependencies, spatial constraints, verification criteria, and any
+>   unsupported capabilities. It feeds the existing `plan_build` tool and never changes the project.
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -476,6 +484,36 @@ as a one-shot flag. The one-shot CLI seeds the id as known before execution. Exi
   computer vision.
 
 `analyze_scene` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
+
+### decompose_intent (Phase 9B)
+
+- **Purpose:** Translate a natural-language build/edit request into a structured, bounded
+  execution plan that uses only tools RBXForge already implements.
+- **Execution model:** this tool is **Agent-side orchestration**. It is a pure local function that
+  inspects the request (and an optional `scene_summary` from `analyze_scene`) and returns a plan
+  dict. No WebSocket `request` is produced.
+- **Inputs (schema, validated before sending):**
+  - `request` — required non-empty string (max 500 chars). The user's natural-language goal.
+  - `scene_summary` — optional object. The `result` dict from a prior `analyze_scene` call; used to
+    resolve references like "the house" or "this room".
+- **Plan contents:**
+  - **goal** — the original request restated.
+  - **action** — `build`, `edit`, `ambiguous`, or `unsupported`.
+  - **reference_objects** — existing scene objects the request refers to.
+  - **required_actions** — bounded list of concrete actions (max 5). Each entry has `tool`,
+    `arguments`, `reason`, and `depends_on`.
+  - **dependencies** — ordering constraints (list of prior-step indices per action).
+  - **spatial_constraints** — intended placement relative to references (e.g. "build near
+    SpawnLocation", "garage adjacent to House").
+  - **verification_criteria** — checks the final state should satisfy.
+  - **unsupported_capabilities** — requested capabilities the current toolset cannot perform
+    (e.g., particles, terrain, lighting).
+- **Bounded guarantees:** plans never exceed 5 steps, only reference implemented tools, and
+  unsupported/ambiguous requests are rejected with a clear note instead of being hallucinated.
+- **Non-goals:** `decompose_intent` is not a general planner, does not execute actions, does not
+  change the project, and does not use a large language model.
+
+`decompose_intent` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
 
 ## Conceptual Tool List
 

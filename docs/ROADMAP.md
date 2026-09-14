@@ -625,6 +625,59 @@ helps the model plan and edit builds in larger, more complex Roblox projects.
 **Explicitly NOT included:** computer vision, arbitrary code execution,
 unrestricted traversal, or a separate autonomous-agent framework.
 
+### Phase 9B — Natural-Language Build Intent and Task Decomposition
+
+> **Status:** Done. `decompose_intent` translates higher-level build/edit
+> requests into structured, bounded execution plans that use only the tools
+> RBXForge already implements. It identifies the requested outcome, relevant
+> existing objects, required changes, dependencies, spatial constraints,
+> verification criteria, and unsupported capabilities.
+
+**Goal:** let RBXForge understand vague natural-language build/edit goals
+("build a small modern shop here", "turn this room into a weapons shop",
+"add a garage to the existing house") and turn them into concrete, bounded
+plans before execution.
+
+**Deliverables:**
+
+- **`decompose_intent` tool:** a read-only, Agent-side orchestration tool that
+  takes a natural-language `request` and an optional `scene_summary` (from
+  `analyze_scene`) and returns a structured plan.
+- **Plan contents:**
+  - **Goal** — the original request restated.
+  - **Action type** — `build`, `edit`, `ambiguous`, or `unsupported`.
+  - **Reference objects** — existing scene objects the request refers to.
+  - **Required actions** — bounded list (max 5) of concrete tool calls
+    (`create_part`, `create_script`, `modify_instance`, `insert_asset`, etc.)
+    with arguments, reason, and `depends_on` indices.
+  - **Dependencies** — ordering constraints between actions.
+  - **Spatial constraints** — intended placement relative to references.
+  - **Verification criteria** — checks the final state should satisfy.
+  - **Unsupported capabilities** — requested things the current toolset cannot
+    do (e.g., particles, terrain, lighting) so they are not hallucinated.
+- **Lightweight and rule-based:** no new autonomous-agent framework; the
+  intent layer sits alongside the existing `plan_build` tool and feeds it
+  validated steps.
+- **Bounded and safe:** plans are capped at five steps, only use implemented
+  tools, and unsupported/ambiguous requests are rejected with a clear note.
+
+**Verification criteria:**
+
+- Automated tests cover simple build intent, edit intent, ambiguous intent,
+  scene-dependent intent, multi-object goals, unsupported requests, dependency
+  ordering, spatial constraints, verification criteria, bounded plan generation,
+  and Agent integration where `analyze_scene` → `decompose_intent` → `build` →
+  `plan_build` → execution succeeds.
+- The intent layer never invents unsupported capabilities, never changes the
+  project, and never produces unbounded plans.
+
+**Dependencies:** Phases 9A and 8B.
+
+**Explicitly NOT included:** arbitrary code execution, unrestricted deletion,
+asset purchasing, unbounded planning loops, a separate autonomous-agent
+framework, or natural-language understanding backed by a large model (the
+layer is intentionally lightweight and deterministic).
+
 ---
 
 ## No Dates
@@ -650,4 +703,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
 | Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default; 7D verification done: after `insert_asset` the Agent automatically verifies the placed instance with `inspect_instance` and fails closed on mismatch/missing/timeout, and the plugin defends against silent parenting failures, duplicate-name exhaustion, and inconsistent paths) |
-| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built. 8D iterative build editing done: lightweight `recent_build_context` persists across requests, `edit_build` activates edit mode, `delete_instance` removes objects from the recent build context, and the Agent verifies modified/created/deleted paths before reporting success. 9A robust scene understanding done: `analyze_scene` returns a bounded, deterministic summary of landmarks, models, groups, class counts, and query-relevant objects so the model can understand larger scenes before acting) |
+| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built. 8D iterative build editing done: lightweight `recent_build_context` persists across requests, `edit_build` activates edit mode, `delete_instance` removes objects from the recent build context, and the Agent verifies modified/created/deleted paths before reporting success. 9A robust scene understanding done: `analyze_scene` returns a bounded, deterministic summary of landmarks, models, groups, class counts, and query-relevant objects so the model can understand larger scenes before acting. 9B natural-language build intent done: `decompose_intent` translates higher-level build/edit requests into structured, bounded execution plans that use only the current toolset and explicitly report unsupported capabilities) |

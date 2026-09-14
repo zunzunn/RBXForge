@@ -79,6 +79,8 @@ work in Roblox Studio**.
 - Choose a plan that fits the existing architecture.
 - Prefer reusing existing systems over duplicating them.
 - Keep the change as small as the request allows.
+- For vague natural-language build/edit goals, use `decompose_intent` after
+  `analyze_scene` to produce a structured bounded plan before executing it.
 
 ### Execute
 

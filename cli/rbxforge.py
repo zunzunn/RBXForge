@@ -58,6 +58,12 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   optionally objects matching a query, so the model can understand larger
   scenes without repeated low-level inspection calls. It is read-only and
   stays within strict depth/result/size limits.
+- decompose_intent (Phase 9B) translates natural-language build/edit goals
+  into a structured, bounded execution plan that uses only tools RBXForge
+  already implements. It identifies the requested outcome, relevant existing
+  objects, required changes, dependencies, spatial constraints, verification
+  criteria, and unsupported capabilities. It is read-only and never changes
+  the project.
   It never allows unbounded planning, arbitrary code execution, or
   unrestricted deletion.
 
@@ -1218,6 +1224,71 @@ def analyze_scene_tool():
     )
 
 
+# Phase 9B: natural-language build intent decomposition. ``decompose_intent``
+# takes a user request and an optional scene summary and returns a structured,
+# bounded plan containing only actions the current toolset can perform.
+DECOMPOSE_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "request": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 500,
+        },
+        "scene_summary": {
+            "type": "object",
+        },
+    },
+    "required": ["request"],
+}
+
+
+def decompose_intent_tool():
+    """Build the decompose_intent tool (Phase 9B).
+
+    ``decompose_intent`` translates a natural-language build/edit request into
+    a structured, bounded execution plan. It identifies the goal, relevant
+    existing objects, required changes, dependencies between actions, spatial
+    constraints, verification criteria, and unsupported capabilities. The plan
+    contains only actions that the current toolset can actually perform
+    (create_part, modify_instance, insert_asset, etc.). It is read-only and
+    never changes the project.
+    """
+
+    def run(rbx, params, timeout):
+        request = params.get("request", "")
+        scene_summary = params.get("scene_summary") or {}
+        intent_mod = _import_intent()
+        if intent_mod is None:
+            rbx.log("decompose_intent failed: intent module unavailable")
+            return False
+        output = intent_mod.decompose_intent(request, scene_summary)
+        result = output.get("result") or {}
+        rbx.log(
+            "decompose_intent OK: action={0}, steps={1}, unsupported={2}".format(
+                result.get("action"),
+                len(result.get("required_actions") or []),
+                len(result.get("unsupported_capabilities") or []),
+            )
+        )
+        return output
+
+    return Tool(
+        "decompose_intent",
+        "Translate a natural-language build or edit request into a structured, "
+        "bounded execution plan using only tools RBXForge already implements. "
+        "Provide the request text and (optionally) a scene_summary from "
+        "analyze_scene. The result contains: goal, action type, reference "
+        "objects, required_actions (each with tool/arguments/reason/depends_on), "
+        "dependencies, spatial_constraints, verification_criteria, and any "
+        "unsupported_capabilities. Use this after analyze_scene and before "
+        "build/plan_build or edit_build to turn a vague request into concrete "
+        "steps. This tool is read-only and never changes the project.",
+        DECOMPOSE_INTENT_SCHEMA,
+        run,
+    )
+
+
 # Creator Store asset search (Phase 7A). `query` is required and must be a
 # non-empty string; `asset_type` is an optional strict allowlist (the official
 # searchCategoryType values); `max_results` is optional (the CLI applies the
@@ -1864,6 +1935,7 @@ def default_registry():
     registry.register(recent_build_context_tool())
     registry.register(delete_instance_tool())
     registry.register(analyze_scene_tool())
+    registry.register(decompose_intent_tool())
     return registry
 
 
@@ -2004,6 +2076,31 @@ def _import_agent():
         try:
             import agent  # reload after cli/ was added to sys.path
             return agent
+        except ImportError:
+            return None
+
+
+def _import_intent():
+    """Lazily import cli/intent.py and return the module (or None).
+
+    Mirrors ``_import_agent``: works both when this file runs as a script and
+    when it is loaded in-process by tests. The import is lazy so plain CLI use
+    never loads the intent-decomposition layer unless a decompose_intent call
+    happens.
+    """
+    import os
+    import sys
+
+    try:
+        import intent
+        return intent
+    except ImportError:
+        here = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        try:
+            import intent  # reload after cli/ was added to sys.path
+            return intent
         except ImportError:
             return None
 

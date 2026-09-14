@@ -22,7 +22,11 @@
 >   set of changes, restricts deletion to recent build objects, and verifies modified/added/removed
 >   paths before reporting success. Phase 9A adds `analyze_scene` as a pure Agent-side
 >   orchestration tool: it reuses `inspect_hierarchy` / `find_instances` internally but those
->   internal requests are not surfaced to the model; only the compact summary is returned.
+>   internal requests are not surfaced to the model; only the compact summary is returned. Phase 9B
+> adds `decompose_intent` as another pure Agent-side orchestration tool: it turns a
+> natural-language build/edit request and an optional scene summary into a structured, bounded
+> execution plan containing only actions the current toolset can perform; no internal inspection
+> calls are surfaced to the model.
 > - **Deliberate exception (Phase 7A/7B):** `asset_search` and `recommend_assets` are registered
 >   tools but are **not** dispatched through the plugin. They execute as **local HTTP calls** to
 >   the Open Cloud Creator Store API from `cli/roblox_assets.py` / `cli/asset_ranking.py`, so they
@@ -234,6 +238,7 @@ Implemented tools and their `params`:
 | `recent_build_context` | none — **Agent-side context read only, no `request` message** | `{ context: [{ path, name, class, ... }] }` (lightweight context of objects from the most recent successful build) |
 | `delete_instance` | `path` (required non-empty string, full path from Workspace) | `{ path, name, className }` |
 | `analyze_scene` | `depth` (optional integer, `1..6`, default `3`), `max_nodes` (optional integer, `1..500`, default `200`), `query` (optional non-empty string) — **Agent-side orchestration only, no `request` message** | `{ landmarks, major_models, groups, class_counts, relevant_objects, truncated, node_count }` (bounded summary of the Workspace) |
+| `decompose_intent` | `request` (required non-empty string, max 500 chars), `scene_summary` (optional object) — **Agent-side orchestration only, no `request` message** | `{ goal, action, reference_objects, required_actions, dependencies, spatial_constraints, verification_criteria, unsupported_capabilities }` (structured, bounded build/edit plan) |
 
 `inspect_hierarchy` example request:
 
@@ -580,11 +585,11 @@ Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.
 
-**Phase 7A/7B/8A/8B/8D/9A exception (`asset_search`, `recommend_assets`, `build`, `plan_build`,
-`edit_build`, `recent_build_context`, `analyze_scene`):** these tools are registered and
-schema-validated exactly like the others, but their execution **does not produce a WebSocket
-`request`**. `asset_search` and `recommend_assets` make local HTTP `POST`s to the Open Cloud
-Creator Store API from `cli/roblox_assets.py` (search) and rank purely in-process in
+**Phase 7A/7B/8A/8B/8D/9A/9B exception (`asset_search`, `recommend_assets`, `build`, `plan_build`,
+`edit_build`, `recent_build_context`, `analyze_scene`, `decompose_intent`):** these tools are
+registered and schema-validated exactly like the others, but their execution **does not produce
+a WebSocket `request`**. `asset_search` and `recommend_assets` make local HTTP `POST`s to the
+Open Cloud Creator Store API from `cli/roblox_assets.py` (search) and rank purely in-process in
 `cli/asset_ranking.py` (recommendation — no extra API calls beyond the search; no robot changes
 to Studio). `build`, `plan_build`, and `edit_build` are Agent-side orchestration only: they
 activate multi-object build mode, structured planning, or iterative edit mode and raise the
@@ -593,6 +598,9 @@ returns the lightweight list of objects from the most recent successful build. `
 (Phase 9A) is Agent-side orchestration only: it calls `inspect_hierarchy` and optionally
 `find_instances` on the raw connection, compiles a compact bounded summary, and returns only the
 summary to the model — the internal inspection calls are not exposed as separate tool results.
+`decompose_intent` (Phase 9B) is Agent-side orchestration only: it is a pure local function that
+uses the request text and an optional scene summary to produce a structured, bounded plan; no
+plugin request is made.
 Their structured result is returned directly (and logged / shown to the agent); there is no plugin
 handler and no `response` message.
 `insert_asset` (Phase 7C/7D) and `delete_instance` (Phase 8D) are the counterparts that **do**
@@ -624,9 +632,9 @@ Not implemented; listed as future direction:
   `delete_instance`) plus the local-HTTP `asset_search` (Phase 7A), `recommend_assets`
   (Phase 7B), and the Agent-side orchestration/context tools `build` (Phase 8A),
   `plan_build` (Phase 8B), `edit_build` / `recent_build_context` (Phase 8D),
-  `analyze_scene` (Phase 9A), which are not Studio operations at all. Other
-  object/script/UI operations and generalized search (class type / property value / parent
-  scope) are planned.
+  `analyze_scene` (Phase 9A), and `decompose_intent` (Phase 9B), which are not
+  Studio operations at all. Other object/script/UI operations and generalized search
+  (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
   `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`; only identity,
   path, and a small allowlisted property set by `inspect_instance`); no indexing, spatial

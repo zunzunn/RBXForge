@@ -44,6 +44,12 @@ def load_agent_module():
 # module scope) so the test doubles below can subclass its classes.
 load_agent_module()
 
+# Phase 9B: make the repository root importable so ``cli.intent`` can be
+# imported directly (the agent bootstrap loads its siblings under different
+# top-level module names).
+sys.path.insert(0, ROOT)
+import cli.intent as intent  # noqa: E402
+
 
 # --------------------------------------------------------------------------- #
 # Test doubles
@@ -150,10 +156,10 @@ def scenario_tool_definitions_sent_to_ai():
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
     assert names == ["analyze_scene", "asset_search", "build", "create_part",
-                     "create_script", "delete_instance", "edit_build",
-                     "find_instances", "insert_asset", "inspect_hierarchy",
-                     "inspect_instance", "modify_instance", "plan_build",
-                     "recent_build_context", "recommend_assets"], names
+                     "create_script", "decompose_intent", "delete_instance",
+                     "edit_build", "find_instances", "insert_asset",
+                     "inspect_hierarchy", "inspect_instance", "modify_instance",
+                     "plan_build", "recent_build_context", "recommend_assets"], names
     asset_search = defs[1]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
     assert asset_search["parameters"]["type"] == "object"
@@ -1519,13 +1525,13 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 15, tools
+    assert isinstance(tools, list) and len(tools) == 16, tools
     names = [tool["name"] for tool in tools]
     assert names == ["analyze_scene", "asset_search", "build", "create_part",
-                     "create_script", "delete_instance", "edit_build",
-                     "find_instances", "insert_asset", "inspect_hierarchy",
-                     "inspect_instance", "modify_instance", "plan_build",
-                     "recent_build_context", "recommend_assets"], names
+                     "create_script", "decompose_intent", "delete_instance",
+                     "edit_build", "find_instances", "insert_asset",
+                     "inspect_hierarchy", "inspect_instance", "modify_instance",
+                     "plan_build", "recent_build_context", "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = [tool for tool in tools if tool["name"] == "create_part"][0]
@@ -2175,6 +2181,170 @@ def scenario_analyze_scene():
     print("OK  analyze_scene integrates into the Agent loop before build")
 
 
+def scenario_natural_language_build_intent():
+    """Phase 9B: a vague natural-language build request is decomposed into a
+    structured, bounded plan, then validated with plan_build and executed in
+    build mode. The plan only contains actions the current toolset supports."""
+    mod = load_agent_module()
+
+    # Scene summary returned by analyze_scene (synthetic, but shaped like the
+    # real tool output).
+    scene_summary = {
+        "total_nodes": 5,
+        "truncated": False,
+        "landmarks": [
+            {"name": "SpawnLocation", "class": "SpawnLocation",
+             "path": "Workspace/SpawnLocation"},
+        ],
+        "models": [
+            {"name": "House", "class": "Model", "path": "Workspace/House",
+             "child_count": 4},
+        ],
+        "groups": [],
+        "class_counts": {"SpawnLocation": 1, "Model": 1, "Part": 1},
+        "relevant": [],
+    }
+
+    # Decompose the request using the same module the tool uses.
+    plan = intent.decompose_intent("build a small modern shop here", scene_summary)
+    result = plan["result"]
+    assert result["action"] == "build", result
+    actions = result["required_actions"]
+    assert 1 <= len(actions) <= 5, actions
+
+    # Steps ready for plan_build.
+    plan_steps = [{"tool": a["tool"], "arguments": a["arguments"]} for a in actions]
+
+    # Provider sequence: analyze scene, decompose intent, enter build mode,
+    # submit plan, execute each planned step, then report success.
+    sequence = [
+        json.dumps({"tool": "analyze_scene", "arguments": {}}),
+        json.dumps({
+            "tool": "decompose_intent",
+            "arguments": {
+                "request": "build a small modern shop here",
+                "scene_summary": scene_summary,
+            },
+        }),
+        json.dumps({
+            "tool": "build",
+            "arguments": {"description": "small modern shop near SpawnLocation"},
+        }),
+        json.dumps({
+            "tool": "plan_build",
+            "arguments": {
+                "description": "small modern shop near SpawnLocation",
+                "steps": plan_steps,
+            },
+        }),
+    ]
+    for a in actions:
+        sequence.append(json.dumps({
+            "tool": a["tool"],
+            "arguments": a["arguments"],
+        }))
+    sequence.append(json.dumps({
+        "message": "Built a small modern shop near the SpawnLocation.",
+    }))
+
+    # Canned create_part responses, one per planned step, each with a path so
+    # build-mode verification can confirm the instance exists.
+    create_payloads = []
+    verify_map = {}
+    for a in actions:
+        name = a["arguments"]["name"]
+        path = "Workspace/" + name
+        create_payloads.append({
+            "ok": True,
+            "result": {
+                "name": name,
+                "path": path,
+                "parent_path": "Workspace",
+                "position": a["arguments"]["position"],
+                "size": a["arguments"]["size"],
+                "color": a["arguments"].get("color", "gray"),
+            },
+        })
+        verify_map[path] = {
+            "ok": True,
+            "result": {
+                "name": name,
+                "className": "Part",
+                "path": path,
+                "parent_path": "Workspace",
+                "properties": {},
+            },
+        }
+
+    # Hierarchy tree used by analyze_scene.
+    tree = [
+        {"name": "Workspace", "className": "Workspace", "children": [
+            {"name": "SpawnLocation", "className": "SpawnLocation"},
+            {"name": "Baseplate", "className": "Part"},
+            {"name": "House", "className": "Model", "children": [
+                {"name": "Wall", "className": "Part"},
+            ]},
+        ]},
+    ]
+
+    def count_nodes(nodes):
+        total = 0
+        def walk(node):
+            nonlocal total
+            total += 1
+            for child in node.get("children", []):
+                walk(child)
+        for node in nodes:
+            walk(node)
+        return total
+
+    hierarchy_payload = {
+        "ok": True,
+        "result": {
+            "root": "Workspace",
+            "depth": 3,
+            "count": count_nodes(tree),
+            "truncated": False,
+            "tree": tree,
+        },
+    }
+
+    rbx = BuildFakeRBX(
+        payloads={
+            "inspect_hierarchy": hierarchy_payload,
+            "find_instances": {
+                "ok": True,
+                "result": {
+                    "query": "SpawnLocation",
+                    "max_results": 10,
+                    "total": 1,
+                    "count": 1,
+                    "truncated": False,
+                    "matches": [
+                        {"name": "SpawnLocation", "className": "SpawnLocation",
+                         "path": "Workspace/SpawnLocation"},
+                    ],
+                },
+            },
+        },
+        per_tool_counts={"create_part": create_payloads},
+        verify_map=verify_map,
+    )
+
+    result = make_agent(SequenceProvider(sequence), rbx=rbx).run(
+        "build a small modern shop here"
+    )
+    assert result.ok is True, result
+    step_tools = [s["tool"] for s in result.steps]
+    assert "analyze_scene" in step_tools, step_tools
+    assert "decompose_intent" in step_tools, step_tools
+    assert "build" in step_tools, step_tools
+    assert "plan_build" in step_tools, step_tools
+    assert sum(1 for s in result.steps if s["tool"] == "create_part") == len(actions), step_tools
+    assert all(s["ok"] for s in result.steps), result.steps
+    print("OK  natural-language build intent decomposes and executes through Agent")
+
+
 def scenario_max_tool_calls_enforced():
     """The loop must never exceed max_tool_calls executed tools per request.
     Five successful inspection calls exhaust the budget and yield a clear
@@ -2340,6 +2510,7 @@ def main():
     scenario_intelligent_build_planning()
     scenario_iterative_build_editing()
     scenario_analyze_scene()
+    scenario_natural_language_build_intent()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

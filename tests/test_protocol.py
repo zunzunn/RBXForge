@@ -1254,10 +1254,10 @@ def scenario_tool_registry_metadata():
     tools = registry.list()
     assert [t.name for t in tools] == [
         "analyze_scene", "asset_search", "build", "create_part",
-        "create_script", "delete_instance", "edit_build",
-        "find_instances", "insert_asset", "inspect_hierarchy",
-        "inspect_instance", "modify_instance", "plan_build",
-        "recent_build_context", "recommend_assets",
+        "create_script", "decompose_intent", "delete_instance",
+        "edit_build", "find_instances", "insert_asset",
+        "inspect_hierarchy", "inspect_instance", "modify_instance",
+        "plan_build", "recent_build_context", "recommend_assets",
     ], tools
 
     tool = registry.get("create_part")
@@ -1433,10 +1433,20 @@ def scenario_tool_registry_metadata():
     assert nodes_prop["minimum"] == 1
     assert nodes_prop["maximum"] == mod.MAX_ANALYZE_SCENE_MAX_NODES
 
+    decomposer = registry.get("decompose_intent")
+    assert decomposer is not None
+    assert isinstance(decomposer.description, str) and decomposer.description
+    assert decomposer.input_schema["type"] == "object"
+    assert set(decomposer.input_schema["required"]) == {"request"}
+    assert decomposer.input_schema["properties"]["request"] == {
+        "type": "string", "min_length": 1, "max_length": 500,
+    }
+    assert decomposer.input_schema["properties"]["scene_summary"]["type"] == "object"
+
     print("OK  registry registers create_part, create_script, modify_instance, "
           "find_instances, inspect_hierarchy, inspect_instance, insert_asset, "
           "build, plan_build, edit_build, recent_build_context, "
-          "delete_instance, and analyze_scene with metadata")
+          "delete_instance, analyze_scene, and decompose_intent with metadata")
 
 
 def scenario_tool_validation():

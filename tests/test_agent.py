@@ -151,7 +151,8 @@ def scenario_tool_definitions_sent_to_ai():
     names = [entry["name"] for entry in defs]
     assert names == ["asset_search", "build", "create_part", "create_script",
                      "find_instances", "insert_asset", "inspect_hierarchy",
-                     "inspect_instance", "modify_instance", "recommend_assets"], names
+                     "inspect_instance", "modify_instance", "plan_build",
+                     "recommend_assets"], names
     asset_search = defs[0]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
     assert asset_search["parameters"]["type"] == "object"
@@ -1209,6 +1210,276 @@ def scenario_scene_aware_building():
     print("OK  scene-aware build raises the tool-call budget in build mode")
 
 
+def scenario_intelligent_build_planning():
+    """Phase 8B: the model submits a structured, bounded plan via plan_build
+    inside build mode. The Agent validates the plan, tracks execution, skips
+    redundant scene inspections, and produces a clear natural-language summary
+    of what was built. Invalid plans and partial failures are reported as
+    build failures."""
+    mod = load_agent_module()
+    registry = mod.rbxforge.default_registry()
+    assert "plan_build" in [t.name for t in registry.list()]
+
+    spawn_payload = {
+        "ok": True,
+        "result": {
+            "name": "SpawnLocation",
+            "className": "SpawnLocation",
+            "path": "Workspace/SpawnLocation",
+            "parent_path": "Workspace",
+            "properties": {"Position": {"x": 0, "y": 0, "z": 0}},
+        },
+    }
+
+    def part_payload(name, path=None):
+        return {
+            "ok": True,
+            "result": {
+                "name": name,
+                "parent_path": "Workspace",
+                "path": path or "Workspace/" + name,
+                "position": {"x": 5, "y": 0.5, "z": 0},
+                "size": {"x": 2, "y": 2, "z": 2},
+                "color": "gray",
+            },
+        }
+
+    build_call = json.dumps({
+        "tool": "build",
+        "arguments": {
+            "description": "small shop near the SpawnLocation",
+            "reference_path": "Workspace.SpawnLocation",
+        },
+    })
+    plan_call = json.dumps({
+        "tool": "plan_build",
+        "arguments": {
+            "description": "small shop near the SpawnLocation",
+            "reference_path": "Workspace.SpawnLocation",
+            "steps": [
+                {"tool": "inspect_instance", "arguments": {"path": "Workspace.SpawnLocation"}},
+                {"tool": "create_part", "arguments": {
+                    "name": "ShopFloor",
+                    "position": {"x": 5, "y": 0.5, "z": 0},
+                    "size": {"x": 8, "y": 1, "z": 6},
+                    "color": "gray",
+                }},
+                {"tool": "create_part", "arguments": {
+                    "name": "ShopWall",
+                    "position": {"x": 5, "y": 3, "z": -3},
+                    "size": {"x": 8, "y": 5, "z": 1},
+                    "color": "gray",
+                }},
+            ],
+        },
+    })
+    inspect_spawn = json.dumps({
+        "tool": "inspect_instance",
+        "arguments": {"path": "Workspace.SpawnLocation"},
+    })
+    create_floor = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopFloor",
+            "position": {"x": 5, "y": 0.5, "z": 0},
+            "size": {"x": 8, "y": 1, "z": 6},
+            "color": "gray",
+        },
+    })
+    create_wall = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopWall",
+            "position": {"x": 5, "y": 3, "z": -3},
+            "size": {"x": 8, "y": 5, "z": 1},
+            "color": "gray",
+        },
+    })
+    final_report = json.dumps({
+        "message": "Built a small shop near the SpawnLocation.",
+    })
+
+    verify_ok = {
+        "Workspace/ShopFloor": {
+            "ok": True,
+            "result": {
+                "name": "ShopFloor",
+                "className": "Part",
+                "path": "Workspace/ShopFloor",
+            },
+        },
+        "Workspace/ShopWall": {
+            "ok": True,
+            "result": {
+                "name": "ShopWall",
+                "className": "Part",
+                "path": "Workspace/ShopWall",
+            },
+        },
+    }
+
+    # 1) Successful plan: build, plan_build, execute planned steps, final report.
+    provider = SequenceProvider([
+        build_call,
+        plan_call,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        final_report,
+    ])
+    rbx = BuildFakeRBX(
+        {"inspect_instance": spawn_payload},
+        verify_map=verify_ok,
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
+        },
+    )
+    result = make_agent(provider, rbx=rbx).run(
+        "build a small shop near the SpawnLocation"
+    )
+    assert result.ok is True, result
+    assert result.message == "Built a small shop near the SpawnLocation.", result
+    assert [step["tool"] for step in result.steps] == [
+        "build", "plan_build", "inspect_instance", "create_part", "create_part",
+        "inspect_instance", "inspect_instance",
+    ], [step["tool"] for step in result.steps]
+    assert all(step["ok"] for step in result.steps), result.steps
+    # Scene inspection happened once before execution; verification twice after.
+    assert rbx.requests[0] == ("inspect_instance", {"path": "Workspace.SpawnLocation"})
+    assert rbx.requests[1] == ("create_part", {
+        "name": "ShopFloor",
+        "position": {"x": 5, "y": 0.5, "z": 0},
+        "size": {"x": 8, "y": 1, "z": 6},
+        "color": "gray",
+    })
+    assert rbx.requests[2] == ("create_part", {
+        "name": "ShopWall",
+        "position": {"x": 5, "y": 3, "z": -3},
+        "size": {"x": 8, "y": 5, "z": 1},
+        "color": "gray",
+    })
+    print("OK  intelligent build plan: structured, bounded, executed, verified")
+
+    # 2) plan_build outside build mode is rejected immediately.
+    provider_outside = SequenceProvider([plan_call])
+    rbx_outside = BuildFakeRBX({})
+    result_outside = make_agent(provider_outside, rbx=rbx_outside).run(
+        "plan a shop without entering build mode"
+    )
+    assert result_outside.ok is False, result_outside
+    assert result_outside.error["code"] == "invalid_plan", result_outside
+    assert [step["tool"] for step in result_outside.steps] == ["plan_build"], result_outside.steps
+    print("OK  plan_build outside build mode rejected as invalid_plan")
+
+    # 3) plan_build with a disallowed tool is rejected.
+    bad_plan = json.dumps({
+        "tool": "plan_build",
+        "arguments": {
+            "description": "bad plan",
+            "steps": [
+                {"tool": "asset_search", "arguments": {"query": "tree"}},
+            ],
+        },
+    })
+    provider_bad = SequenceProvider([build_call, bad_plan, final_report])
+    rbx_bad = BuildFakeRBX({})
+    result_bad = make_agent(provider_bad, rbx=rbx_bad).run("bad plan")
+    assert result_bad.ok is False, result_bad
+    assert result_bad.error["code"] == "build_failed", result_bad
+    plan_step = result_bad.steps[1]
+    assert plan_step["tool"] == "plan_build" and plan_step["ok"] is False, plan_step
+    print("OK  plan_build with disallowed tool rejected")
+
+    # 4) plan_build with duplicate consecutive steps is rejected.
+    duplicate_plan = json.dumps({
+        "tool": "plan_build",
+        "arguments": {
+            "description": "duplicate plan",
+            "steps": [
+                {"tool": "inspect_instance", "arguments": {"path": "Workspace.SpawnLocation"}},
+                {"tool": "inspect_instance", "arguments": {"path": "Workspace.SpawnLocation"}},
+            ],
+        },
+    })
+    provider_dup = SequenceProvider([build_call, duplicate_plan, final_report])
+    rbx_dup = BuildFakeRBX({})
+    result_dup = make_agent(provider_dup, rbx=rbx_dup).run("duplicate plan")
+    assert result_dup.ok is False, result_dup
+    assert result_dup.error["code"] == "build_failed", result_dup
+    print("OK  plan_build with duplicate consecutive steps rejected")
+
+    # 5) plan_build with too many steps is rejected.
+    oversized_plan = json.dumps({
+        "tool": "plan_build",
+        "arguments": {
+            "description": "oversized plan",
+            "steps": [
+                {"tool": "create_part", "arguments": {"name": "P{0}".format(i), "position": {"x": i, "y": 0, "z": 0}, "size": {"x": 1, "y": 1, "z": 1}}}
+                for i in range(6)
+            ],
+        },
+    })
+    provider_big = SequenceProvider([build_call, oversized_plan, final_report])
+    rbx_big = BuildFakeRBX({})
+    result_big = make_agent(provider_big, rbx=rbx_big).run("oversized plan")
+    assert result_big.ok is False, result_big
+    assert result_big.error["code"] == "build_failed", result_big
+    print("OK  plan_build with more than 5 steps rejected")
+
+    # 6) Redundant inspect_instance is skipped without a second plugin request.
+    provider_skip = SequenceProvider([
+        build_call,
+        plan_call,
+        inspect_spawn,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        final_report,
+    ])
+    rbx_skip = BuildFakeRBX(
+        {"inspect_instance": spawn_payload},
+        verify_map=verify_ok,
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
+        },
+    )
+    result_skip = make_agent(provider_skip, rbx=rbx_skip).run(
+        "build a small shop near the SpawnLocation"
+    )
+    assert result_skip.ok is True, result_skip
+    # The second inspect_instance step was skipped from cache but still recorded.
+    inspect_steps = [s for s in result_skip.steps if s["tool"] == "inspect_instance"]
+    assert len(inspect_steps) == 4, inspect_steps  # 2 model-driven (1 skipped) + 2 verify
+    assert all(s["ok"] for s in inspect_steps), inspect_steps
+    # Only one actual plugin request for the SpawnLocation inspection.
+    spawn_requests = [r for r in rbx_skip.requests if r == ("inspect_instance", {"path": "Workspace.SpawnLocation"})]
+    assert len(spawn_requests) == 1, spawn_requests
+    print("OK  redundant inspect_instance skipped in build mode")
+
+    # 7) Fallback summary when the model's final report is empty.
+    provider_summary = SequenceProvider([
+        build_call,
+        plan_call,
+        inspect_spawn,
+        create_floor,
+        create_wall,
+        json.dumps({"message": ""}),
+    ])
+    rbx_summary = BuildFakeRBX(
+        {"inspect_instance": spawn_payload},
+        verify_map=verify_ok,
+        per_tool_counts={
+            "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
+        },
+    )
+    result_summary = make_agent(provider_summary, rbx=rbx_summary).run(
+        "build a small shop near the SpawnLocation"
+    )
+    assert result_summary.ok is True, result_summary
+    assert "ShopFloor" in result_summary.message and "ShopWall" in result_summary.message, result_summary.message
+    print("OK  empty final report falls back to generated build summary")
+
+
 def scenario_groq_compat_agent_passes_tools():
     """Agent-side half of the GPT-OSS/Groq compatibility fix: when the provider
     advertises ``supports_tools`` (Groq), the agent hands it the registry's tool
@@ -1238,11 +1509,12 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 10, tools
+    assert isinstance(tools, list) and len(tools) == 11, tools
     names = [tool["name"] for tool in tools]
     assert names == ["asset_search", "build", "create_part", "create_script",
                      "find_instances", "insert_asset", "inspect_hierarchy",
-                     "inspect_instance", "modify_instance", "recommend_assets"], names
+                     "inspect_instance", "modify_instance", "plan_build",
+                     "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = [tool for tool in tools if tool["name"] == "create_part"][0]
@@ -1441,6 +1713,7 @@ def main():
     scenario_create_script_action_tool()
     scenario_insert_asset_action_tool()
     scenario_scene_aware_building()
+    scenario_intelligent_build_planning()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

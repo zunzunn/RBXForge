@@ -42,8 +42,11 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   shop near the SpawnLocation"), inspects the scene, executes multiple
   create_part / create_script / insert_asset / modify_instance steps in a
   bounded loop, and the agent verifies every created path before reporting
-  success. It never allows unbounded planning, arbitrary code execution, or
-  asset deletion.
+  success. plan_build (Phase 8B) makes the planning explicit: the model
+  submits a structured plan of up to 5 validated steps before executing it.
+  The Agent tracks the plan, skips redundant scene inspections, and always
+  reports what was built in plain language. It never allows unbounded
+  planning, arbitrary code execution, or asset deletion.
 
 Standard library only; no external dependencies.
 
@@ -439,9 +442,10 @@ def _validate_value(value, spec, path):
     """Validate one value against a schema fragment; returns an error string or None.
 
     The schema is a small JSON-like object with a ``type`` key. Supported types:
-    ``object`` (with ``properties`` and ``required``), ``vec3`` (an object with
-    numeric x, y, z), ``string`` (optionally ``min_length`` / ``enum``),
-    ``number``, and ``boolean``.
+    ``object`` (with ``properties`` and ``required``), ``array`` (with
+    ``items``, ``minItems``, ``maxItems``), ``vec3`` (an object with numeric x,
+    y, z), ``string`` (optionally ``min_length`` / ``enum``), ``number``, and
+    ``boolean``.
     """
     kind = spec.get("type")
     if kind == "object":
@@ -464,6 +468,19 @@ def _validate_value(value, spec, path):
         for key, child in declared.items():
             if key in value:
                 error = _validate_value(value[key], child, path + "." + key)
+                if error is not None:
+                    return error
+    elif kind == "array":
+        if not isinstance(value, list):
+            return path + " must be an array"
+        if "minItems" in spec and len(value) < spec["minItems"]:
+            return path + " must have at least {0} item(s)".format(spec["minItems"])
+        if "maxItems" in spec and len(value) > spec["maxItems"]:
+            return path + " must have at most {0} item(s)".format(spec["maxItems"])
+        item_spec = spec.get("items")
+        if item_spec is not None:
+            for index, item in enumerate(value):
+                error = _validate_value(item, item_spec, path + "[" + str(index) + "]")
                 if error is not None:
                     return error
     elif kind == "vec3":
@@ -1320,6 +1337,128 @@ def build_tool():
     )
 
 
+# Phase 8B: intelligent build planning. ``plan_build`` lets the model submit a
+# structured, bounded construction plan before executing it. The tool validates
+# the plan (allowed tools, max steps, no duplicate consecutive steps) and the
+# Agent loop tracks the plan so it can avoid redundant calls and produce a clear
+# natural-language summary of what was built.
+PLAN_MAX_STEPS = 5
+PLAN_BUILD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 500,
+        },
+        "reference_path": {
+            "type": "string",
+            "min_length": 1,
+        },
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "min_length": 1,
+                    },
+                    "arguments": {"type": "object"},
+                },
+                "required": ["tool", "arguments"],
+            },
+            "minItems": 1,
+            "maxItems": PLAN_MAX_STEPS,
+        },
+    },
+    "required": ["description", "steps"],
+}
+
+# Tools that may appear inside a plan. Plans are not allowed to call
+# asset_search/recommend_assets directly (those should run before build mode) or
+# the orchestration tools themselves.
+PLAN_ALLOWED_TOOLS = frozenset({
+    "create_part",
+    "create_script",
+    "insert_asset",
+    "modify_instance",
+    "inspect_instance",
+    "find_instances",
+    "inspect_hierarchy",
+})
+
+
+def plan_build_tool():
+    """Build the intelligent build-planning tool (Phase 8B).
+
+    ``plan_build`` validates a structured construction plan: it checks that the
+    plan is bounded (at most ``PLAN_BUILD_SCHEMA['properties']['steps']['maxItems']``
+    steps), only uses tools that actually change or read the project, and does
+    not contain obviously redundant consecutive steps. The tool does not execute
+    the plan; execution still goes through the normal tool loop, one step at a
+    time, so every failure is surfaced exactly where it happens.
+    """
+
+    def run(rbx, params, timeout):
+        steps = params.get("steps") or []
+        if not steps:
+            rbx.log("plan_build REJECTED: plan has no steps")
+            return False
+        if len(steps) > PLAN_BUILD_SCHEMA["properties"]["steps"]["maxItems"]:
+            rbx.log(
+                "plan_build REJECTED: plan has {0} steps, max is {1}".format(
+                    len(steps),
+                    PLAN_BUILD_SCHEMA["properties"]["steps"]["maxItems"],
+                )
+            )
+            return False
+        for index, step in enumerate(steps):
+            tool_name = step.get("tool")
+            if tool_name not in PLAN_ALLOWED_TOOLS:
+                rbx.log(
+                    "plan_build REJECTED: step {0} uses disallowed tool {1!r}".format(
+                        index + 1, tool_name
+                    )
+                )
+                return False
+        # Reject obviously redundant consecutive steps (e.g. inspecting the same
+        # path twice in a row).
+        for index in range(1, len(steps)):
+            prev = steps[index - 1]
+            curr = steps[index]
+            if (
+                prev["tool"] == curr["tool"]
+                and prev.get("arguments") == curr.get("arguments")
+            ):
+                rbx.log(
+                    "plan_build REJECTED: steps {0} and {1} are identical".format(
+                        index, index + 1
+                    )
+                )
+                return False
+        rbx.log(
+            "plan_build OK: {0} step(s) for {1!r}".format(
+                len(steps), params["description"]
+            )
+        )
+        return True
+
+    return Tool(
+        "plan_build",
+        "Submit a structured, bounded construction plan before executing it. "
+        "Use this inside build mode (after `build`) to lay out the exact steps "
+        "you intend to run: each step is a tool call with arguments. The plan "
+        "is validated (max 5 steps, only project read/write tools, no duplicate "
+        "consecutive steps) but not executed automatically; you must still call "
+        "each tool yourself. After the plan is accepted, execute the steps in "
+        "order, then send a final report describing what was built in plain "
+        "language.",
+        PLAN_BUILD_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
@@ -1333,6 +1472,7 @@ def default_registry():
     registry.register(recommend_assets_tool())
     registry.register(insert_asset_tool())
     registry.register(build_tool())
+    registry.register(plan_build_tool())
     return registry
 
 

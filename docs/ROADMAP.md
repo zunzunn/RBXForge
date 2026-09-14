@@ -482,6 +482,52 @@ simple garage next to the existing house".
 asset deletion, unbounded planning loops, or generalized code generation beyond
 script creation through the existing `create_script` tool.
 
+### Phase 8B — Intelligent Build Planning
+
+> **Status:** Done. The model submits a structured, bounded construction plan
+> with `plan_build`; the Agent validates it, tracks execution, skips redundant
+> scene inspections, and always reports what was built in plain language.
+
+**Goal:** turn natural-language requests like "build a small shop near the
+SpawnLocation" into explicit, bounded construction plans before any project
+changes happen, so the Agent can execute deterministically and explain the
+result.
+
+**Deliverables:**
+
+- **`plan_build` orchestration tool:** a new registered tool used inside `build`
+  mode. It accepts a `description`, optional `reference_path`, and a bounded
+  `steps` array (max `PLAN_MAX_STEPS` = 5). Each step names a tool and its
+  arguments. The tool validates the plan: steps must use allowed project
+  read/write tools, must not contain duplicate consecutive steps, and must stay
+  within the step limit. It does not execute the plan; execution still goes
+  through the normal tool loop one step at a time.
+- **Plan tracking in the Agent loop:** after `plan_build` succeeds, the Agent
+  remembers the planned steps. As the model executes each tool, the Agent
+  advances through the plan when the actual call matches the next expected step.
+- **Redundant inspection avoidance:** the Agent caches successful
+  `inspect_instance` results during build mode and reuses them when the model
+  asks for the same path again, eliminating unnecessary plugin round-trips.
+- **Natural-language summary:** when the model's final report is empty or
+  missing, the Agent generates a simple fallback summary from the recorded
+  created paths so the user always knows what was built.
+- **Bounded and deterministic:** planning is capped at 5 steps, invalid plans
+  are rejected, and the loop remains bounded by the raised build-mode budget.
+
+**Verification criteria:**
+
+- Automated tests cover successful structured plans, `plan_build` outside build
+  mode, disallowed tools in a plan, duplicate consecutive steps, oversized
+  plans, redundant `inspect_instance` skipping, and fallback summary generation.
+- The Agent rejects invalid plans before executing them and never reports a
+  completed build when the plan or any step fails.
+
+**Dependencies:** Phase 8A.
+
+**Explicitly NOT included:** arbitrary external downloads, asset purchasing,
+asset deletion, unbounded planning loops, or generalized code generation beyond
+script creation through the existing `create_script` tool.
+
 ---
 
 ## No Dates
@@ -507,4 +553,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
 | Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default; 7D verification done: after `insert_asset` the Agent automatically verifies the placed instance with `inspect_instance` and fails closed on mismatch/missing/timeout, and the plugin defends against silent parenting failures, duplicate-name exhaustion, and inconsistent paths) |
-| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`) |
+| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built) |

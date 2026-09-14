@@ -1,13 +1,13 @@
 # RBXForge — Tool System
 
-> **Status:** Ten tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Eleven tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
 > modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B,
-> insert_asset in Phase 7C, build in Phase 8A); the
+> insert_asset in Phase 7C, build in Phase 8A, plan_build in Phase 8B); the
 > rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
 > of these tools; Phase 8A adds the `build` orchestration tool for multi-object scene-aware
-> construction.
+> construction and Phase 8B adds the `plan_build` structured planning tool.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -57,6 +57,10 @@
 >   `insert_asset`, and `modify_instance` into a coherent structure (e.g. a shop near the
 >   SpawnLocation), with a bounded raised tool-call budget and automatic final verification of
 >   every created path. It does not change the project itself.
+> - **Implemented (Phase 8B):** `plan_build` is the **structured planning tool** used inside build
+>   mode. The model submits a bounded list of explicit steps (max 5) before executing them; the
+>   tool validates the plan and the Agent tracks progress, skips redundant scene inspections, and
+>   reports what was built in plain language. It does not change the project itself.
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -329,6 +333,40 @@ as a one-shot flag. The one-shot CLI seeds the id as known before execution. Exi
   the Agent to reuse the existing tool set for multi-object requests.
 
 `build` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
+
+### plan_build (Phase 8B)
+
+- **Purpose:** Submit a **structured, bounded construction plan** inside build mode. Use it after
+  `build` when the model wants to lay out the exact steps it intends to execute before changing the
+  project. It does **not** create anything itself; it validates the plan and lets the Agent track
+  progress.
+- **Execution model:** this tool is **local orchestration only** — no WebSocket message is sent.
+  It is only valid after `build` has activated build mode; outside build mode it is rejected with
+  `invalid_plan`.
+- **Inputs (schema, validated before sending):**
+  - `description` — required, non-empty string (max 500 chars). Mirrors the `build` description.
+  - `reference_path` — optional non-empty string. Mirrors the `build` reference path.
+  - `steps` — required array with `1..PLAN_MAX_STEPS` entries (default max 5). Each entry is an
+    object with:
+    - `tool` — non-empty string naming the tool to call.
+    - `arguments` — object containing the tool arguments.
+- **Plan validation:** the tool rejects plans that:
+  - are empty or exceed `PLAN_MAX_STEPS`,
+  - use tools outside the allowed set (`create_part`, `create_script`, `insert_asset`,
+    `modify_instance`, `inspect_instance`, `find_instances`, `inspect_hierarchy`),
+  - contain two identical consecutive steps.
+- **Agent behavior:** after a valid `plan_build`, the Agent stores the steps and advances its plan
+  index when the model's actual tool call matches the next expected step. Successful
+  `inspect_instance` results are cached during build mode, so a redundant read of the same path is
+  skipped without another plugin round-trip. When the model sends a final report, the Agent verifies
+  every created path as usual. If the final report is empty, the Agent generates a simple summary
+  from the recorded paths (e.g. "Built small shop near the SpawnLocation: ShopFloor and ShopWall.").
+- **Bounded guarantees:** planning is capped at `PLAN_MAX_STEPS`, invalid plans are rejected before
+  execution, and the loop remains bounded by the raised build-mode budget.
+- **Non-goals:** `plan_build` is not a solver or code generator; it only makes the existing build
+  process explicit and verifiable.
+
+`plan_build` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
 
 ## Conceptual Tool List
 

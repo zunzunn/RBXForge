@@ -182,9 +182,9 @@ def parse_agent_reply(text):
     if not isinstance(data, dict):
         raise ToolCallParseError("structured reply must be a JSON object")
     if "message" in data:
-        if isinstance(data["message"], str) and data["message"].strip():
+        if isinstance(data["message"], str):
             return FinalMessage(data["message"].strip())
-        raise ToolCallParseError("a final 'message' must be a non-empty string")
+        raise ToolCallParseError("a final 'message' must be a string")
     if not isinstance(data.get("tool"), str) or not data["tool"].strip():
         raise ToolCallParseError(
             "structured reply must be a tool call (with 'tool' and 'arguments') "
@@ -448,13 +448,15 @@ def build_system_prompt(registry):
         "Use it when the user asks for a structure that requires several "
         "objects (e.g. 'build a small shop near the SpawnLocation' or 'make a "
         "garage next to the house'). Call build first with a clear description "
-        "and optional reference_path, inspect the scene if the position "
-        "depends on existing objects, then execute create_part / create_script "
-        "/ insert_asset / modify_instance for each piece. Action tools do not "
-        "end the loop in build mode. When you are done send a final report; "
-        "the system will verify every created path and fail the build if any "
-        "step failed or any path is missing. Do not use build for single-object "
-        "requests.\n"
+        "and optional reference_path, then submit a structured plan with "
+        "plan_build (Phase 8B): list up to 5 explicit steps using only "
+        "create_part, create_script, insert_asset, modify_instance, or scene "
+        "inspection tools. Inspect the scene if the position depends on "
+        "existing objects, then execute the planned steps. Action tools do not "
+        "end the loop in build mode. When you are done send a final report in "
+        "plain language describing exactly what was built; the system will "
+        "verify every created path and fail the build if any step failed or "
+        "any path is missing. Do not use build for single-object requests.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "
@@ -538,9 +540,10 @@ class AgentResult:
 class Agent:
     """Bounded multi-step agent: prompt -> model -> tool call -> execution -> ...
 
-    Phase 4D; preserves the Phase 3B single-step behavior for simple requests.
-    The loop is bounded per user request by ``max_tool_calls`` (default 5), and
-    only compacted, bounded tool results are ever returned to the model.
+    Phase 4D/8B; preserves the Phase 3B single-step behavior for simple requests
+    and adds scene-aware multi-object build mode with structured planning. The
+    loop is bounded per user request by ``max_tool_calls`` (default 5), and only
+    compacted, bounded tool results are ever returned to the model.
 
     - ``provider``: a Phase 3A ``Provider`` instance (Ollama, mock, ...).
     - ``registry``: the :class:`ToolRegistry` tools are validated and executed
@@ -731,6 +734,30 @@ class Agent:
         info["message"] = "build verified: {0} path(s) confirmed".format(len(paths))
         return True, info
 
+    @staticmethod
+    def _build_summary(build_plan, build_paths):
+        """Phase 8B: produce a simple natural-language summary of a completed
+        build from the recorded created paths. Falls back to the plan
+        description when no paths were recorded."""
+        description = "the build"
+        if build_plan and build_plan.get("description"):
+            description = build_plan["description"]
+        if not build_paths:
+            return "Planned {0} but no objects were created.".format(description)
+        names = []
+        for path in build_paths:
+            # Use the last segment of the path as the object name.
+            segment = path.split("/")[-1]
+            if segment and segment not in names:
+                names.append(segment)
+        if not names:
+            return "Build completed with {0} object(s).".format(len(build_paths))
+        if len(names) == 1:
+            return "Built {0}: {1}.".format(description, names[0])
+        return "Built {0}: {1} and {2}.".format(
+            description, ", ".join(names[:-1]), names[-1]
+        )
+
     def run(self, prompt, **chat_options):
         """Run ``prompt`` through the bounded multi-step loop.
 
@@ -769,8 +796,15 @@ class Agent:
         # the model calls it, the loop enters build mode so multiple action
         # tools can be executed and verified as one coherent build.
         build_mode = False
+        build_plan = None
         build_paths = []
         build_failures = []
+        # Phase 8B: track the accepted plan and how many planned steps have been
+        # executed, plus scene inspections already performed so duplicate reads
+        # can be skipped without a plugin round-trip.
+        planned_steps = []
+        plan_index = 0
+        inspected_paths = {}
         effective_max_tool_calls = self.max_tool_calls
 
         while True:
@@ -851,11 +885,16 @@ class Agent:
                                 "message": "; ".join(messages),
                             },
                         )
+                    message = reply.text
+                    if message and message.strip():
+                        message = message.strip()
+                    else:
+                        message = self._build_summary(build_plan, build_paths)
                     return AgentResult(
                         ok=True,
                         provider_text=last_text,
                         steps=steps,
-                        message=reply.text or verify_info["message"],
+                        message=message,
                     )
                 if pending_verify is not None:
                     return AgentResult(
@@ -883,6 +922,7 @@ class Agent:
             # the provider returns a scripted response that has already been
             # handled (e.g. RecordingProvider returning the same call text).
             skip_tool_execution = False
+            cached_response_payload = None
             if (
                 pending_verify is not None
                 and call.name == pending_verify["call"].name
@@ -890,6 +930,20 @@ class Agent:
             ):
                 skip_tool_execution = True
                 output = pending_verify["output"]
+
+            # Phase 8B: in build mode, skip redundant inspect_instance calls for
+            # the same path and reuse the cached result, saving plugin round-trips.
+            if (
+                not skip_tool_execution
+                and build_mode
+                and call.name == "inspect_instance"
+            ):
+                path = call.arguments.get("path")
+                if path and path in inspected_paths:
+                    skip_tool_execution = True
+                    cached = inspected_paths[path]
+                    output = cached["output"]
+                    cached_response_payload = cached["response_payload"]
 
             if not skip_tool_execution:
                 output = None
@@ -916,9 +970,27 @@ class Agent:
                     "message": "tool {0!r} did not report success".format(call.name),
                 }
 
-            response_payload = (
-                capturer.responses[-1]["response"] if capturer.responses else None
-            )
+            if cached_response_payload is not None:
+                response_payload = cached_response_payload
+            else:
+                response_payload = (
+                    capturer.responses[-1]["response"] if capturer.responses else None
+                )
+
+            # Phase 8B: cache successful scene inspections in build mode so a
+            # later redundant read can be skipped.
+            if (
+                build_mode
+                and call.name == "inspect_instance"
+                and failure is None
+                and output
+            ):
+                path = call.arguments.get("path")
+                if path:
+                    inspected_paths[path] = {
+                        "output": output,
+                        "response_payload": response_payload,
+                    }
             compacted = (
                 _compact_value(response_payload)
                 if response_payload is not None
@@ -948,6 +1020,10 @@ class Agent:
             # action tools to continue instead of ending the loop.
             if call.name == "build" and failure is None and output:
                 build_mode = True
+                build_plan = {
+                    "description": call.arguments.get("description", ""),
+                    "reference_path": call.arguments.get("reference_path"),
+                }
                 effective_max_tool_calls = max(
                     self.max_tool_calls, BUILD_MODE_MAX_TOOL_CALLS
                 )
@@ -959,6 +1035,42 @@ class Agent:
                     )
                 )
                 continue
+
+            # Phase 8B: plan_build validates and stores a structured construction
+            # plan. It is only meaningful inside build mode; outside build mode it
+            # is rejected so it cannot be used to bypass normal action-tool limits.
+            if call.name == "plan_build":
+                if failure is not None:
+                    pass  # fall through to normal failure handling below
+                elif not build_mode:
+                    failure = {
+                        "code": "invalid_plan",
+                        "message": "plan_build must be called after build inside a multi-object build",
+                    }
+                elif output:
+                    planned_steps = list(call.arguments.get("steps") or [])
+                    plan_index = 0
+                    messages.append(providers.message("assistant", last_text))
+                    messages.append(
+                        providers.message(
+                            "user",
+                            tool_result_message(
+                                issued, call, output, response_payload
+                            ),
+                        )
+                    )
+                    continue
+
+            # Phase 8B: advance through the planned steps when the model's actual
+            # tool call matches the next expected step. This lets the Agent
+            # notice when the plan has drifted and still records progress.
+            if planned_steps and plan_index < len(planned_steps):
+                expected = planned_steps[plan_index]
+                if (
+                    call.name == expected.get("tool")
+                    and call.arguments == expected.get("arguments")
+                ):
+                    plan_index += 1
 
             if failure is not None:
                 if build_mode:

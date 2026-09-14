@@ -1248,14 +1248,15 @@ def scenario_interactive_create_part_registered():
 def scenario_tool_registry_metadata():
     """The tool registry must expose create_part, create_script, modify_instance,
     find_instances, inspect_hierarchy, inspect_instance, asset_search,
-    recommend_assets, and insert_asset with metadata."""
+    recommend_assets, insert_asset, build, and plan_build with metadata."""
     mod = load_cli_module()
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
         "asset_search", "build", "create_part", "create_script",
         "find_instances", "insert_asset", "inspect_hierarchy",
-        "inspect_instance", "modify_instance", "recommend_assets",
+        "inspect_instance", "modify_instance", "plan_build",
+        "recommend_assets",
     ], tools
 
     tool = registry.get("create_part")
@@ -1365,9 +1366,29 @@ def scenario_tool_registry_metadata():
     assert builder.input_schema["properties"]["reference_path"] == {
         "type": "string", "min_length": 1,
     }
+
+    planner = registry.get("plan_build")
+    assert planner is not None
+    assert isinstance(planner.description, str) and planner.description
+    assert planner.input_schema["type"] == "object"
+    assert set(planner.input_schema["required"]) == {"description", "steps"}
+    assert planner.input_schema["properties"]["description"] == {
+        "type": "string", "min_length": 1, "max_length": 500,
+    }
+    assert planner.input_schema["properties"]["reference_path"] == {
+        "type": "string", "min_length": 1,
+    }
+    steps_schema = planner.input_schema["properties"]["steps"]
+    assert steps_schema["type"] == "array"
+    assert steps_schema["minItems"] == 1
+    assert steps_schema["maxItems"] == mod.PLAN_MAX_STEPS
+    item = steps_schema["items"]
+    assert set(item["required"]) == {"tool", "arguments"}
+    assert item["properties"]["tool"] == {"type": "string", "min_length": 1}
+    assert item["properties"]["arguments"] == {"type": "object"}
     print("OK  registry registers create_part, create_script, modify_instance, "
           "find_instances, inspect_hierarchy, inspect_instance, insert_asset, "
-          "and build with metadata")
+          "build, and plan_build with metadata")
 
 
 def scenario_tool_validation():

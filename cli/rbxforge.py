@@ -45,8 +45,15 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   success. plan_build (Phase 8B) makes the planning explicit: the model
   submits a structured plan of up to 5 validated steps before executing it.
   The Agent tracks the plan, skips redundant scene inspections, and always
-  reports what was built in plain language. It never allows unbounded
-  planning, arbitrary code execution, or asset deletion.
+  reports what was built in plain language.
+- edit_build / recent_build_context / delete_instance (Phase 8D) enable
+  iterative refinement of an existing build. The Agent remembers a
+  lightweight context of recently-created objects, reads it on follow-up
+  requests, and applies the smallest set of changes (modify, create, or
+  delete) needed to satisfy the user's intent. Deletion is restricted to
+  objects from the recent build context or touched in the current edit.
+  It never allows unbounded planning, arbitrary code execution, or
+  unrestricted deletion.
 
 Standard library only; no external dependencies.
 
@@ -1158,6 +1165,10 @@ INSERTABLE_ASSET_TYPES = frozenset({"Model", "MeshPart", "Decal", "Audio"})
 #: known-assets registry can never grow without bound.
 MAX_KNOWN_ASSETS = 200
 
+#: Phase 8D: maximum number of objects kept in the recent build context.
+#: Keeps follow-up edit prompts small and deterministic.
+MAX_RECENT_BUILD_CONTEXT = 50
+
 INSERT_ASSET_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1459,6 +1470,166 @@ def plan_build_tool():
     )
 
 
+# Phase 8D: edit_build signals that the user wants to modify an existing build
+# rather than create a new one. Like build, it is pure orchestration: it raises
+# the per-request budget and tells the Agent to track edits for final
+# verification.
+EDIT_BUILD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 500,
+        },
+        "reference_path": {
+            "type": "string",
+            "min_length": 1,
+        },
+    },
+    "required": ["description"],
+}
+
+
+def edit_build_tool():
+    """Build the iterative build-editing orchestration tool (Phase 8D).
+
+    ``edit_build`` does not change the project. It activates edit mode so the
+    Agent can inspect the recent build context, identify the relevant objects,
+    and apply the smallest set of changes needed to satisfy a follow-up request.
+    """
+
+    def run(rbx, params, timeout):
+        description = params["description"]
+        reference = params.get("reference_path")
+        if reference:
+            rbx.log(
+                "edit_build: {0} (reference: {1})".format(description, reference)
+            )
+        else:
+            rbx.log("edit_build: {0}".format(description))
+        return True
+
+    return Tool(
+        "edit_build",
+        "Declare an iterative edit to an existing build. Use this when the user "
+        "refers to a structure you already built (e.g. 'make the shop bigger', "
+        "'move the counter to the left', 'change the roof to red', 'add two "
+        "windows', or 'remove the sign you just created'). Provide a clear "
+        "'description' of the change and an optional 'reference_path'. After "
+        "calling edit_build, read the recent build context with "
+        "recent_build_context, inspect the scene if needed, then use "
+        "modify_instance to adjust existing objects, create_part/create_script/"
+        "insert_asset to add new ones, or delete_instance to remove an object "
+        "the user explicitly wants gone. Prefer modifying existing objects over "
+        "creating duplicates. Action tools do not end the loop in edit mode. "
+        "When you are done send a final report in plain language; the system "
+        "verifies every changed path and reports failure if any step failed.",
+        EDIT_BUILD_SCHEMA,
+        run,
+    )
+
+
+# Phase 8D: recent_build_context returns the lightweight context of objects
+# created in the most recent successful build. This lets the model refer to
+# "the counter you just created" without relying only on fragile name searches.
+RECENT_BUILD_CONTEXT_SCHEMA = {
+    "type": "object",
+    "properties": {},
+}
+
+
+def recent_build_context_tool():
+    """Build the recent-build-context read-only tool (Phase 8D)."""
+
+    def run(rbx, params, timeout):
+        context = []
+        getter = getattr(rbx, "recent_build_context", None)
+        if getter is not None:
+            try:
+                context = getter()
+            except Exception:
+                context = []
+        rbx.log(
+            "recent_build_context: {0} object(s)".format(len(context))
+        )
+        return {"context": context}
+
+    return Tool(
+        "recent_build_context",
+        "Read the lightweight context of objects created by the most recent "
+        "successful build. Use this at the start of an edit_build request to "
+        "identify the objects the user is referring to (e.g. 'the shop', "
+        "'the counter', 'the sign you just created'). Each entry contains at "
+        "least 'path', 'name', and 'class'; many also contain 'position', "
+        "'size', 'color', and 'material'. If the context is empty, fall back "
+        "to find_instances / inspect_instance to locate the object. This tool "
+        "is read-only and never changes the project.",
+        RECENT_BUILD_CONTEXT_SCHEMA,
+        run,
+    )
+
+
+# Phase 8D: delete_instance removes an instance by path. It is intended for
+# explicit removal requests during edit mode. The Agent layer restricts it to
+# paths that are part of the recent build context or touched in the current
+# edit, so it cannot be used to delete arbitrary project objects.
+DELETE_INSTANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "min_length": 1,
+        },
+    },
+    "required": ["path"],
+}
+
+
+def delete_instance_tool():
+    """Build the delete_instance tool (Phase 8D).
+
+    ``delete_instance`` sends a ``delete_instance`` request to the plugin. The
+    Agent layer enforces that the path is part of the recent build context or
+    was touched in the current edit, preventing arbitrary project deletion.
+    """
+
+    def run(rbx, params, timeout):
+        path = params["path"]
+        response = rbx.send_request("delete_instance", params, timeout)
+        if response is None:
+            rbx.log("delete_instance failed: no response from the plugin")
+            return False
+        result = response.get("result") or {}
+        if response.get("ok"):
+            rbx.log(
+                "delete_instance OK: removed {0} ({1}) at {2}".format(
+                    result.get("name", "?"),
+                    result.get("className", "?"),
+                    result.get("path", path),
+                )
+            )
+            return True
+        error = response.get("error") or {}
+        rbx.log(
+            "delete_instance FAILED: [{0}] {1}".format(
+                error.get("code"), error.get("message")
+            )
+        )
+        return False
+
+    return Tool(
+        "delete_instance",
+        "Delete an existing instance by full path. Use this ONLY when the user "
+        "explicitly asks to remove an object (e.g. 'remove the sign you just "
+        "created'). The path should come from recent_build_context or from an "
+        "inspection of the current build. Do not use this to 'clean up' or "
+        "delete objects the user did not ask to remove.",
+        DELETE_INSTANCE_SCHEMA,
+        run,
+    )
+
+
 def default_registry():
     """Build the registry with all built-in tools registered."""
     registry = ToolRegistry()
@@ -1473,6 +1644,9 @@ def default_registry():
     registry.register(insert_asset_tool())
     registry.register(build_tool())
     registry.register(plan_build_tool())
+    registry.register(edit_build_tool())
+    registry.register(recent_build_context_tool())
+    registry.register(delete_instance_tool())
     return registry
 
 
@@ -1704,6 +1878,9 @@ class RBXForge:
         # asset_search / recommend_assets calls; insert_asset only accepts ids
         # recorded here, so the model can never invent one.
         self._known_assets = {}
+        # Phase 8D: lightweight context of objects created by the most recent
+        # successful build, so follow-up edits can reference them naturally.
+        self._recent_build_context = []
 
     # -- logging ----------------------------------------------------------- #
 
@@ -1760,6 +1937,24 @@ class RBXForge:
     def known_asset(self, asset_id):
         """The recorded metadata snapshot for ``asset_id``, or None."""
         return self._known_assets.get(str(asset_id))
+
+    # -- Phase 8D: recent build context ------------------------------------ #
+
+    def set_recent_build_context(self, context):
+        """Replace the lightweight context of recently-built objects.
+
+        ``context`` is a list of dicts describing objects the Agent created in
+        the most recent successful build (path, name, class, and any properties
+        captured from the creation response). It is bounded to keep the prompt
+        small and deterministic.
+        """
+        if not isinstance(context, list):
+            context = []
+        self._recent_build_context = context[:MAX_RECENT_BUILD_CONTEXT]
+
+    def recent_build_context(self):
+        """Return the current recent build context list."""
+        return list(self._recent_build_context)
 
     # -- server callbacks -------------------------------------------------- #
 

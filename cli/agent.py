@@ -210,6 +210,7 @@ ACTION_TOOLS = frozenset(
         "create_script",
         "modify_instance",
         "insert_asset",
+        "delete_instance",
     }
 )
 
@@ -457,6 +458,21 @@ def build_system_prompt(registry):
         "plain language describing exactly what was built; the system will "
         "verify every created path and fail the build if any step failed or "
         "any path is missing. Do not use build for single-object requests.\n"
+        "- edit_build declares an iterative edit to an existing build (Phase 8D). "
+        "Use this for follow-up requests like 'make the shop bigger', 'move the "
+        "counter to the left', 'change the roof to red', 'add two windows', or "
+        "'remove the sign you just created'. Call edit_build first with a clear "
+        "description, then read recent_build_context to see the objects created "
+        "in the last build. Inspect the scene if needed, then apply the smallest "
+        "set of changes: use modify_instance to resize, recolor, or reposition "
+        "an existing object; use create_part/create_script/insert_asset only to "
+        "add genuinely new components; use delete_instance ONLY when the user "
+        "explicitly asks to remove an object and the path is from recent_build_context. "
+        "Never create a duplicate when an existing object can be modified instead. "
+        "Action tools do not end the loop in edit mode. When you are done send a "
+        "final report in plain language describing exactly what changed; the system "
+        "will verify every modified, added, and removed path and fail the edit if "
+        "any step failed.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "
@@ -569,6 +585,10 @@ class Agent:
         self.rbx = rbx if rbx is not None else rbxforge.RBXForge()
         self.timeout = timeout
         self.max_tool_calls = max_tool_calls
+        # Phase 8D: lightweight context of objects created by the most recent
+        # successful build. Persisted across run() calls so follow-up edit
+        # requests can reference them naturally.
+        self.recent_build_context = []
 
     def tool_definitions(self):
         """The currently registered tool definitions sent to the model."""
@@ -758,6 +778,125 @@ class Agent:
             description, ", ".join(names[:-1]), names[-1]
         )
 
+    @staticmethod
+    def _extract_build_context_entry(tool_name, response_payload):
+        """Phase 8D: build a lightweight context entry from a creation response."""
+        if not response_payload or not response_payload.get("ok"):
+            return None
+        result = response_payload.get("result") or {}
+        path = result.get("path")
+        if not path:
+            return None
+        entry = {
+            "path": path,
+            "name": result.get("name"),
+            "class": result.get("className") or result.get("class"),
+        }
+        if tool_name in ("create_part", "modify_instance"):
+            for key in ("position", "size", "color", "material"):
+                if key in result:
+                    entry[key] = result[key]
+        elif tool_name == "insert_asset":
+            for key in ("position", "placement"):
+                if key in result:
+                    entry[key] = result[key]
+        elif tool_name == "create_script":
+            entry["type"] = result.get("type")
+            entry["parent_path"] = result.get("parent_path")
+        return entry
+
+    def _persist_build_context(self, paths, steps):
+        """Phase 8D: populate ``self.recent_build_context`` from a completed
+        build and mirror it to ``self.rbx`` so the registry tool can read it.
+        """
+        context = []
+        seen = set()
+        for step in steps:
+            if step.get("tool") in ACTION_TOOLS and step.get("ok"):
+                path = self._extract_created_path(step["tool"], step.get("data"))
+                if path and path not in seen:
+                    seen.add(path)
+                    entry = self._extract_build_context_entry(
+                        step["tool"], step.get("data")
+                    )
+                    if entry:
+                        context.append(entry)
+        # Ensure every verified path is represented even if the creation
+        # response was sparse.
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                context.append({"path": path, "name": path.split("/")[-1]})
+        self.recent_build_context = context[:rbxforge.MAX_RECENT_BUILD_CONTEXT]
+        setter = getattr(self.rbx, "set_recent_build_context", None)
+        if setter is not None:
+            setter(self.recent_build_context)
+
+    def _verify_edit_paths(self, modified, created, deleted, timeout):
+        """Phase 8D: verify an edit batch. Modified and created paths must
+        exist; deleted paths must be gone."""
+        info = {"output": True, "paths": []}
+
+        def check(path, expect_exists):
+            capturer = CapturingRBX(self.rbx)
+            try:
+                output = self.registry.execute(
+                    capturer, "inspect_instance", {"path": path}, timeout
+                )
+            except (rbxforge.UnknownToolError, rbxforge.InvalidParamsError) as exc:
+                return {"path": path, "ok": not expect_exists, "error": str(exc)}
+            response_payload = (
+                capturer.responses[-1]["response"] if capturer.responses else None
+            )
+            exists = bool(
+                output and response_payload and response_payload.get("ok")
+            )
+            ok = exists if expect_exists else not exists
+            return {"path": path, "ok": ok, "exists": exists}
+
+        for path in modified + created:
+            entry = check(path, True)
+            info["paths"].append(entry)
+            if not entry["ok"]:
+                info["output"] = False
+        for path in deleted:
+            entry = check(path, False)
+            info["paths"].append(entry)
+            if not entry["ok"]:
+                info["output"] = False
+
+        if not info["output"]:
+            failed = [p["path"] for p in info["paths"] if not p["ok"]]
+            info["message"] = (
+                "edit verification failed: the following paths were not in the "
+                "expected state: {0}".format(", ".join(failed))
+            )
+            return False, info
+        info["message"] = "edit verified: {0} path(s) confirmed".format(
+            len(info["paths"])
+        )
+        return True, info
+
+    @staticmethod
+    def _edit_summary(edit_description, modified, created, deleted):
+        """Phase 8D: produce a simple natural-language summary of an edit."""
+        parts = []
+        if modified:
+            names = sorted({p.split("/")[-1] for p in modified})
+            parts.append("updated " + ", ".join(names))
+        if created:
+            names = sorted({p.split("/")[-1] for p in created})
+            parts.append("added " + ", ".join(names))
+        if deleted:
+            names = sorted({p.split("/")[-1] for p in deleted})
+            parts.append("removed " + ", ".join(names))
+        if not parts:
+            return "No changes were made."
+        action = "; ".join(parts)
+        if edit_description:
+            return "Edited {0}: {1}.".format(edit_description, action)
+        return "Edited {0}.".format(action)
+
     def run(self, prompt, **chat_options):
         """Run ``prompt`` through the bounded multi-step loop.
 
@@ -805,6 +944,23 @@ class Agent:
         planned_steps = []
         plan_index = 0
         inspected_paths = {}
+        # Phase 8D edit-mode state. ``edit_build`` is an orchestration tool: when
+        # the model calls it, the loop enters edit mode so the Agent can modify
+        # an existing build. Modified, newly-created, and deleted paths are
+        # tracked for final verification.
+        edit_mode = False
+        edit_description = ""
+        edit_modified_paths = []
+        edit_created_paths = []
+        edit_deleted_paths = []
+        edit_failures = []
+        # Paths that are safe targets for delete_instance in this request:
+        # recent build context plus anything touched during this edit.
+        edit_safe_delete_paths = {
+            entry["path"]
+            for entry in self.recent_build_context
+            if isinstance(entry, dict) and entry.get("path")
+        }
         effective_max_tool_calls = self.max_tool_calls
 
         while True:
@@ -890,6 +1046,67 @@ class Agent:
                         message = message.strip()
                     else:
                         message = self._build_summary(build_plan, build_paths)
+                    # Phase 8D: remember the successfully-built objects so the
+                    # next request can edit them naturally.
+                    self._persist_build_context(build_paths, steps)
+                    return AgentResult(
+                        ok=True,
+                        provider_text=last_text,
+                        steps=steps,
+                        message=message,
+                    )
+                # Phase 8D: a final report in edit mode triggers verification of
+                # modified, newly-created, and deleted paths.
+                if edit_mode:
+                    verified, verify_info = self._verify_edit_paths(
+                        edit_modified_paths,
+                        edit_created_paths,
+                        edit_deleted_paths,
+                        self.timeout,
+                    )
+                    for entry in verify_info["paths"]:
+                        issued += 1
+                        steps.append(
+                            {
+                                "tool": "inspect_instance",
+                                "arguments": {"path": entry["path"]},
+                                "output": entry["ok"],
+                                "data": entry,
+                                "result": "verify {0}: {1}".format(
+                                    entry["path"],
+                                    "ok" if entry["ok"] else "unexpected state",
+                                ),
+                                "ok": entry["ok"],
+                            }
+                        )
+                    if edit_failures or not verified:
+                        messages = []
+                        if edit_failures:
+                            messages.append(
+                                "{0} edit step(s) failed".format(len(edit_failures))
+                            )
+                        if not verified:
+                            messages.append(verify_info["message"])
+                        return AgentResult(
+                            ok=False,
+                            provider_text=last_text,
+                            steps=steps,
+                            message=reply.text,
+                            error={
+                                "code": "build_failed",
+                                "message": "; ".join(messages),
+                            },
+                        )
+                    message = reply.text
+                    if message and message.strip():
+                        message = message.strip()
+                    else:
+                        message = self._edit_summary(
+                            edit_description,
+                            edit_modified_paths,
+                            edit_created_paths,
+                            edit_deleted_paths,
+                        )
                     return AgentResult(
                         ok=True,
                         provider_text=last_text,
@@ -948,14 +1165,28 @@ class Agent:
             if not skip_tool_execution:
                 output = None
                 failure = None
-                try:
-                    output = self.registry.execute(
-                        capturer, call.name, call.arguments, self.timeout
-                    )
-                except rbxforge.UnknownToolError as exc:
-                    failure = {"code": "unknown_tool", "message": str(exc)}
-                except rbxforge.InvalidParamsError as exc:
-                    failure = {"code": "invalid_arguments", "message": str(exc)}
+                # Phase 8D: delete_instance is only allowed on objects that are
+                # part of the recent build context or have been touched during
+                # this edit. This prevents arbitrary project deletion.
+                if call.name == "delete_instance":
+                    path = call.arguments.get("path")
+                    if path and path not in edit_safe_delete_paths:
+                        failure = {
+                            "code": "invalid_deletion",
+                            "message": (
+                                "delete_instance is only allowed for objects in "
+                                "the recent build context or touched in this edit"
+                            ),
+                        }
+                if failure is None:
+                    try:
+                        output = self.registry.execute(
+                            capturer, call.name, call.arguments, self.timeout
+                        )
+                    except rbxforge.UnknownToolError as exc:
+                        failure = {"code": "unknown_tool", "message": str(exc)}
+                    except rbxforge.InvalidParamsError as exc:
+                        failure = {"code": "invalid_arguments", "message": str(exc)}
                 if failure is None and not output:
                     failure = {
                         "code": "execution_failed",
@@ -1072,6 +1303,35 @@ class Agent:
                 ):
                     plan_index += 1
 
+            # Phase 8D: edit_build activates iterative edit mode. Like build, it
+            # is orchestration-only and raises the per-request budget.
+            if call.name == "edit_build" and failure is None and output:
+                edit_mode = True
+                edit_description = call.arguments.get("description", "")
+                effective_max_tool_calls = max(
+                    self.max_tool_calls, BUILD_MODE_MAX_TOOL_CALLS
+                )
+                messages.append(providers.message("assistant", last_text))
+                messages.append(
+                    providers.message(
+                        "user",
+                        tool_result_message(issued, call, output, response_payload),
+                    )
+                )
+                continue
+
+            # Phase 8D: recent_build_context is read-only context for edits. It
+            # is useful outside edit mode too, but it never ends the loop.
+            if call.name == "recent_build_context" and failure is None and output:
+                messages.append(providers.message("assistant", last_text))
+                messages.append(
+                    providers.message(
+                        "user",
+                        tool_result_message(issued, call, output, response_payload),
+                    )
+                )
+                continue
+
             if failure is not None:
                 if build_mode:
                     # In build mode a single step failure is recorded so the
@@ -1079,6 +1339,20 @@ class Agent:
                     # report), but the final report will report the build as
                     # failed rather than complete.
                     build_failures.append(
+                        {"tool": call.name, "arguments": call.arguments, "error": failure}
+                    )
+                    messages.append(providers.message("assistant", last_text))
+                    messages.append(
+                        providers.message(
+                            "user",
+                            tool_result_message(issued, call, output, response_payload),
+                        )
+                    )
+                    continue
+                if edit_mode:
+                    # In edit mode a single step failure is recorded so the
+                    # model can abort cleanly with a final report.
+                    edit_failures.append(
                         {"tool": call.name, "arguments": call.arguments, "error": failure}
                     )
                     messages.append(providers.message("assistant", last_text))
@@ -1106,6 +1380,38 @@ class Agent:
                     path = self._extract_created_path(call.name, response_payload)
                     if path:
                         build_paths.append(path)
+                    messages.append(providers.message("assistant", last_text))
+                    messages.append(
+                        providers.message(
+                            "user",
+                            tool_result_message(
+                                issued, call, output, response_payload
+                            ),
+                        )
+                    )
+                    continue
+
+                # Phase 8D: in edit mode action tools are intermediate steps.
+                # Track modified, newly-created, and deleted paths so the final
+                # verification pass can confirm the edit was applied correctly.
+                if edit_mode:
+                    path = None
+                    if call.name == "modify_instance":
+                        path = call.arguments.get("path")
+                        if path and path not in edit_modified_paths:
+                            edit_modified_paths.append(path)
+                    elif call.name == "delete_instance":
+                        path = call.arguments.get("path")
+                        if path and path not in edit_deleted_paths:
+                            edit_deleted_paths.append(path)
+                    else:
+                        path = self._extract_created_path(
+                            call.name, response_payload
+                        )
+                        if path and path not in edit_created_paths:
+                            edit_created_paths.append(path)
+                    if path:
+                        edit_safe_delete_paths.add(path)
                     messages.append(providers.message("assistant", last_text))
                     messages.append(
                         providers.message(

@@ -1254,8 +1254,9 @@ def scenario_tool_registry_metadata():
     tools = registry.list()
     assert [t.name for t in tools] == [
         "asset_search", "build", "create_part", "create_script",
-        "find_instances", "insert_asset", "inspect_hierarchy",
-        "inspect_instance", "modify_instance", "plan_build",
+        "delete_instance", "edit_build", "find_instances",
+        "insert_asset", "inspect_hierarchy", "inspect_instance",
+        "modify_instance", "plan_build", "recent_build_context",
         "recommend_assets",
     ], tools
 
@@ -1386,9 +1387,37 @@ def scenario_tool_registry_metadata():
     assert set(item["required"]) == {"tool", "arguments"}
     assert item["properties"]["tool"] == {"type": "string", "min_length": 1}
     assert item["properties"]["arguments"] == {"type": "object"}
+
+    editor = registry.get("edit_build")
+    assert editor is not None
+    assert isinstance(editor.description, str) and editor.description
+    assert editor.input_schema["type"] == "object"
+    assert set(editor.input_schema["required"]) == {"description"}
+    assert editor.input_schema["properties"]["description"] == {
+        "type": "string", "min_length": 1, "max_length": 500,
+    }
+    assert editor.input_schema["properties"]["reference_path"] == {
+        "type": "string", "min_length": 1,
+    }
+
+    context_tool = registry.get("recent_build_context")
+    assert context_tool is not None
+    assert isinstance(context_tool.description, str) and context_tool.description
+    assert context_tool.input_schema["type"] == "object"
+
+    deleter = registry.get("delete_instance")
+    assert deleter is not None
+    assert isinstance(deleter.description, str) and deleter.description
+    assert deleter.input_schema["type"] == "object"
+    assert set(deleter.input_schema["required"]) == {"path"}
+    assert deleter.input_schema["properties"]["path"] == {
+        "type": "string", "min_length": 1,
+    }
+
     print("OK  registry registers create_part, create_script, modify_instance, "
           "find_instances, inspect_hierarchy, inspect_instance, insert_asset, "
-          "build, and plan_build with metadata")
+          "build, plan_build, edit_build, recent_build_context, and "
+          "delete_instance with metadata")
 
 
 def scenario_tool_validation():

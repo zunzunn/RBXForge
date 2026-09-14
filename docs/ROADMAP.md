@@ -528,6 +528,54 @@ result.
 asset deletion, unbounded planning loops, or generalized code generation beyond
 script creation through the existing `create_script` tool.
 
+### Phase 8D — Iterative Build Editing
+
+> **Status:** Done. The Agent remembers a lightweight context of recently-built
+> objects, reads it on `edit_build`, and applies the smallest set of changes
+> (modify, create, or delete) to satisfy follow-up requests like "make the shop
+> bigger" or "remove the sign you just created". Deletion is restricted to the
+> recent build context, and every edit is verified before it is reported complete.
+
+**Goal:** let RBXForge understand follow-up requests that modify an existing
+build instead of rebuilding from scratch.
+
+**Deliverables:**
+
+- **Lightweight build context:** after a successful `build`, the Agent stores a
+  bounded list of created objects (path, name, class, and captured properties).
+  The context persists across requests so the next prompt can refer to "the shop"
+  or "the sign you just created".
+- **`recent_build_context` tool:** a read-only tool that returns the stored
+  context. The model uses it at the start of an edit to identify the relevant
+  objects without relying solely on name search.
+- **`edit_build` orchestration tool:** signals iterative edit mode. Like `build`,
+  it raises the per-request tool-call budget and keeps action tools as
+  intermediate steps until a final report.
+- **`delete_instance` tool:** removes an instance by path. The Agent layer only
+  allows deletion of paths in the recent build context or touched in the current
+  edit, preventing arbitrary project deletion.
+- **Smallest-change guidance:** the system prompt instructs the model to prefer
+  `modify_instance` over creating duplicates, and to use `delete_instance` only
+  for explicit removal.
+- **Edit verification:** when the model sends a final report in edit mode, the
+  Agent verifies that modified/created paths exist and that deleted paths are
+  gone. Partial failures report `build_failed`.
+
+**Verification criteria:**
+
+- Automated tests cover modifying a previous build, relative movement, resizing,
+  property changes, adding components, explicit deletion, deletion safety,
+  ambiguous references, avoiding unnecessary rebuilds, partial failure, and final
+  verification.
+- The Agent never deletes an object outside the recent build context or current
+  edit, and never reports a completed edit when a step or verification fails.
+
+**Dependencies:** Phases 8A and 8B.
+
+**Explicitly NOT included:** arbitrary code execution, unrestricted deletion,
+asset purchasing, unbounded planning loops, or a separate autonomous-agent
+framework.
+
 ---
 
 ## No Dates
@@ -553,4 +601,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
 | Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default; 7D verification done: after `insert_asset` the Agent automatically verifies the placed instance with `inspect_instance` and fails closed on mismatch/missing/timeout, and the plugin defends against silent parenting failures, duplicate-name exhaustion, and inconsistent paths) |
-| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built) |
+| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built. 8D iterative build editing done: lightweight `recent_build_context` persists across requests, `edit_build` activates edit mode, `delete_instance` removes objects from the recent build context, and the Agent verifies modified/created/deleted paths before reporting success) |

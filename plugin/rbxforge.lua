@@ -2,13 +2,16 @@
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
 -- + Phase 4B (find_instances) + Phase 4C (inspect_instance) + Phase 6A (create_script)
 -- + Phase 6B (modify_instance) + Phase 7C (insert_asset) + Phase 7D (verification)
+-- + Phase 8D (delete_instance)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
--- and seven Studio operations: create_part, create_script, modify_instance,
--- insert_asset, inspect_hierarchy, find_instances, and inspect_instance
--- (request/response). insert_asset includes Phase 7D reliability checks:
--- sibling-unique naming, post-parent verification, and path round-trip validation.
+-- and eight Studio operations: create_part, create_script, modify_instance,
+-- insert_asset, inspect_hierarchy, find_instances, inspect_instance, and
+-- delete_instance (request/response). insert_asset includes Phase 7D reliability
+-- checks: sibling-unique naming, post-parent verification, and path round-trip
+-- validation. delete_instance (Phase 8D) removes an instance by path and is
+-- restricted to recent build context paths at the Agent layer.
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -1029,6 +1032,77 @@ end
 local toolHandlers = {}
 
 -- --------------------------------------------------------------------------- #
+-- Phase 8D: Delete an existing instance by full path
+-- --------------------------------------------------------------------------- --
+
+-- Removes the instance at `params.path` from the live Workspace. The path is
+-- resolved the same way as inspect_instance; the handler fails with
+-- "not_found" when no instance exists at the path. The destroyed instance's
+-- name, className, and path are returned so the caller can verify the deletion.
+local function handleDeleteInstance(id, params)
+	params = params or {}
+	local path = params.path
+	if type(path) ~= "string" or path == "" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must be a non-empty string",
+		})
+	end
+	local segments = splitPathSegments(path)
+	if #segments < 2 then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must name an instance inside Workspace "
+				.. "(e.g. \"Workspace.Sign\")",
+		})
+	end
+	if segments[1] ~= "Workspace" then
+		return sendResponse(id, false, {
+			code = "invalid_params",
+			message = "params.path must start with the Workspace root",
+		})
+	end
+	for _, segment in ipairs(segments) do
+		if segment == "" then
+			return sendResponse(id, false, {
+				code = "invalid_params",
+				message = "params.path contains an empty segment",
+			})
+		end
+	end
+
+	local ok, target = pcall(function()
+		return resolveSegments(segments)
+	end)
+	if not ok then
+		log("delete_instance resolve error: " .. tostring(target))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = tostring(target),
+		})
+	end
+	if not target then
+		return sendResponse(id, false, {
+			code = "not_found",
+			message = "no instance at path: " .. path,
+		})
+	end
+
+	local name = target.Name
+	local className = target.ClassName
+	local deletedPath = buildPath(target)
+	local parent = target.Parent
+	target:Destroy()
+	log(string.format("delete_instance: removed %s (%s) from %s",
+		name, className, parent and buildPath(parent) or "?"))
+	return sendResponse(id, true, {
+		path = deletedPath,
+		name = name,
+		className = className,
+	})
+end
+
+-- --------------------------------------------------------------------------- #
 -- Phase 7C: Creator Store asset insertion (insert_asset)
 -- --------------------------------------------------------------------------- --
 
@@ -1328,6 +1402,7 @@ registerTool("inspect_hierarchy", handleInspectHierarchy)
 registerTool("find_instances", handleFindInstances)
 registerTool("inspect_instance", handleInspectInstance)
 registerTool("insert_asset", handleInsertAsset)
+registerTool("delete_instance", handleDeleteInstance)
 
 local function handleRequest(id, payload)
 	local tool = payload.tool

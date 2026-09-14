@@ -23,6 +23,13 @@
 > plan, tracks execution, skips redundant `inspect_instance` calls, and always reports what was
 > built in plain language (with a generated fallback summary if the model's final report is empty).
 >
+> **Implemented (Phase 8D):** the Agent supports **iterative build editing**. It persists a
+> lightweight `recent_build_context` across requests, exposes it via the `recent_build_context`
+> tool, and uses `edit_build` to apply the smallest set of changes to an existing build. The model
+> can modify, add, or (with `delete_instance`) remove objects from the recent build context; the
+> Agent restricts deletion to recent build objects and verifies every modified/added/removed path
+> before reporting success.
+>
 > **Implemented (Phase 7A):** `asset_search` is exposed to the model as a read-only Creator
 > Store search tool (local HTTP, not a plugin tool). It is **not** an action tool: a successful
 > search never ends the loop, and its dict result is compacted for the model the same way plugin
@@ -211,11 +218,15 @@ bounded compacted result is appended to the conversation
 model can call find_instances / inspect_instance / inspect_hierarchy again, or act
    ↓
 action tool succeeds → loop ends, unless the model previously called `build`
-  (Phase 8A). In build mode action tools are intermediate steps; the loop ends
-  when the model sends a final report, at which point the Agent verifies every
-  created path. The model may call `plan_build` (Phase 8B) after `build` to submit
-  a structured bounded plan before executing it; the Agent validates the plan,
-  tracks progress, and skips redundant `inspect_instance` calls.
+  (Phase 8A) or `edit_build` (Phase 8D). In build/edit mode action tools are
+  intermediate steps; the loop ends when the model sends a final report, at which
+  point the Agent verifies every created/edited/deleted path. The model may call
+  `plan_build` (Phase 8B) after `build` to submit a structured bounded plan before
+  executing it; the Agent validates the plan, tracks progress, and skips redundant
+  `inspect_instance` calls. In edit mode the model should call
+  `recent_build_context` to identify existing objects and prefer `modify_instance`
+  over duplicate creation; `delete_instance` is allowed only for recent build
+  objects.
   (create_part/create_script/modify_instance permit one optional
   model-driven inspect_instance verification step before ending when not in build
   mode; insert_asset automatically verifies with inspect_instance at the reported
@@ -238,20 +249,25 @@ action tools continue until a final report, and the Agent verifies every recorde
 before reporting `build_failed` or success. Phase 8B adds the `plan_build` orchestration tool:
 after `build`, the model can submit a structured plan of up to 5 steps; the Agent validates it,
 tracks execution, caches `inspect_instance` results to skip redundant reads, and generates a
-natural-language summary if the final report is empty.
+natural-language summary if the final report is empty. Phase 8D adds `edit_build`,
+`recent_build_context`, and `delete_instance`: after `edit_build`, the model reads the recent
+build context, applies the smallest set of changes to existing objects, and the Agent verifies
+modified/created paths still exist and deleted paths are gone before reporting `build_failed`
+or success.
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
   budget remains.
 - **Stopping:** the loop ends on an executed **action tool** (`create_part`, `create_script`,
-  `modify_instance`, `insert_asset`) **unless the model previously called `build`** (Phase 8A),
-  a final model report (`{"message": ...}`), a hard rejection
-  (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
-  `execution_failed` / `verification_failed` / `build_failed`), or the **5-call budget** being
-  exhausted (`max_tool_calls`; raised to a bounded 12 in build mode). It stops rather than
-  guessing when it cannot determine what to do. `asset_search` and `recommend_assets` are
-  **not** action tools, so a successful search/recommendation alone never ends the loop — the
-  loop ends when the model inserts (7C/7D), declares a build complete (8A/8B), or otherwise acts.
+  `modify_instance`, `insert_asset`, `delete_instance`) **unless the model previously called
+  `build` or `edit_build`** (Phases 8A/8D), a final model report (`{"message": ...}`), a hard
+  rejection (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
+  `execution_failed` / `verification_failed` / `build_failed` / `invalid_deletion`), or the
+  **5-call budget** being exhausted (`max_tool_calls`; raised to a bounded 12 in build/edit mode).
+  It stops rather than guessing when it cannot determine what to do. `asset_search` and
+  `recommend_assets` are **not** action tools, so a successful search/recommendation alone never
+  ends the loop — the loop ends when the model inserts (7C/7D), declares a build/edit complete
+  (8A/8B/8D), or otherwise acts.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never
@@ -290,6 +306,13 @@ natural-language summary if the final report is empty.
     Agent generates a fallback summary from the recorded created paths so the result always
     explains what was built. The model should not call `inspect_instance` itself to verify the
     build; the system does it.
+  - `edit_build` (Phase 8D): when the model sends a final report after an `edit_build` call,
+    the Agent **automatically** verifies every modified, newly-created, and deleted path.
+    Modified and created paths must exist; deleted paths must be gone. If any edit step failed
+    or any path is in the wrong state, the result is `build_failed`. The Agent also generates a
+    fallback summary from the recorded changes if the final report is empty. Deletion is
+    restricted to objects in the recent build context or touched in the current edit; attempts
+    to delete other objects fail with `invalid_deletion`.
 - Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet; the loop
   relies on plain `chat` output parsed as JSON (one object per step). Normalizing
   provider-specific tool-call formats behind the provider abstraction is future work.

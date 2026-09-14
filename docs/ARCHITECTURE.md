@@ -23,8 +23,13 @@
 > executes a bounded sequence of existing action tools, and the Agent verifies every created path
 > before reporting `build_failed` or success. Phase 8B adds the `plan_build` orchestration tool:
 > the model submits a structured bounded construction plan, the Agent validates and tracks it,
-> skips redundant scene inspections, and always reports what was built in plain language.
-> A full verify → fix → report cycle remains planned.
+> skips redundant scene inspections, and always reports what was built in plain language. Phase
+> 8D adds `edit_build`, `recent_build_context`, and `delete_instance` for iterative build editing:
+> the Agent persists a lightweight context of recently-built objects, reads it on follow-up
+> requests, applies the smallest set of changes (modify, create, or delete), restricts deletion
+> to the recent build context or objects touched in the current edit, and verifies every
+> modified/added/removed path before reporting success. A full verify → fix → report cycle
+> remains planned.
 
 ## Overview
 
@@ -69,8 +74,8 @@ connects a user prompt to changes that actually appear in Roblox Studio.
 
 | Component | Status |
 | --- | --- |
-| CLI | **Implemented (Phases 1–4D + Phase 7A/7B/7C/7D + Phase 8A/8B)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`asset_search`/`recommend_assets`/`insert_asset`/`build`/`plan_build`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` + `asset_search` + `recommend_assets` + `insert_asset` + `build` + `plan_build` tools ([TOOLS.md](./TOOLS.md)) |
-| Interactive agent | **Implemented (bounded, Phase 3B → 4D → 8A/8B)** — `prompt → provider → tool call → ... → action` multi-step loop in `cli/agent.py`: inspection tools feed bounded results back to the model (max 5 tool calls per request, raised to a bounded 12 in build mode); `build` enables multi-object scene-aware construction and `plan_build` validates/tracks structured plans; redundant scene inspections are skipped and a natural-language summary is produced; single-step requests preserve the original behavior |
+| CLI | **Implemented (Phases 1–4D + Phase 7A/7B/7C/7D + Phase 8A/8B/8D)** — local WebSocket server, interactive AI REPL (`ping`/`status`/`create_part`/`inspect_hierarchy`/`find_instances`/`inspect_instance`/`asset_search`/`recommend_assets`/`insert_asset`/`build`/`plan_build`/`edit_build`/`recent_build_context`/`delete_instance`/`help`/`quit` + plain text sent to the agent), `create_part` + `inspect_hierarchy` + `find_instances` + `inspect_instance` + `asset_search` + `recommend_assets` + `insert_asset` + `build` + `plan_build` + `edit_build` + `recent_build_context` + `delete_instance` tools ([TOOLS.md](./TOOLS.md)) |
+| Interactive agent | **Implemented (bounded, Phase 3B → 4D → 8A/8B/8D)** — `prompt → provider → tool call → ... → action` multi-step loop in `cli/agent.py`: inspection tools feed bounded results back to the model (max 5 tool calls per request, raised to a bounded 12 in build/edit mode); `build` enables multi-object scene-aware construction, `plan_build` validates/tracks structured plans, and `edit_build` applies iterative changes with `recent_build_context` and `delete_instance`; redundant scene inspections are skipped and a natural-language summary is produced; single-step requests preserve the original behavior |
 | AI provider layer | **Implemented (Phase 3A + Phase 4E)** — `cli/providers.py`: provider interface, Ollama + Groq + mock backends, env-based config, typed errors ([AI.md](./AI.md)) |
 | Agent loop | **Implemented (Phase 4D → 6C → 7D → 8A/8B)** — bounded multi-step loop with project inspection
   and verification. The model inspects the live Roblox project via the inspection
@@ -83,23 +88,28 @@ connects a user prompt to changes that actually appear in Roblox Studio.
   a final report, and the Agent verifies every recorded created path before reporting
   `build_failed` or success. Phase 8B adds `plan_build`: the model submits a structured bounded
   plan, the Agent validates and tracks it, caches `inspect_instance` results to skip redundant
-  reads, and generates a fallback summary if the final report is empty. Verification is skipped
-  when the tool result already provides sufficient information. Single-step requests preserve the
-  original behavior: one model call → one tool call → done (unless inspection context was
-  gathered). The full understand/plan/verify/fix autonomy is still planned. |
-| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7A + Phase 7B + Phase 7C + Phase 7D + Phase 8A/8B)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A), `modify_instance` (Phase 6B), `insert_asset` (Phase 7C/7D), `build` (Phase 8A), and `plan_build` (Phase 8B) live end-to-end or in the Agent loop; `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) are schema-registered alongside them but execute as local HTTP calls (no plugin handler); more tools planned |
+  reads, and generates a fallback summary if the final report is empty. Phase 8D adds `edit_build`
+  mode: the Agent persists `recent_build_context` across requests, reads it on follow-up edits,
+  tracks modified/created/deleted paths, restricts `delete_instance` to recent build objects, and
+  verifies every affected path before reporting success. Verification is skipped when the tool
+  result already provides sufficient information. Single-step requests preserve the original
+  behavior: one model call → one tool call → done (unless inspection context was gathered). The
+  full understand/plan/verify/fix autonomy is still planned. |
+| Tool system | **Partially implemented (Phase 2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7A + Phase 7B + Phase 7C + Phase 7D + Phase 8A/8B/8D)** — `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A), `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A), `modify_instance` (Phase 6B), `insert_asset` (Phase 7C/7D), `build` (Phase 8A), `plan_build` (Phase 8B), and `edit_build` / `recent_build_context` / `delete_instance` (Phase 8D) live end-to-end or in the Agent loop; `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) are schema-registered alongside them but execute as local HTTP calls (no plugin handler); more tools planned |
 | Project inspection / index | **Started (Phase 4A + Phase 4B + Phase 4C + Phase 4D)** — `inspect_hierarchy` snapshots the Workspace tree (bounded, Name/ClassName); `find_instances` searches the live Workspace by name (bounded, case-insensitive, with full paths); `inspect_instance` reads one instance by full path with an allowlisted safe-property set; the Phase 4D agent loop drives these live before acting; indexing/temporal tracking still planned |
 | Local communication layer | **Implemented (Phases 1–2B)** — local WebSocket transport, ping/pong, tool requests/responses, see [PROTOCOL.md](./PROTOCOL.md) |
-| Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7C + Phase 7D)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, `inspect_instance`, `create_script`, `modify_instance`, and `insert_asset`; `insert_asset` includes Phase 7D reliability checks (parenting verification, bounded unique naming, path round-trip), see [PLUGIN.md](./PLUGIN.md) |
-| Verification system | **Implemented (Phase 6C + Phase 7D + Phase 8A/8B)** — optional model-driven verification after action tool
+| Studio plugin | **Implemented (Phases 1–2B + Phase 4A + Phase 4B + Phase 4C + Phase 6A + Phase 6B + Phase 7C + Phase 7D + Phase 8D)** — connects to RBXForge, answers ping/pong, executes `create_part`, `inspect_hierarchy`, `find_instances`, `inspect_instance`, `create_script`, `modify_instance`, `insert_asset`, and `delete_instance`; `insert_asset` includes Phase 7D reliability checks (parenting verification, bounded unique naming, path round-trip), see [PLUGIN.md](./PLUGIN.md) |
+| Verification system | **Implemented (Phase 6C + Phase 7D + Phase 8A/8B/8D)** — optional model-driven verification after action tool
   success for `modify_instance` and conditionally for `create_part`/`create_script`; mandatory
-  automatic Agent verification for `insert_asset` (Phase 7D) and for every path created during a
-  `build` (Phase 8A). After a successful `insert_asset`, the Agent executes one `inspect_instance`
-  call at the reported path and reports `verification_failed` if the instance is missing or its
-  path/name/class does not match. After a `build` final report, the Agent executes one
-  `inspect_instance` call per recorded created path and reports `build_failed` if any step failed
-  or any path cannot be confirmed; during build mode successful inspections are cached so
-  redundant reads of the same path are skipped. After a successful `modify_instance`, one optional
+  automatic Agent verification for `insert_asset` (Phase 7D), for every path created during a
+  `build` (Phase 8A), and for every modified/created/deleted path during an `edit_build` (Phase
+  8D). After a successful `insert_asset`, the Agent executes one `inspect_instance` call at the
+  reported path and reports `verification_failed` if the instance is missing or its path/name/class
+  does not match. After a `build` final report, the Agent executes one `inspect_instance` call per
+  recorded created path and reports `build_failed` if any step failed or any path cannot be
+  confirmed; during build mode successful inspections are cached so redundant reads of the same
+  path are skipped. After an `edit_build` final report, the Agent verifies modified/created paths
+  still exist and deleted paths are gone. After a successful `modify_instance`, one optional
   `inspect_instance` verification step is permitted. After a successful `create_part`/`create_script`,
   one optional step is permitted only if the model previously called an inspection tool during the
   same request. Verification is skipped when the tool result already provides sufficient

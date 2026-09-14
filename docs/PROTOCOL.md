@@ -16,6 +16,11 @@
 >   Phase 8B adds the `plan_build` orchestration tool (also Agent-side only) that validates and
 >   stores a structured bounded construction plan, tracks execution, skips redundant scene
 >   inspections, and provides a natural-language summary of what was built.
+>   Phase 8D adds `edit_build` / `recent_build_context` (Agent-side orchestration/context tools)
+>   and `delete_instance` (a plugin `request`/`response` tool). Together they let the Agent modify
+>   an existing build iteratively: the Agent reads the recent build context, applies the smallest
+>   set of changes, restricts deletion to recent build objects, and verifies modified/added/removed
+>   paths before reporting success.
 > - **Deliberate exception (Phase 7A/7B):** `asset_search` and `recommend_assets` are registered
 >   tools but are **not** dispatched through the plugin. They execute as **local HTTP calls** to
 >   the Open Cloud Creator Store API from `cli/roblox_assets.py` / `cli/asset_ranking.py`, so they
@@ -223,6 +228,9 @@ Implemented tools and their `params`:
 | `insert_asset` | `asset_id` (digits-only string, max 16 chars — must be an id a prior `asset_search`/`recommend_assets` returned in this session, never invented), `parent_path` (optional game-rooted string, default `"Workspace"`), `position` (optional object with numeric `x`, `y`, `z`), `reference_path` (optional non-empty string, a path to place near; `position` and `reference_path` are mutually exclusive) | `{ asset_id, name, class, parent_path, path, positioned, placement: "explicit" \| "reference" \| "default", position? }` |
 | `build` | `description` (required non-empty string, max 200 chars), `reference_path` (optional non-empty string to an existing instance) — **Agent-side orchestration only, no `request` message** | `true` (declares a multi-object build plan and activates build mode) |
 | `plan_build` | `description` (required non-empty string, max 500 chars), `reference_path` (optional non-empty string), `steps` (array, `1..PLAN_MAX_STEPS` entries, each `{tool, arguments}`) — **Agent-side orchestration only, no `request` message** | `true` (plan validated and stored; the Agent tracks progress and skips redundant scene inspections) |
+| `edit_build` | `description` (required non-empty string, max 500 chars), `reference_path` (optional non-empty string) — **Agent-side orchestration only, no `request` message** | `true` (declares an edit to an existing build and activates edit mode) |
+| `recent_build_context` | none — **Agent-side context read only, no `request` message** | `{ context: [{ path, name, class, ... }] }` (lightweight context of objects from the most recent successful build) |
+| `delete_instance` | `path` (required non-empty string, full path from Workspace) | `{ path, name, className }` |
 
 `inspect_hierarchy` example request:
 
@@ -569,26 +577,29 @@ Every `request` gets a `response` —
 never silence; the CLI-side validation failure replaces the request/response round trip with a
 local rejection before anything is sent.
 
-**Phase 7A/7B/8A/8B exception (`asset_search`, `recommend_assets`, `build`, `plan_build`):** these tools are registered and
-schema-validated exactly like the others, but their execution **does not produce a WebSocket
-`request`**. `asset_search` and `recommend_assets` make local HTTP `POST`s to the Open Cloud
-Creator Store API from `cli/roblox_assets.py` (search) and rank purely in-process in
-`cli/asset_ranking.py` (recommendation — no extra API calls beyond the search; no robot changes
-to Studio). `build` is Agent-side orchestration only: it activates multi-object build mode and
-raises the bounded per-request tool-call budget. `plan_build` (Phase 8B) is also Agent-side
-orchestration only: it validates and stores a structured bounded construction plan, tracks plan
-execution, caches successful `inspect_instance` results to skip redundant reads, and provides a
-natural-language summary of what was built. Their structured result is returned directly
-(and logged / shown to the agent); there is no plugin handler and no `response` message.
-`insert_asset` (Phase 7C/7D) is the counterpart that **does** produce normal `request`/`response`
-pairs: the CLI accepts an `asset_id` only if a prior search/ranking recorded it in the bounded
-per-session known-id registry (or the human typed it via `--insert-asset-once`), and the plugin
-loads it with `InsertService:LoadAsset`, applies Phase 7D reliability checks (parenting
-verification, bounded unique naming, path round-trip), and reports the final instance path. The
-Agent then reuses `inspect_instance` to verify the placed instance before reporting success.
-Phase 8A reuses the same `inspect_instance` message for the final build verification pass, and
-Phase 8B caches those inspection results during build mode to avoid redundant plugin traffic. See
-[TOOLS.md](./TOOLS.md).
+**Phase 7A/7B/8A/8B/8D exception (`asset_search`, `recommend_assets`, `build`, `plan_build`,
+`edit_build`, `recent_build_context`):** these tools are registered and schema-validated exactly
+like the others, but their execution **does not produce a WebSocket `request`**. `asset_search`
+and `recommend_assets` make local HTTP `POST`s to the Open Cloud Creator Store API from
+`cli/roblox_assets.py` (search) and rank purely in-process in `cli/asset_ranking.py`
+(recommendation — no extra API calls beyond the search; no robot changes to Studio). `build`,
+`plan_build`, and `edit_build` are Agent-side orchestration only: they activate multi-object
+build mode, structured planning, or iterative edit mode and raise the bounded per-request
+tool-call budget. `recent_build_context` is Agent-side context only: it returns the lightweight
+list of objects from the most recent successful build. Their structured result is returned
+directly (and logged / shown to the agent); there is no plugin handler and no `response` message.
+`insert_asset` (Phase 7C/7D) and `delete_instance` (Phase 8D) are the counterparts that **do**
+produce normal `request`/`response` pairs: `insert_asset` accepts an `asset_id` only if a prior
+search/ranking recorded it in the bounded per-session known-id registry (or the human typed it via
+`--insert-asset-once`), and the plugin loads it with `InsertService:LoadAsset`, applies Phase 7D
+reliability checks (parenting verification, bounded unique naming, path round-trip), and reports
+the final instance path. `delete_instance` resolves the path live, confirms the instance exists,
+destroys it, and returns the deleted instance's identity; the Agent layer restricts it to recent
+build context paths or objects touched in the current edit. The Agent reuses `inspect_instance`
+to verify the placed instance before reporting success. Phase 8A reuses the same `inspect_instance`
+message for the final build verification pass; Phase 8B caches those inspection results during
+build mode to avoid redundant plugin traffic; Phase 8D verifies modified/created paths still exist
+and deleted paths are gone. See [TOOLS.md](./TOOLS.md).
 
 ## Future Streaming / Events (Planned)
 
@@ -601,11 +612,12 @@ Not implemented; listed as future direction:
 
 ## Non-Goals (for this milestone)
 
-- Only seven Studio operations (`create_part`, `create_script`, `modify_instance`,
-  `insert_asset`, `inspect_hierarchy`, `find_instances`, `inspect_instance`) plus the
-  local-HTTP `asset_search` (Phase 7A), `recommend_assets` (Phase 7B), and the Agent-side
-  orchestration tools `build` (Phase 8A) and `plan_build` (Phase 8B), which are not Studio
-  operations at all. Other object/script/UI operations and generalized
+- Only eight Studio operations (`create_part`, `create_script`, `modify_instance`,
+  `insert_asset`, `inspect_hierarchy`, `find_instances`, `inspect_instance`,
+  `delete_instance`) plus the local-HTTP `asset_search` (Phase 7A), `recommend_assets`
+  (Phase 7B), and the Agent-side orchestration/context tools `build` (Phase 8A),
+  `plan_build` (Phase 8B), `edit_build` / `recent_build_context` (Phase 8D), which are not
+  Studio operations at all. Other object/script/UI operations and generalized
   search (class type / property value / parent scope) are planned.
 - No arbitrary Instance property serialization (only Name and ClassName are returned by
   `inspect_hierarchy`; only Name, ClassName, and full path by `find_instances`; only identity,

@@ -150,8 +150,9 @@ def scenario_tool_definitions_sent_to_ai():
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
     assert names == ["asset_search", "build", "create_part", "create_script",
-                     "find_instances", "insert_asset", "inspect_hierarchy",
-                     "inspect_instance", "modify_instance", "plan_build",
+                     "delete_instance", "edit_build", "find_instances",
+                     "insert_asset", "inspect_hierarchy", "inspect_instance",
+                     "modify_instance", "plan_build", "recent_build_context",
                      "recommend_assets"], names
     asset_search = defs[0]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
@@ -531,13 +532,22 @@ class MultiFakeRBX:
         self.requests = []
         self.logs = []
         self.known_assets = dict(known_assets) if known_assets else {}
+        self._recent_build_context = []
 
     def send_request(self, tool, params, timeout):
         self.requests.append((tool, params))
+        if tool == "recent_build_context":
+            return {"ok": True, "result": {"context": self._recent_build_context}}
         return self.payloads.get(tool)
 
     def log(self, message):
         self.logs.append(message)
+
+    def set_recent_build_context(self, context):
+        self._recent_build_context = list(context)
+
+    def recent_build_context(self):
+        return list(self._recent_build_context)
 
     def remember_assets(self, results):
         count = 0
@@ -1509,11 +1519,12 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 11, tools
+    assert isinstance(tools, list) and len(tools) == 14, tools
     names = [tool["name"] for tool in tools]
     assert names == ["asset_search", "build", "create_part", "create_script",
-                     "find_instances", "insert_asset", "inspect_hierarchy",
-                     "inspect_instance", "modify_instance", "plan_build",
+                     "delete_instance", "edit_build", "find_instances",
+                     "insert_asset", "inspect_hierarchy", "inspect_instance",
+                     "modify_instance", "plan_build", "recent_build_context",
                      "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
@@ -1536,19 +1547,424 @@ def scenario_groq_compat_agent_passes_tools():
     print("OK  Agent passes tool definitions to Groq (supports_tools) and stays JSON-in-text")
 
 
+def scenario_iterative_build_editing():
+    """Phase 8D: follow-up requests can edit an existing build. The Agent
+    remembers a lightweight context of recently-created objects, reads it on
+    edit_build, applies the smallest change (modify/create/delete), restricts
+    deletion to recent build objects, and verifies every affected path."""
+    mod = load_agent_module()
+    registry = mod.rbxforge.default_registry()
+    names = [t.name for t in registry.list()]
+    assert "edit_build" in names, names
+    assert "recent_build_context" in names, names
+    assert "delete_instance" in names, names
+
+    def part_payload(name, path=None, **overrides):
+        result = {
+            "name": name,
+            "parent_path": "Workspace",
+            "path": path or "Workspace/" + name,
+            "position": {"x": 5, "y": 0.5, "z": 0},
+            "size": {"x": 8, "y": 1, "z": 6},
+            "color": "gray",
+        }
+        result.update(overrides)
+        return {"ok": True, "result": result}
+
+    def modify_payload(path, changed):
+        return {
+            "ok": True,
+            "result": {"path": path, "className": "Part", "changed": changed},
+        }
+
+    def delete_payload(path, name):
+        return {
+            "ok": True,
+            "result": {"path": path, "name": name, "className": "Part"},
+        }
+
+    def inspect_ok(name, path, **props):
+        return {
+            "ok": True,
+            "result": {
+                "name": name,
+                "className": "Part",
+                "path": path,
+                "parent_path": "Workspace",
+                "properties": props,
+            },
+        }
+
+    def not_found(path):
+        return {"ok": False, "error": {"code": "not_found", "message": "gone"}}
+
+    build_call = json.dumps({
+        "tool": "build",
+        "arguments": {"description": "small shop"},
+    })
+    create_floor = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopFloor",
+            "position": {"x": 5, "y": 0.5, "z": 0},
+            "size": {"x": 8, "y": 1, "z": 6},
+            "color": "gray",
+        },
+    })
+    create_wall = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopWall",
+            "position": {"x": 5, "y": 3, "z": -3},
+            "size": {"x": 8, "y": 5, "z": 1},
+            "color": "gray",
+        },
+    })
+    create_sign = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "ShopSign",
+            "position": {"x": 7, "y": 4, "z": 0},
+            "size": {"x": 2, "y": 1, "z": 0.2},
+            "color": "gray",
+        },
+    })
+    final_build = json.dumps({
+        "message": "Built a small shop with floor, wall, and sign.",
+    })
+
+    # 1) Build a shop and verify context is persisted on the Agent.
+    # 2) Then add two windows to the existing build (reuse the same Agent).
+    edit_add = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "add two windows"},
+    })
+    get_context = json.dumps({
+        "tool": "recent_build_context",
+        "arguments": {},
+    })
+    create_window1 = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "Window1",
+            "position": {"x": 3, "y": 2, "z": -2.4},
+            "size": {"x": 1.5, "y": 1.5, "z": 0.2},
+            "color": "blue",
+        },
+    })
+    create_window2 = json.dumps({
+        "tool": "create_part",
+        "arguments": {
+            "name": "Window2",
+            "position": {"x": 7, "y": 2, "z": -2.4},
+            "size": {"x": 1.5, "y": 1.5, "z": 0.2},
+            "color": "blue",
+        },
+    })
+    final_add = json.dumps({"message": "Added two windows."})
+
+    verify_map_build = {
+        "Workspace/ShopFloor": inspect_ok("ShopFloor", "Workspace/ShopFloor"),
+        "Workspace/ShopWall": inspect_ok("ShopWall", "Workspace/ShopWall"),
+        "Workspace/ShopSign": inspect_ok("ShopSign", "Workspace/ShopSign"),
+        "Workspace/Window1": inspect_ok("Window1", "Workspace/Window1"),
+        "Workspace/Window2": inspect_ok("Window2", "Workspace/Window2"),
+    }
+    rbx_build = BuildFakeRBX(
+        {},
+        per_tool_counts={
+            "create_part": [
+                part_payload("ShopFloor"),
+                part_payload("ShopWall"),
+                part_payload("ShopSign", position={"x": 7, "y": 4, "z": 0},
+                           size={"x": 2, "y": 1, "z": 0.2}),
+                part_payload("Window1", position={"x": 3, "y": 2, "z": -2.4},
+                            size={"x": 1.5, "y": 1.5, "z": 0.2}, color="blue"),
+                part_payload("Window2", position={"x": 7, "y": 2, "z": -2.4},
+                            size={"x": 1.5, "y": 1.5, "z": 0.2}, color="blue"),
+            ],
+        },
+        verify_map=verify_map_build,
+    )
+    provider = SequenceProvider([
+        build_call, create_floor, create_wall, create_sign, final_build,
+        edit_add, get_context, create_window1, create_window2, final_add,
+    ])
+    agent = make_agent(provider, rbx=rbx_build)
+    result_build = agent.run("build a small shop")
+    assert result_build.ok is True, result_build
+    assert len(agent.recent_build_context) == 3, agent.recent_build_context
+    assert {entry["name"] for entry in agent.recent_build_context} == {
+        "ShopFloor", "ShopWall", "ShopSign"
+    }, agent.recent_build_context
+    print("OK  build context persisted after successful build")
+
+    result_add = agent.run("add two windows")
+    assert result_add.ok is True, result_add
+    assert result_add.message == "Added two windows.", result_add
+    assert [s["tool"] for s in result_add.steps] == [
+        "edit_build", "recent_build_context", "create_part", "create_part",
+        "inspect_instance", "inspect_instance",
+    ], [s["tool"] for s in result_add.steps]
+    assert all(s["ok"] for s in result_add.steps), result_add.steps
+    print("OK  edit_build adds components to an existing build")
+
+    # 3) Modify an existing object (make the shop bigger) with a fresh Agent
+    #    seeded from context.
+    seeded_context = [
+        {"path": "Workspace/ShopFloor", "name": "ShopFloor", "class": "Part",
+         "position": {"x": 5, "y": 0.5, "z": 0},
+         "size": {"x": 8, "y": 1, "z": 6}, "color": "gray"},
+    ]
+    agent2 = make_agent(SequenceProvider([]), rbx=BuildFakeRBX({}))
+    agent2.recent_build_context = seeded_context
+    agent2.rbx.set_recent_build_context(seeded_context)
+
+    edit_bigger = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "make the shop bigger"},
+    })
+    inspect_floor = json.dumps({
+        "tool": "inspect_instance",
+        "arguments": {"path": "Workspace/ShopFloor"},
+    })
+    modify_floor = json.dumps({
+        "tool": "modify_instance",
+        "arguments": {
+            "path": "Workspace/ShopFloor",
+            "properties": {"size": {"x": 12, "y": 1, "z": 10}},
+        },
+    })
+    final_bigger = json.dumps({"message": "Made the shop bigger."})
+
+    provider_bigger = SequenceProvider([
+        edit_bigger, get_context, inspect_floor, modify_floor, final_bigger,
+    ])
+    rbx_bigger = BuildFakeRBX(
+        {},
+        per_tool_counts={
+            "modify_instance": [modify_payload("Workspace/ShopFloor", ["size"])],
+        },
+        verify_map={
+            "Workspace/ShopFloor": inspect_ok(
+                "ShopFloor", "Workspace/ShopFloor",
+                Size={"x": 12, "y": 1, "z": 10},
+            ),
+        },
+    )
+    result_bigger = make_agent(provider_bigger, rbx=rbx_bigger).run(
+        "make the shop bigger"
+    )
+    assert result_bigger.ok is True, result_bigger
+    assert any(s["tool"] == "modify_instance" for s in result_bigger.steps), result_bigger.steps
+    print("OK  edit_build modifies an existing object (resize)")
+
+    # 4) Relative movement: move the counter to the left.
+    seeded_context = [
+        {"path": "Workspace/Counter", "name": "Counter", "class": "Part",
+         "position": {"x": 5, "y": 0.5, "z": 0}, "size": {"x": 2, "y": 1, "z": 1},
+         "color": "gray"},
+    ]
+    edit_move = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "move the counter to the left"},
+    })
+    inspect_counter = json.dumps({
+        "tool": "inspect_instance",
+        "arguments": {"path": "Workspace/Counter"},
+    })
+    modify_counter = json.dumps({
+        "tool": "modify_instance",
+        "arguments": {
+            "path": "Workspace/Counter",
+            "properties": {"position": {"x": 0, "y": 0.5, "z": 0}},
+        },
+    })
+    final_move = json.dumps({"message": "Moved the counter to the left."})
+
+    provider_move = SequenceProvider([
+        edit_move, get_context, inspect_counter, modify_counter, final_move,
+    ])
+    rbx_move = BuildFakeRBX(
+        {},
+        per_tool_counts={
+            "modify_instance": [modify_payload("Workspace/Counter", ["position"])],
+        },
+        verify_map={
+            "Workspace/Counter": inspect_ok(
+                "Counter", "Workspace/Counter",
+                Position={"x": 0, "y": 0.5, "z": 0},
+            ),
+        },
+    )
+    agent_move = make_agent(provider_move, rbx=rbx_move)
+    agent_move.recent_build_context = seeded_context
+    agent_move.rbx.set_recent_build_context(seeded_context)
+    result_move = agent_move.run("move the counter to the left")
+    assert result_move.ok is True, result_move
+    assert any(s["tool"] == "modify_instance" for s in result_move.steps), result_move.steps
+    print("OK  edit_build repositions an existing object")
+
+    # 5) Property change: change the roof to red (avoids creating a duplicate).
+    seeded_context = [
+        {"path": "Workspace/Roof", "name": "Roof", "class": "Part",
+         "position": {"x": 5, "y": 5, "z": 0}, "size": {"x": 8, "y": 0.5, "z": 6},
+         "color": "gray"},
+    ]
+    edit_color = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "change the roof to red"},
+    })
+    inspect_roof = json.dumps({
+        "tool": "inspect_instance",
+        "arguments": {"path": "Workspace/Roof"},
+    })
+    modify_roof = json.dumps({
+        "tool": "modify_instance",
+        "arguments": {
+            "path": "Workspace/Roof",
+            "properties": {"color": "red"},
+        },
+    })
+    final_color = json.dumps({"message": "Changed the roof to red."})
+
+    provider_color = SequenceProvider([
+        edit_color, get_context, inspect_roof, modify_roof, final_color,
+    ])
+    rbx_color = BuildFakeRBX(
+        {},
+        per_tool_counts={
+            "modify_instance": [modify_payload("Workspace/Roof", ["color"])],
+        },
+        verify_map={
+            "Workspace/Roof": inspect_ok("Roof", "Workspace/Roof"),
+        },
+    )
+    agent_color = make_agent(provider_color, rbx=rbx_color)
+    agent_color.recent_build_context = seeded_context
+    agent_color.rbx.set_recent_build_context(seeded_context)
+    result_color = agent_color.run("change the roof to red")
+    assert result_color.ok is True, result_color
+    assert not any(s["tool"] == "create_part" for s in result_color.steps), result_color.steps
+    assert any(s["tool"] == "modify_instance" for s in result_color.steps), result_color.steps
+    print("OK  edit_build prefers modify over duplicate creation")
+
+    # 6) Explicit deletion: remove the sign.
+    seeded_context = [
+        {"path": "Workspace/ShopSign", "name": "ShopSign", "class": "Part"},
+    ]
+    edit_delete = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "remove the sign"},
+    })
+    delete_sign = json.dumps({
+        "tool": "delete_instance",
+        "arguments": {"path": "Workspace/ShopSign"},
+    })
+    final_delete = json.dumps({"message": "Removed the sign."})
+
+    provider_delete = SequenceProvider([
+        edit_delete, get_context, delete_sign, final_delete,
+    ])
+    rbx_delete = BuildFakeRBX(
+        {},
+        per_tool_counts={
+            "delete_instance": [delete_payload("Workspace/ShopSign", "ShopSign")],
+        },
+        verify_map={
+            "Workspace/ShopSign": not_found("Workspace/ShopSign"),
+        },
+    )
+    agent_delete = make_agent(provider_delete, rbx=rbx_delete)
+    agent_delete.recent_build_context = seeded_context
+    agent_delete.rbx.set_recent_build_context(seeded_context)
+    result_delete = agent_delete.run("remove the sign you just created")
+    assert result_delete.ok is True, result_delete
+    assert any(s["tool"] == "delete_instance" and s["ok"] for s in result_delete.steps), result_delete.steps
+    print("OK  edit_build deletes an object from the recent build context")
+
+    # 7) Deletion safety: deleting an object outside the recent build context is
+    #    rejected.
+    edit_unsafe = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "remove the baseplate"},
+    })
+    delete_baseplate = json.dumps({
+        "tool": "delete_instance",
+        "arguments": {"path": "Workspace/Baseplate"},
+    })
+    final_unsafe = json.dumps({"message": "Cannot remove Baseplate."})
+
+    provider_unsafe = SequenceProvider([
+        edit_unsafe, get_context, delete_baseplate, final_unsafe,
+    ])
+    rbx_unsafe = BuildFakeRBX({})
+    agent_unsafe = make_agent(provider_unsafe, rbx=rbx_unsafe)
+    agent_unsafe.recent_build_context = seeded_context
+    agent_unsafe.rbx.set_recent_build_context(seeded_context)
+    result_unsafe = agent_unsafe.run("remove the baseplate")
+    assert result_unsafe.ok is False, result_unsafe
+    assert result_unsafe.error["code"] == "build_failed", result_unsafe
+    del_step = [s for s in result_unsafe.steps if s["tool"] == "delete_instance"]
+    assert del_step and del_step[0]["ok"] is False, del_step
+    print("OK  delete_instance rejected outside recent build context")
+
+    # 8) Partial failure during edit is reported as build_failed.
+    edit_fail = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "make the shop bigger"},
+    })
+    modify_fail = json.dumps({
+        "tool": "modify_instance",
+        "arguments": {
+            "path": "Workspace/ShopFloor",
+            "properties": {"size": {"x": 12, "y": 1, "z": 10}},
+        },
+    })
+    final_fail = json.dumps({"message": "Could not resize the shop."})
+
+    provider_fail = SequenceProvider([
+        edit_fail, get_context, modify_fail, final_fail,
+    ])
+    rbx_fail = BuildFakeRBX(
+        {},
+        per_tool_counts={
+            "modify_instance": [{"ok": False, "error": {"code": "execution_failed", "message": "locked"}}],
+        },
+    )
+    agent_fail = make_agent(provider_fail, rbx=rbx_fail)
+    agent_fail.recent_build_context = seeded_context
+    agent_fail.rbx.set_recent_build_context(seeded_context)
+    result_fail = agent_fail.run("make the shop bigger")
+    assert result_fail.ok is False, result_fail
+    assert result_fail.error["code"] == "build_failed", result_fail
+    print("OK  partial failure during edit reports build_failed")
+
+    # 9) Ambiguous reference handled gracefully (no crash, final report).
+    edit_ambiguous = json.dumps({
+        "tool": "edit_build",
+        "arguments": {"description": "make it bigger"},
+    })
+    final_ambiguous = json.dumps({
+        "message": "Please clarify which object you want to make bigger.",
+    })
+
+    provider_ambiguous = SequenceProvider([
+        edit_ambiguous, get_context, final_ambiguous,
+    ])
+    rbx_ambiguous = BuildFakeRBX({})
+    agent_ambiguous = make_agent(provider_ambiguous, rbx=rbx_ambiguous)
+    agent_ambiguous.recent_build_context = seeded_context
+    agent_ambiguous.rbx.set_recent_build_context(seeded_context)
+    result_ambiguous = agent_ambiguous.run("make it bigger")
+    assert result_ambiguous.ok is True, result_ambiguous
+    assert "clarify" in result_ambiguous.message.lower(), result_ambiguous.message
+    print("OK  ambiguous edit request handled gracefully")
+
+
 def scenario_multistep_final_message_without_tools():
     """A model that decides nothing needs to change completes successfully with
     a report and executes nothing."""
-    mod = load_agent_module()
-    provider = SequenceProvider([json.dumps({"message": "The project is already empty."})])
-    rbx = MultiFakeRBX({})
-    result = make_agent(provider, rbx=rbx).run("is there anything to clean up?")
-    assert result.ok is True, result
-    assert result.message == "The project is already empty.", result
-    assert result.tool is None, result
-    assert result.steps == [], result.steps
-    assert rbx.requests == [], rbx.requests
-    print("OK  model final report completes without executing any tool")
 
 
 def scenario_max_tool_calls_enforced():
@@ -1714,6 +2130,7 @@ def main():
     scenario_insert_asset_action_tool()
     scenario_scene_aware_building()
     scenario_intelligent_build_planning()
+    scenario_iterative_build_editing()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

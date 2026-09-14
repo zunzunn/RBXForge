@@ -1,13 +1,14 @@
 # RBXForge — Tool System
 
-> **Status:** Eleven tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Fourteen tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
 > modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B,
-> insert_asset in Phase 7C, build in Phase 8A, plan_build in Phase 8B); the
-> rest is conceptual. The
+> insert_asset in Phase 7C, build in Phase 8A, plan_build in Phase 8B, edit_build /
+> recent_build_context / delete_instance in Phase 8D); the rest is conceptual. The
 > **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
 > of these tools; Phase 8A adds the `build` orchestration tool for multi-object scene-aware
-> construction and Phase 8B adds the `plan_build` structured planning tool.
+> construction, Phase 8B adds the `plan_build` structured planning tool, and Phase 8D adds
+> `edit_build`, `recent_build_context`, and `delete_instance` for iterative refinement.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -61,6 +62,16 @@
 >   mode. The model submits a bounded list of explicit steps (max 5) before executing them; the
 >   tool validates the plan and the Agent tracks progress, skips redundant scene inspections, and
 >   reports what was built in plain language. It does not change the project itself.
+> - **Implemented (Phase 8D):** `edit_build` is an **orchestration tool** for iterative edits to an
+>   existing build. It activates edit mode, raises the bounded tool-call budget, and lets the model
+>   apply the smallest set of changes to satisfy a follow-up request.
+> - **Implemented (Phase 8D):** `recent_build_context` is a **read-only context tool** that returns
+>   the objects created by the most recent successful build (path, name, class, and captured
+>   properties). The model uses it to resolve references like "the sign you just created" without
+>   relying only on name search.
+> - **Implemented (Phase 8D):** `delete_instance` removes an instance by full path. It is restricted
+>   by the Agent layer to recent build context paths or objects touched in the current edit, so it
+>   cannot be used to delete arbitrary project objects.
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -367,6 +378,68 @@ as a one-shot flag. The one-shot CLI seeds the id as known before execution. Exi
   process explicit and verifiable.
 
 `plan_build` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
+
+### edit_build (Phase 8D)
+
+- **Purpose:** Orchestrate an **iterative edit to an existing build**. Use `edit_build` when the user
+  refers to a structure that was already built (e.g. "make the shop bigger", "move the counter to
+  the left", "change the roof to red", "add two windows", "remove the sign you just created").
+- **Execution model:** this tool is **local orchestration only** — no WebSocket message is sent. It
+  activates edit mode, raising the per-request tool-call budget to a bounded `BUILD_MODE_MAX_TOOL_CALLS`
+  (12) so multiple read/modify/create/delete steps can run in one request.
+- **Inputs (schema, validated before sending):**
+  - `description` — required, non-empty string (max 500 chars). A clear statement of the change.
+  - `reference_path` — optional non-empty string. A full path to an existing instance the edit
+    concerns.
+- **Agent behavior:** after `edit_build`, the model should call `recent_build_context` to see the
+  objects from the last build, inspect the scene if needed, then apply the smallest set of changes.
+  Prefer `modify_instance` to resize, recolor, or reposition an existing object; use `create_part`,
+  `create_script`, or `insert_asset` only for genuinely new components; use `delete_instance` only
+  when the user explicitly asks to remove an object and the path is in the recent build context.
+  Action tools do **not** end the loop in edit mode. When the model sends a final report, the Agent
+  verifies every modified, added, and removed path and reports `build_failed` if any step failed or
+  any path is in the wrong state.
+- **Bounded guarantees:** no uncontrolled planning, no arbitrary code execution, no asset
+  purchasing. Deletion is restricted to the recent build context or objects touched in the current
+  edit. The loop ends on the final report or budget exhaustion.
+- **Non-goals:** `edit_build` is not a code generator or autonomous planner; it only enables the
+  Agent to reuse the existing tool set for follow-up modifications.
+
+`edit_build` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
+
+### recent_build_context (Phase 8D)
+
+- **Purpose:** Provide a **lightweight, read-only context** of objects created by the most recent
+  successful build so the model can refer to them naturally on follow-up requests.
+- **Execution model:** this tool is **local orchestration only** — no WebSocket message is sent. It
+  reads the context stored on the Agent/RBXForge connection.
+- **Inputs:** none.
+- **Output:** an object with a `context` array. Each entry contains at least `path`, `name`, and
+  `class`; entries from creation responses may also contain `position`, `size`, `color`, `material`,
+  etc.
+- **Agent behavior:** the model should call this at the start of an `edit_build` request to identify
+  the relevant objects. If the context is empty, fall back to `find_instances` / `inspect_instance`.
+- **Bounded guarantees:** the context is capped at `MAX_RECENT_BUILD_CONTEXT` (50) objects and only
+  contains paths from the most recent successful build.
+
+`recent_build_context` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
+
+### delete_instance (Phase 8D)
+
+- **Purpose:** Remove an existing instance by full path. Use this **only** when the user explicitly
+  asks to remove an object from the recent build (e.g. "remove the sign you just created").
+- **Execution model:** this tool sends a WebSocket `request` to the plugin. The plugin resolves the
+  path live, confirms the instance exists, destroys it, and returns the deleted instance's identity.
+- **Inputs (schema, validated before sending):**
+  - `path` — required non-empty string. Full path to the instance (e.g. `"Workspace/ShopSign"`).
+- **Agent behavior:** the Agent layer rejects `delete_instance` calls for paths that are not in the
+  recent build context or touched in the current edit. This prevents arbitrary project deletion.
+  When rejected, the step fails with `invalid_deletion` and the edit reports `build_failed`.
+- **Bounded guarantees:** deletion is scoped to recently-built or currently-edited objects only.
+- **Non-goals:** `delete_instance` is not a bulk cleanup tool; it only removes one explicitly named
+  instance at a time.
+
+`delete_instance` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
 
 ## Conceptual Tool List
 

@@ -149,12 +149,12 @@ def scenario_tool_definitions_sent_to_ai():
 
     defs = agent.tool_definitions()
     names = [entry["name"] for entry in defs]
-    assert names == ["asset_search", "build", "create_part", "create_script",
-                     "delete_instance", "edit_build", "find_instances",
-                     "insert_asset", "inspect_hierarchy", "inspect_instance",
-                     "modify_instance", "plan_build", "recent_build_context",
-                     "recommend_assets"], names
-    asset_search = defs[0]
+    assert names == ["analyze_scene", "asset_search", "build", "create_part",
+                     "create_script", "delete_instance", "edit_build",
+                     "find_instances", "insert_asset", "inspect_hierarchy",
+                     "inspect_instance", "modify_instance", "plan_build",
+                     "recent_build_context", "recommend_assets"], names
+    asset_search = defs[1]
     assert isinstance(asset_search["description"], str) and asset_search["description"]
     assert asset_search["parameters"]["type"] == "object"
     assert set(asset_search["parameters"]["required"]) == {"query"}, asset_search
@@ -1519,13 +1519,13 @@ def scenario_groq_compat_agent_passes_tools():
 
     chat_options = provider.chat_calls[0][1]
     tools = chat_options.get("tools")
-    assert isinstance(tools, list) and len(tools) == 14, tools
+    assert isinstance(tools, list) and len(tools) == 15, tools
     names = [tool["name"] for tool in tools]
-    assert names == ["asset_search", "build", "create_part", "create_script",
-                     "delete_instance", "edit_build", "find_instances",
-                     "insert_asset", "inspect_hierarchy", "inspect_instance",
-                     "modify_instance", "plan_build", "recent_build_context",
-                     "recommend_assets"], names
+    assert names == ["analyze_scene", "asset_search", "build", "create_part",
+                     "create_script", "delete_instance", "edit_build",
+                     "find_instances", "insert_asset", "inspect_hierarchy",
+                     "inspect_instance", "modify_instance", "plan_build",
+                     "recent_build_context", "recommend_assets"], names
     # The definitions are the model-facing JSON Schema (vec3 flattened), exactly
     # what Groq's `tools` parameter accepts.
     create_part = [tool for tool in tools if tool["name"] == "create_part"][0]
@@ -1965,6 +1965,214 @@ def scenario_iterative_build_editing():
 def scenario_multistep_final_message_without_tools():
     """A model that decides nothing needs to change completes successfully with
     a report and executes nothing."""
+    mod = load_agent_module()
+    provider = SequenceProvider([json.dumps({"message": "The project is already empty."})])
+    rbx = MultiFakeRBX({})
+    result = make_agent(provider, rbx=rbx).run("is there anything to clean up?")
+    assert result.ok is True, result
+    assert result.message == "The project is already empty.", result
+    assert result.tool is None, result
+    assert result.steps == [], result.steps
+    assert rbx.requests == [], rbx.requests
+    print("OK  model final report completes without executing any tool")
+
+
+def scenario_analyze_scene():
+    """Phase 9A: analyze_scene produces a bounded, deterministic summary of the
+    Workspace, identifying landmarks, models, groups, class counts, and
+    relevant objects. It handles empty scenes, large scenes, nested models,
+    grouped structures, duplicate names, missing metadata, and bounded output."""
+    mod = load_agent_module()
+    registry = mod.rbxforge.default_registry()
+    names = [t.name for t in registry.list()]
+    assert "analyze_scene" in names, names
+
+    def hierarchy_payload(tree, truncated=False):
+        return {
+            "ok": True,
+            "result": {
+                "root": "Workspace",
+                "depth": 3,
+                "count": _count_nodes(tree),
+                "truncated": truncated,
+                "tree": tree,
+            },
+        }
+
+    def _count_nodes(tree):
+        total = 0
+        def walk(node):
+            nonlocal total
+            total += 1
+            for child in node.get("children") or []:
+                walk(child)
+        for root in tree:
+            walk(root)
+        return total
+
+    def node(name, cls, children=None):
+        out = {"name": name, "className": cls}
+        if children:
+            out["children"] = children
+        return out
+
+    # 1) Empty scene: only Workspace.
+    rbx_empty = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload([node("Workspace", "Workspace")]),
+    })
+    result_empty = mod.rbxforge.analyze_scene_summary(rbx_empty, {}, 10)
+    assert result_empty is not None, result_empty
+    summary_empty = result_empty["result"]
+    assert summary_empty["total_nodes"] == 1, summary_empty
+    assert summary_empty["landmarks"] == [], summary_empty
+    assert summary_empty["models"] == [], summary_empty
+    assert summary_empty["groups"] == [], summary_empty
+    print("OK  analyze_scene handles empty scene")
+
+    # 2) Landmarks, models, and groups.
+    tree = [node("Workspace", "Workspace", [
+        node("SpawnLocation", "SpawnLocation"),
+        node("Baseplate", "Part"),
+        node("Shop", "Model", [
+            node("Shop_Floor", "Part"),
+            node("Shop_Wall", "Part"),
+            node("Shop_Roof", "Part"),
+            node("Sign", "Part"),
+        ]),
+        node("Tree", "Model"),
+        node("Script", "Script"),
+    ])]
+    rbx_scene = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(tree),
+    })
+    result_scene = mod.rbxforge.analyze_scene_summary(rbx_scene, {}, 10)
+    summary = result_scene["result"]
+    assert summary["total_nodes"] == _count_nodes(tree), summary
+    assert any(l["name"] == "SpawnLocation" for l in summary["landmarks"]), summary
+    assert any(l["name"] == "Baseplate" for l in summary["landmarks"]), summary
+    assert any(m["name"] == "Shop" and m["child_count"] == 4 for m in summary["models"]), summary
+    assert any(g["name"] == "Shop" and g["count"] == 3 for g in summary["groups"]), summary
+    assert summary["class_counts"].get("Part", 0) >= 5, summary
+    assert summary["class_counts"].get("Model", 0) == 2, summary
+    print("OK  analyze_scene identifies landmarks, models, groups, and class counts")
+
+    # 3) Relevant-object filtering via query uses find_instances.
+    rbx_query = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(tree),
+        "find_instances": {
+            "ok": True,
+            "result": {
+                "query": "Tree",
+                "max_results": 10,
+                "total": 1,
+                "count": 1,
+                "truncated": False,
+                "matches": [
+                    {"name": "Tree", "className": "Model", "path": "Workspace/Tree"},
+                ],
+            },
+        },
+    })
+    result_query = mod.rbxforge.analyze_scene_summary(
+        rbx_query, {"query": "Tree"}, 10
+    )
+    summary_query = result_query["result"]
+    assert any(r["name"] == "Tree" for r in summary_query["relevant"]), summary_query
+    print("OK  analyze_scene includes query-relevant objects")
+
+    # 4) Large scene truncated by max_nodes.
+    big_tree = [node("Workspace", "Workspace", [
+        node("Part{0}".format(i), "Part") for i in range(50)
+    ])]
+    rbx_big = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(big_tree),
+    })
+    result_big = mod.rbxforge.analyze_scene_summary(
+        rbx_big, {"max_nodes": 10}, 10
+    )
+    summary_big = result_big["result"]
+    assert summary_big["total_nodes"] == 10, summary_big
+    assert summary_big["truncated"] is True, summary_big
+    print("OK  analyze_scene respects max_nodes and reports truncation")
+
+    # 5) Nested models.
+    nested_tree = [node("Workspace", "Workspace", [
+        node("House", "Model", [
+            node("Frame", "Model", [
+                node("Wall", "Part"),
+            ]),
+        ]),
+    ])]
+    rbx_nested = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(nested_tree),
+    })
+    result_nested = mod.rbxforge.analyze_scene_summary(rbx_nested, {}, 10)
+    summary_nested = result_nested["result"]
+    model_names = {m["name"] for m in summary_nested["models"]}
+    assert model_names == {"House", "Frame"}, summary_nested
+    print("OK  analyze_scene recognizes nested models")
+
+    # 6) Duplicate names under different parents are counted.
+    dup_tree = [node("Workspace", "Workspace", [
+        node("Shop", "Model", [node("Wall", "Part")]),
+        node("Garage", "Model", [node("Wall", "Part")]),
+    ])]
+    rbx_dup = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(dup_tree),
+    })
+    result_dup = mod.rbxforge.analyze_scene_summary(rbx_dup, {}, 10)
+    summary_dup = result_dup["result"]
+    assert summary_dup["class_counts"].get("Part", 0) == 2, summary_dup
+    print("OK  analyze_scene handles duplicate names across parents")
+
+    # 7) Missing metadata tolerated (className absent -> Unknown).
+    bad_tree = [{"name": "Mystery"}]
+    rbx_bad = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(bad_tree),
+    })
+    result_bad = mod.rbxforge.analyze_scene_summary(rbx_bad, {}, 10)
+    summary_bad = result_bad["result"]
+    assert summary_bad["class_counts"].get("Unknown", 0) == 1, summary_bad
+    print("OK  analyze_scene tolerates missing className")
+
+    # 8) Agent integration: analyze_scene used before a build.
+    analyze_call = json.dumps({
+        "tool": "analyze_scene",
+        "arguments": {"query": "SpawnLocation"},
+    })
+    build_call = json.dumps({
+        "tool": "build",
+        "arguments": {"description": "small shop near SpawnLocation"},
+    })
+    final_build = json.dumps({
+        "message": "Analyzed the scene and planned a shop near SpawnLocation.",
+    })
+    provider = SequenceProvider([analyze_call, build_call, final_build])
+    rbx_agent = MultiFakeRBX({
+        "inspect_hierarchy": hierarchy_payload(tree),
+        "find_instances": {
+            "ok": True,
+            "result": {
+                "query": "SpawnLocation",
+                "max_results": 10,
+                "total": 1,
+                "count": 1,
+                "truncated": False,
+                "matches": [
+                    {"name": "SpawnLocation", "className": "SpawnLocation", "path": "Workspace/SpawnLocation"},
+                ],
+            },
+        },
+    })
+    result_agent = make_agent(provider, rbx=rbx_agent).run(
+        "build a shop near the SpawnLocation"
+    )
+    assert result_agent.ok is True, result_agent
+    assert [s["tool"] for s in result_agent.steps] == [
+        "analyze_scene", "build",
+    ], [s["tool"] for s in result_agent.steps]
+    assert all(s["ok"] for s in result_agent.steps), result_agent.steps
+    print("OK  analyze_scene integrates into the Agent loop before build")
 
 
 def scenario_max_tool_calls_enforced():
@@ -2131,6 +2339,7 @@ def main():
     scenario_scene_aware_building()
     scenario_intelligent_build_planning()
     scenario_iterative_build_editing()
+    scenario_analyze_scene()
     scenario_groq_compat_agent_passes_tools()
     scenario_multistep_final_message_without_tools()
     scenario_max_tool_calls_enforced()

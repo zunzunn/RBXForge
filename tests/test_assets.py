@@ -1163,7 +1163,7 @@ def scenario_cli_one_shot_success():
         proc = run_cli(["--asset-search-once", "--query", "sword"], env)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "asset_search OK: 2 result(s) for query 'sword'" in proc.stdout, proc.stdout
-        assert "tools registered: asset_search" in proc.stdout, proc.stdout
+        assert "tools registered:" in proc.stdout and "asset_search" in proc.stdout, proc.stdout
         assert server.bodies[0] == {"query": "sword", "maxPageSize": 5}, server.bodies
 
         # asset_type + max-results flow through to the request body.

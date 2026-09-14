@@ -30,6 +30,13 @@
 > Agent restricts deletion to recent build objects and verifies every modified/added/removed path
 > before reporting success.
 >
+> **Implemented (Phase 9A):** the Agent has a **bounded, deterministic scene-summary** tool,
+> `analyze_scene`. It reuses the existing inspection tools internally but only exposes a compact
+> summary to the model — landmarks, major models/folders, grouped instances, class counts, and
+> optional query-relevant objects. It is read-only, strictly bounded by `depth` and `max_nodes`,
+> and the system prompt recommends it at the start of complex builds, edits, or whenever the user
+> refers to the existing scene.
+>
 > **Implemented (Phase 7A):** `asset_search` is exposed to the model as a read-only Creator
 > Store search tool (local HTTP, not a plugin tool). It is **not** an action tool: a successful
 > search never ends the loop, and its dict result is compacted for the model the same way plugin
@@ -215,8 +222,8 @@ ToolRegistry.execute  (validation unchanged)   → Studio (plugin) → tool resu
    ↓
 bounded compacted result is appended to the conversation
    ↓
-model can call find_instances / inspect_instance / inspect_hierarchy again, or act
-   ↓
+model can call find_instances / inspect_instance / inspect_hierarchy / analyze_scene again, or act
+    ↓
 action tool succeeds → loop ends, unless the model previously called `build`
   (Phase 8A) or `edit_build` (Phase 8D). In build/edit mode action tools are
   intermediate steps; the loop ends when the model sends a final report, at which
@@ -253,7 +260,7 @@ natural-language summary if the final report is empty. Phase 8D adds `edit_build
 `recent_build_context`, and `delete_instance`: after `edit_build`, the model reads the recent
 build context, applies the smallest set of changes to existing objects, and the Agent verifies
 modified/created paths still exist and deleted paths are gone before reporting `build_failed`
-or success.
+or success. Phase 9A adds `analyze_scene`: it internally uses `inspect_hierarchy` / `find_instances` to produce a compact bounded summary, but those internal calls are not exposed to the model, and the system prompt recommends using it at the start of complex builds, edits, or any request that references the existing scene.
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
@@ -264,10 +271,10 @@ or success.
   rejection (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
   `execution_failed` / `verification_failed` / `build_failed` / `invalid_deletion`), or the
   **5-call budget** being exhausted (`max_tool_calls`; raised to a bounded 12 in build/edit mode).
-  It stops rather than guessing when it cannot determine what to do. `asset_search` and
-  `recommend_assets` are **not** action tools, so a successful search/recommendation alone never
-  ends the loop — the loop ends when the model inserts (7C/7D), declares a build/edit complete
-  (8A/8B/8D), or otherwise acts.
+  It stops rather than guessing when it cannot determine what to do. `asset_search`,
+  `recommend_assets`, and `analyze_scene` are **not** action tools, so a successful
+  search/recommendation/scene-summary alone never ends the loop — the loop ends when the model
+  inserts (7C/7D), declares a build/edit complete (8A/8B/8D), or otherwise acts.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never
@@ -334,7 +341,8 @@ or success.
 
 - The agent loads only **relevant, live** project context — the Phase 4D/6C loop lets the model call
   `find_instances` / `inspect_instance` / `inspect_hierarchy` against the current Workspace and
-  acts on the bounded results, rather than dumping the entire project into the prompt
+  acts on the bounded results; Phase 9A adds `analyze_scene` as a higher-level, self-bounding
+  entry point for the same information. The agent never dumps the entire project into the prompt
   (decision D-012 preserved).
 - Every result is compacted before it is shown to the model: cap on list entries, per-string
   truncation, and a hard serialized-character budget (`MAX_TOOL_RESULT_*` in `cli/agent.py`), so

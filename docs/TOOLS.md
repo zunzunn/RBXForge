@@ -1,14 +1,15 @@
 # RBXForge — Tool System
 
-> **Status:** Fourteen tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
+> **Status:** Fifteen tools implemented (create_part in Phase 2B, inspect_hierarchy in Phase 4A,
 > find_instances in Phase 4B, inspect_instance in Phase 4C, create_script in Phase 6A,
 > modify_instance in Phase 6B, asset_search in Phase 7A, recommend_assets in Phase 7B,
 > insert_asset in Phase 7C, build in Phase 8A, plan_build in Phase 8B, edit_build /
-> recent_build_context / delete_instance in Phase 8D); the rest is conceptual. The
-> **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project context on top
-> of these tools; Phase 8A adds the `build` orchestration tool for multi-object scene-aware
-> construction, Phase 8B adds the `plan_build` structured planning tool, and Phase 8D adds
-> `edit_build`, `recent_build_context`, and `delete_instance` for iterative refinement.
+> recent_build_context / delete_instance in Phase 8D, analyze_scene in Phase 9A); the rest is
+> conceptual. The **Phase 4D bounded multi-step agent loop** (`cli/agent.py`) builds AI project
+> context on top of these tools; Phase 8A adds the `build` orchestration tool for multi-object
+> scene-aware construction, Phase 8B adds the `plan_build` structured planning tool, Phase 8D
+> adds `edit_build`, `recent_build_context`, and `delete_instance` for iterative refinement, and
+> Phase 9A adds `analyze_scene` for bounded, deterministic scene summaries.
 >
 > - **Implemented (Phase 2B):** `create_part` is the first **formal RBXForge tool**. It is
 >   registered in a tool registry on the CLI side (`cli/rbxforge.py`) with metadata — **name,
@@ -72,6 +73,12 @@
 > - **Implemented (Phase 8D):** `delete_instance` removes an instance by full path. It is restricted
 >   by the Agent layer to recent build context paths or objects touched in the current edit, so it
 >   cannot be used to delete arbitrary project objects.
+> - **Implemented (Phase 9A):** `analyze_scene` is a **read-only scene-summary tool**. It internally
+>   calls `inspect_hierarchy` (and optionally `find_instances` when a query is given), then returns
+>   a bounded, deterministic summary of the Workspace — landmarks, major models/folders, grouped
+>   instances, class counts, and query-relevant objects. It is Agent-side orchestration: the model
+>   sees only the compact summary, not the individual inspection calls. It does not change the
+>   project.
 > - **Implemented (Phase 4D):** the inspection tools power the agent's **multi-step loop** — the
 >   model calls them for live project context, receives **bounded** results back, and then acts
 >   (e.g. `create_part`). No new tool was added; the loop uses the existing registry unchanged
@@ -440,6 +447,35 @@ as a one-shot flag. The one-shot CLI seeds the id as known before execution. Exi
   instance at a time.
 
 `delete_instance` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
+
+### analyze_scene (Phase 9A)
+
+- **Purpose:** Return a compact, bounded summary of the Workspace so the model can understand the
+  existing scene before building or editing instead of issuing many low-level inspection calls.
+- **Execution model:** this tool is **Agent-side orchestration**. It calls `inspect_hierarchy`
+  (and optionally `find_instances` when a `query` is supplied) directly on the underlying
+  connection, then compiles a deterministic summary. The individual inspection calls are not
+  exposed to the model as separate tool results.
+- **Inputs (schema, validated before sending):**
+  - `depth` — optional integer, 1..6, default 3. How many levels of the hierarchy to traverse.
+  - `max_nodes` — optional integer, 1..500, default 200. Hard cap on the number of nodes to inspect
+    before truncation.
+  - `query` — optional non-empty string. When supplied, top matches from `find_instances` are
+    included as "relevant objects".
+- **Summary contents:**
+  - **landmarks** — SpawnLocation, Baseplate, Camera, and any landmark class instances, with paths
+    and key properties.
+  - **major_models** — Models and Folders with child counts and full paths.
+  - **groups** — instances that share a common name prefix, grouped together with counts.
+  - **class_counts** — how many instances of each class appear in the inspected tree.
+  - **relevant_objects** — when a query is provided, up to 10 matching instances by name.
+  - **truncated** — true when the scene exceeded `max_nodes`.
+- **Bounded guarantees:** traversal depth and node count are strictly limited; output is compact;
+  the tool is read-only and never modifies the project.
+- **Non-goals:** `analyze_scene` is not a full dump, does not run arbitrary code, and does not use
+  computer vision.
+
+`analyze_scene` is exposed to the Agent only; there is no separate REPL or one-shot CLI flag.
 
 ## Conceptual Tool List
 

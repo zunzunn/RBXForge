@@ -1253,11 +1253,11 @@ def scenario_tool_registry_metadata():
     registry = mod.default_registry()
     tools = registry.list()
     assert [t.name for t in tools] == [
-        "asset_search", "build", "create_part", "create_script",
-        "delete_instance", "edit_build", "find_instances",
-        "insert_asset", "inspect_hierarchy", "inspect_instance",
-        "modify_instance", "plan_build", "recent_build_context",
-        "recommend_assets",
+        "analyze_scene", "asset_search", "build", "create_part",
+        "create_script", "delete_instance", "edit_build",
+        "find_instances", "insert_asset", "inspect_hierarchy",
+        "inspect_instance", "modify_instance", "plan_build",
+        "recent_build_context", "recommend_assets",
     ], tools
 
     tool = registry.get("create_part")
@@ -1414,10 +1414,29 @@ def scenario_tool_registry_metadata():
         "type": "string", "min_length": 1,
     }
 
+    analyzer = registry.get("analyze_scene")
+    assert analyzer is not None
+    assert isinstance(analyzer.description, str) and analyzer.description
+    assert analyzer.input_schema["type"] == "object"
+    assert set(analyzer.input_schema["required"]) == set()
+    assert analyzer.input_schema["properties"]["query"] == {
+        "type": "string", "min_length": 1, "max_length": 200,
+    }
+    depth_prop = analyzer.input_schema["properties"]["depth"]
+    assert depth_prop["type"] == "number"
+    assert depth_prop["integer"] is True
+    assert depth_prop["minimum"] == 1
+    assert depth_prop["maximum"] == mod.MAX_ANALYZE_SCENE_DEPTH
+    nodes_prop = analyzer.input_schema["properties"]["max_nodes"]
+    assert nodes_prop["type"] == "number"
+    assert nodes_prop["integer"] is True
+    assert nodes_prop["minimum"] == 1
+    assert nodes_prop["maximum"] == mod.MAX_ANALYZE_SCENE_MAX_NODES
+
     print("OK  registry registers create_part, create_script, modify_instance, "
           "find_instances, inspect_hierarchy, inspect_instance, insert_asset, "
-          "build, plan_build, edit_build, recent_build_context, and "
-          "delete_instance with metadata")
+          "build, plan_build, edit_build, recent_build_context, "
+          "delete_instance, and analyze_scene with metadata")
 
 
 def scenario_tool_validation():

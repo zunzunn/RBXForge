@@ -62,7 +62,9 @@ work in Roblox Studio**.
 
 - Parse the user's prompt into an actionable intent.
 - Ask clarifying questions only when the request is genuinely ambiguous and cannot be resolved
-  by inspecting the project. Default behavior is to act autonomously (decision D-004).
+  by inspecting the project. Default behavior is to act autonomously (decision D-004). For
+  complex builds, edits, or any request that refers to the existing scene, prefer starting with
+  the `analyze_scene` summary tool.
 
 ### Inspect
 

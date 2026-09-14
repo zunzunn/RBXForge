@@ -576,6 +576,55 @@ build instead of rebuilding from scratch.
 asset purchasing, unbounded planning loops, or a separate autonomous-agent
 framework.
 
+### Phase 9A — Robust Scene Understanding
+
+> **Status:** Done. `analyze_scene` returns a bounded, deterministic summary of
+> the Workspace — landmarks, major models, related-object groups, class counts,
+> and optionally query-relevant instances — so the model can understand larger
+> scenes before building or editing instead of repeatedly calling low-level
+> inspection tools.
+
+**Goal:** give RBXForge a lightweight, reusable scene-analysis capability that
+helps the model plan and edit builds in larger, more complex Roblox projects.
+
+**Deliverables:**
+
+- **`analyze_scene` tool:** a read-only tool that internally calls
+  `inspect_hierarchy` (and optionally `find_instances` when a query is given),
+  then returns a compact summary. It is Agent-side orchestration: the internal
+  inspection calls are not exposed to the model as separate tool results.
+- **Summary contents:**
+  - **Landmarks** — SpawnLocation, Baseplate, Camera, and any instance whose
+    class is in a small landmark set.
+  - **Major models/folders** — Models and Folders with their child counts and
+    paths.
+  - **Groups** — instances that share a name prefix (e.g. `Shop_Floor`,
+    `Shop_Wall`, `Shop_Roof` are grouped as `Shop`).
+  - **Class counts** — how many instances of each class appear in the scene.
+  - **Relevant objects** — when the caller provides a `query`, the top
+    `find_instances` matches are included.
+- **Bounded and deterministic:** `analyze_scene` respects configurable `depth`
+  (1..6, default 3) and `max_nodes` (1..500, default 200) limits, truncates
+  output, and processes the tree deterministically. It gracefully handles empty
+  scenes, missing metadata, and unusual hierarchies.
+- **Integration:** the system prompt instructs the model to use `analyze_scene`
+  at the start of complex builds or edits or when the user refers to the
+  existing scene.
+
+**Verification criteria:**
+
+- Automated tests cover empty scenes, large scenes with truncation, nested
+  models, grouped structures, relevant-object filtering, duplicate names across
+  parents, missing metadata, bounded output, and Agent integration where
+  `analyze_scene` is used before a `build`.
+- The tool never changes the project, never traverses without bound, and
+  returns a useful summary for scenes of varying size and shape.
+
+**Dependencies:** Phases 4A, 4B, and 8D.
+
+**Explicitly NOT included:** computer vision, arbitrary code execution,
+unrestricted traversal, or a separate autonomous-agent framework.
+
 ---
 
 ## No Dates
@@ -601,4 +650,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
 | Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default; 7D verification done: after `insert_asset` the Agent automatically verifies the placed instance with `inspect_instance` and fails closed on mismatch/missing/timeout, and the plugin defends against silent parenting failures, duplicate-name exhaustion, and inconsistent paths) |
-| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built. 8D iterative build editing done: lightweight `recent_build_context` persists across requests, `edit_build` activates edit mode, `delete_instance` removes objects from the recent build context, and the Agent verifies modified/created/deleted paths before reporting success) |
+| Phase 8 — Coherent Scene Construction | **In progress** (8A scene-aware building done: `build` orchestration tool enters multi-object build mode with a bounded raised tool-call budget; the Agent inspects the scene, executes multiple `create_part` / `create_script` / `insert_asset` / `modify_instance` steps, and verifies every created path before reporting success; partial failures and verification failures report `build_failed`. 8B intelligent build planning done: `plan_build` validates and stores a structured bounded plan inside build mode, the Agent tracks plan execution, skips redundant `inspect_instance` calls, and generates a natural-language summary of what was built. 8D iterative build editing done: lightweight `recent_build_context` persists across requests, `edit_build` activates edit mode, `delete_instance` removes objects from the recent build context, and the Agent verifies modified/created/deleted paths before reporting success. 9A robust scene understanding done: `analyze_scene` returns a bounded, deterministic summary of landmarks, models, groups, class counts, and query-relevant objects so the model can understand larger scenes before acting) |

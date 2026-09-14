@@ -458,6 +458,13 @@ def build_system_prompt(registry):
         "plain language describing exactly what was built; the system will "
         "verify every created path and fail the build if any step failed or "
         "any path is missing. Do not use build for single-object requests.\n"
+        "- analyze_scene reads the current Workspace and returns a compact summary "
+        "of landmarks, major models, related object groups, class counts, and "
+        "optionally objects matching a query (Phase 9A). Use it at the start of a "
+        "complex build or edit request, or when the user refers to the existing "
+        "scene (e.g. 'build a shop near the big tree' or 'make the house taller'), "
+        "so you can understand the scene before acting instead of making many "
+        "individual inspection calls. It is read-only and never changes the project.\n"
         "- edit_build declares an iterative edit to an existing build (Phase 8D). "
         "Use this for follow-up requests like 'make the shop bigger', 'move the "
         "counter to the left', 'change the roof to red', 'add two windows', or "
@@ -1161,6 +1168,28 @@ class Agent:
                     cached = inspected_paths[path]
                     output = cached["output"]
                     cached_response_payload = cached["response_payload"]
+
+            # Phase 9A: analyze_scene is a read-only summarization tool. Compute
+            # the summary directly on the raw connection so the internal
+            # inspect_hierarchy/find_instances calls are not captured as the tool
+            # result; only the compact summary is shown to the model.
+            if call.name == "analyze_scene":
+                summary = rbxforge.analyze_scene_summary(
+                    self.rbx, call.arguments, self.timeout
+                )
+                skip_tool_execution = True
+                failure = None
+                if summary is None:
+                    failure = {
+                        "code": "execution_failed",
+                        "message": "analyze_scene could not read the scene",
+                    }
+                    output = False
+                else:
+                    output = summary.get("result") or summary
+                # Ensure the captured response payload stays None so the summary
+                # dict is what gets compacted for the model.
+                cached_response_payload = None
 
             if not skip_tool_execution:
                 output = None

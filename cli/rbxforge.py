@@ -52,6 +52,12 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   requests, and applies the smallest set of changes (modify, create, or
   delete) needed to satisfy the user's intent. Deletion is restricted to
   objects from the recent build context or touched in the current edit.
+- analyze_scene (Phase 9A) provides bounded, deterministic scene analysis
+  before builds and edits. It reads the Workspace hierarchy, identifies
+  landmarks, major models, groups of related objects, class counts, and
+  optionally objects matching a query, so the model can understand larger
+  scenes without repeated low-level inspection calls. It is read-only and
+  stays within strict depth/result/size limits.
   It never allows unbounded planning, arbitrary code execution, or
   unrestricted deletion.
 
@@ -1002,6 +1008,216 @@ def inspect_instance_tool():
     )
 
 
+# Phase 9A: bounded scene analysis. analyze_scene reads the Workspace hierarchy,
+# identifies landmarks, models, groups of related objects, and (optionally)
+# instances matching a query, then returns a compact, deterministic summary so
+# the model can understand larger scenes without repeatedly calling low-level
+# inspection tools.
+DEFAULT_ANALYZE_SCENE_DEPTH = 3
+MAX_ANALYZE_SCENE_DEPTH = 6
+DEFAULT_ANALYZE_SCENE_MAX_NODES = 200
+MAX_ANALYZE_SCENE_MAX_NODES = 500
+
+# Classes/names that are useful landmarks for planning builds and edits.
+LANDMARK_CLASSES = {"SpawnLocation"}
+LANDMARK_NAMES = {"SpawnLocation", "Baseplate", "Camera"}
+
+
+ANALYZE_SCENE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 200,
+        },
+        "depth": {
+            "type": "number",
+            "integer": True,
+            "minimum": 1,
+            "maximum": MAX_ANALYZE_SCENE_DEPTH,
+        },
+        "max_nodes": {
+            "type": "number",
+            "integer": True,
+            "minimum": 1,
+            "maximum": MAX_ANALYZE_SCENE_MAX_NODES,
+        },
+    },
+    "required": [],
+}
+
+
+def _scene_name_prefix(name):
+    """Return a shared prefix for grouping related instance names.
+
+    Splits on underscore, space, or dash and returns the first segment when
+    there are at least two segments. Returns None when no useful prefix exists.
+    """
+    if not name or not isinstance(name, str):
+        return None
+    parts = re.split(r"[_\s\-]+", name)
+    if len(parts) >= 2 and parts[0]:
+        return parts[0]
+    return None
+
+
+def _collect_scene_nodes(node, parent_path, out, max_nodes):
+    """Recursively collect lightweight scene nodes up to ``max_nodes``."""
+    if len(out) >= max_nodes:
+        return
+    name = node.get("name") or "?"
+    path = parent_path + "/" + name if parent_path else name
+    out.append({
+        "name": name,
+        "class": node.get("className") or "Unknown",
+        "path": path,
+        "parent_path": parent_path,
+        "child_count": len(node.get("children") or []),
+    })
+    for child in node.get("children") or []:
+        _collect_scene_nodes(child, path, out, max_nodes)
+
+
+def _build_scene_summary(nodes, max_nodes):
+    """Build a deterministic, bounded summary from collected scene nodes."""
+    total = len(nodes)
+    truncated = total >= max_nodes
+    landmarks = []
+    models = []
+    class_counts = {}
+    prefix_groups = {}
+
+    for node in nodes:
+        cls = node["class"]
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+        if cls in LANDMARK_CLASSES or node["name"] in LANDMARK_NAMES:
+            landmarks.append({
+                "name": node["name"],
+                "class": cls,
+                "path": node["path"],
+            })
+        if cls in ("Model", "Folder") and node["child_count"] > 0:
+            models.append({
+                "name": node["name"],
+                "class": cls,
+                "path": node["path"],
+                "child_count": node["child_count"],
+            })
+        prefix = _scene_name_prefix(node["name"])
+        if prefix:
+            prefix_groups.setdefault(prefix, []).append(node)
+
+    groups = []
+    for prefix, members in sorted(
+        prefix_groups.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
+        if len(members) >= 2:
+            groups.append({
+                "name": prefix,
+                "count": len(members),
+                "example_path": members[0]["path"],
+                "classes": sorted({m["class"] for m in members}),
+            })
+
+    return {
+        "total_nodes": total,
+        "truncated": truncated,
+        "landmarks": landmarks[:10],
+        "models": models[:20],
+        "groups": groups[:20],
+        "class_counts": class_counts,
+        "relevant": [],
+    }
+
+
+def analyze_scene_summary(rbx, params, timeout):
+    """Phase 9A: produce a bounded, deterministic scene summary.
+
+    Reads ``inspect_hierarchy`` and optionally ``find_instances`` through the
+    given connection ``rbx``. Returns ``{"ok": True, "result": summary}`` on
+    success, or ``None`` when the hierarchy cannot be read.
+    """
+    depth = params.get("depth")
+    if depth is None:
+        depth = DEFAULT_ANALYZE_SCENE_DEPTH
+    max_nodes = params.get("max_nodes")
+    if max_nodes is None:
+        max_nodes = DEFAULT_ANALYZE_SCENE_MAX_NODES
+    query = params.get("query")
+
+    response = rbx.send_request(
+        "inspect_hierarchy", {"depth": depth}, timeout
+    )
+    if not response or not response.get("ok"):
+        return None
+    result = response.get("result") or {}
+    tree = result.get("tree") or []
+    nodes = []
+    for root in tree:
+        _collect_scene_nodes(root, "", nodes, max_nodes)
+
+    summary = _build_scene_summary(nodes, max_nodes)
+
+    if query:
+        matches_response = rbx.send_request(
+            "find_instances", {"query": query, "max_results": 10}, timeout
+        )
+        if matches_response and matches_response.get("ok"):
+            matches = matches_response.get("result", {}).get("matches") or []
+            summary["relevant"] = [
+                {
+                    "name": m.get("name"),
+                    "class": m.get("className"),
+                    "path": m.get("path"),
+                }
+                for m in matches[:10]
+            ]
+
+    return {"ok": True, "result": summary}
+
+
+def analyze_scene_tool():
+    """Build the analyze_scene tool (Phase 9A).
+
+    ``analyze_scene`` returns a compact, deterministic summary of the current
+    Workspace: landmarks (SpawnLocation, Baseplate, ...), major models/folders,
+    groups of related instances by name prefix, class counts, and (optionally)
+    instances matching a query. It is read-only and never changes the project.
+    """
+
+    def run(rbx, params, timeout):
+        output = analyze_scene_summary(rbx, params, timeout)
+        if output is None:
+            rbx.log("analyze_scene failed: could not read hierarchy")
+            return False
+        summary = output["result"]
+        rbx.log(
+            "analyze_scene OK: {0} node(s), {1} landmark(s), {2} model(s), "
+            "{3} group(s)".format(
+                summary["total_nodes"],
+                len(summary["landmarks"]),
+                len(summary["models"]),
+                len(summary["groups"]),
+            )
+        )
+        return output
+
+    return Tool(
+        "analyze_scene",
+        "Analyze the current Workspace and return a compact, bounded summary. "
+        "Use this at the start of a complex build or edit request so you can "
+        "understand the existing scene before acting. It identifies landmarks "
+        "(SpawnLocation, Baseplate, etc.), major Models/Folders, groups of "
+        "related objects by name prefix, class counts, and (optionally) objects "
+        "matching a 'query'. The output is bounded and deterministic: it respects "
+        "'depth' (1..6, default 3) and 'max_nodes' (1..500, default 200). This "
+        "tool is read-only and never changes the project.",
+        ANALYZE_SCENE_SCHEMA,
+        run,
+    )
+
+
 # Creator Store asset search (Phase 7A). `query` is required and must be a
 # non-empty string; `asset_type` is an optional strict allowlist (the official
 # searchCategoryType values); `max_results` is optional (the CLI applies the
@@ -1647,6 +1863,7 @@ def default_registry():
     registry.register(edit_build_tool())
     registry.register(recent_build_context_tool())
     registry.register(delete_instance_tool())
+    registry.register(analyze_scene_tool())
     return registry
 
 

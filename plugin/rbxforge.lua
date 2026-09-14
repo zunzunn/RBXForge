@@ -1,13 +1,14 @@
 --!nonstrict
 -- RBXForge Studio Plugin - Phase 2A (create_part) + Phase 4A (inspect_hierarchy)
 -- + Phase 4B (find_instances) + Phase 4C (inspect_instance) + Phase 6A (create_script)
--- + Phase 6B (modify_instance) + Phase 7C (insert_asset)
+-- + Phase 6B (modify_instance) + Phase 7C (insert_asset) + Phase 7D (verification)
 -- Bridges Roblox Studio and the local RBXForge process over a WebSocket.
 --
 -- This milestone implements connection management, a ping/pong test message,
 -- and seven Studio operations: create_part, create_script, modify_instance,
 -- insert_asset, inspect_hierarchy, find_instances, and inspect_instance
--- (request/response).
+-- (request/response). insert_asset includes Phase 7D reliability checks:
+-- sibling-unique naming, post-parent verification, and path round-trip validation.
 --
 -- To run: copy this file into your Studio Plugins folder (use a real file,
 -- NOT a symlink - Studio skips symlinks in the plugins directory) and restart
@@ -1042,14 +1043,18 @@ local DEFAULT_INSERT_POSITION = Vector3.new(0, 5, 0)
 -- Generates a sibling-unique Name for `instance` inside `parent`: when the
 -- plain name already exists a numeric suffix is appended ("Cat", "Cat2",
 -- "Cat3", ...). The scan is hard-bounded so it can never loop forever.
+-- Returns (name, errorMessage); errorMessage is nil on success.
 local function uniqueSiblingName(parent, baseName)
 	local name = baseName
 	local counter = 2
-	while parent:FindFirstChild(name) and counter <= 1000 do
+	while parent:FindFirstChild(name) do
+		if counter > 1000 then
+			return nil, "could not find a unique sibling name for '" .. baseName .. "'"
+		end
 		name = baseName .. tostring(counter)
 		counter = counter + 1
 	end
-	return name
+	return name, nil
 end
 
 -- Positions a loaded asset at `pos`. Models are pivoted (modern PivotTo with a
@@ -1204,7 +1209,15 @@ local function handleInsertAsset(id, params)
 	end
 
 	-- Ensure a sibling-unique name so an existing instance is never shadowed.
-	local finalName = uniqueSiblingName(parent, loaded.Name)
+	local finalName, nameErr = uniqueSiblingName(parent, loaded.Name)
+	if not finalName then
+		pcall(function() loaded:Destroy() end)
+		log("insert_asset name error: " .. tostring(nameErr))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = tostring(nameErr),
+		})
+	end
 	loaded.Name = finalName
 
 	local okParent, parentErr = pcall(function()
@@ -1216,6 +1229,18 @@ local function handleInsertAsset(id, params)
 		return sendResponse(id, false, {
 			code = "execution_failed",
 			message = "could not parent asset into the project: " .. tostring(parentErr),
+		})
+	end
+
+	-- Phase 7D: confirm the asset actually ended up in the project. If parenting
+	-- silently failed or the instance was otherwise lost, report failure instead
+	-- of returning a bogus path.
+	if loaded.Parent ~= parent or not loaded:IsDescendantOf(game) then
+		pcall(function() loaded:Destroy() end)
+		log("insert_asset parenting verification failed")
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = "asset was not successfully parented into the project",
 		})
 	end
 
@@ -1250,6 +1275,25 @@ local function handleInsertAsset(id, params)
 	}
 	if positioned then
 		result.position = { x = finalPosition.X, y = finalPosition.Y, z = finalPosition.Z }
+	end
+
+	-- Phase 7D: the reported path must round-trip back to the inserted instance.
+	-- If buildGamePath produced an inconsistent path, fail rather than return a
+	-- path the caller cannot verify.
+	local okPathCheck, pathCheckErr = pcall(function()
+		local segments = splitPathSegments(result.path)
+		local resolved = resolveGameSegments(segments)
+		if resolved ~= loaded then
+			error("resolved path does not point back to the inserted instance")
+		end
+	end)
+	if not okPathCheck then
+		pcall(function() loaded:Destroy() end)
+		log("insert_asset path verification failed: " .. tostring(pathCheckErr))
+		return sendResponse(id, false, {
+			code = "execution_failed",
+			message = "inserted asset path is inconsistent: " .. tostring(pathCheckErr),
+		})
 	end
 
 	log(string.format(

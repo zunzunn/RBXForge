@@ -247,7 +247,7 @@ is parsed as `max_results`) and `--asset-search-once --query <text> [--asset-typ
 [--max-results N]` as a one-shot flag. One-shot execution is local HTTP, so it does **not** wait
 for the plugin: exit `0` on success, `2` when `--query` is missing, `4` on search failure.
 
-### insert_asset (Phase 7C)
+### insert_asset (Phase 7C / 7D)
 
 - **Purpose:** Insert a **Creator Store** asset into the currently connected Studio project at
   a specified or sensible location. This is the **action counterpart** to `asset_search` (7A) and
@@ -256,7 +256,7 @@ for the plugin: exit `0` on success, `2` when `--query` is missing, `4` on searc
   invents an id.
 - **Execution model:** this tool **does** go over the WebSocket to the plugin, like `create_part`
   and `modify_instance`. The CLI validates first; the plugin re-validates, loads, parents, and
-  positions.
+  positions. Phase 7D adds automatic Agent verification and plugin-side reliability checks.
 - **Inputs (schema, validated before sending):**
   - `asset_id` — required, digits-only string (`^[0-9]+$`, max 16 chars). Must be the exact id of
     an asset returned by a prior `asset_search` / `recommend_assets` call; the connection tracks
@@ -270,14 +270,22 @@ for the plugin: exit `0` on success, `2` when `--query` is missing, `4` on searc
   then beside the first `SpawnLocation` descendant, then a sensible default above the origin.
   Models pivot via `PivotTo`; bare parts get a `Position` assignment; assets that carry no
   transform (e.g. decal/audio) are reported `positioned: false` instead of silently adjusted.
-  Sibling names are kept unique by appending a bounded numeric suffix.
+  Sibling names are kept unique by appending a bounded numeric suffix; if no unique name can be
+  found the plugin reports an error rather than shadowing an existing instance.
 - **Expected output (success):** `{ asset_id, name, class, parent_path, path, positioned,
   placement, position? }` where `placement` is one of `"explicit"`, `"reference"`, or
   `"default"`.
-- **Agent behavior (action tool):** unlike search/ranking, `insert_asset` is an **action tool** —
-  the agent loop ends after one optional `inspect_instance` verification step. The id must be
+- **Agent behavior (action tool):** unlike search/ranking, `insert_asset` is an **action tool**.
+  Phase 7D makes verification **automatic and mandatory**: after a successful `insert_asset`, the
+  Agent immediately calls `inspect_instance` at the reported path and confirms path, name, and
+  class. If verification fails (missing instance, wrong path, or name/class mismatch) the result
+  is `verification_failed`, **not** success. The model should not call `inspect_instance` itself
+  after `insert_asset`; it should report as soon as `insert_asset` succeeds. The id must be
   search-sourced for the agent path; the `--insert-asset-once` CLI is the explicit human exception
   that seeds the registry directly.
+- **Plugin reliability (Phase 7D):** the plugin verifies the asset was actually parented
+  (`loaded.Parent == parent` and `IsDescendantOf(game)`), verifies the reported path round-trips
+  back to the inserted instance, and errors out if the unique-name scan exhausts its budget.
 - **Non-goals:** no purchasing, no arbitrary external downloads, no asset deletion, no unrelated
   changes.
 

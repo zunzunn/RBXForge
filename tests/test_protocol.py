@@ -2123,6 +2123,22 @@ def scenario_insert_asset_placement_modes():
             proc.proc.kill()
 
 
+def scenario_insert_asset_timeout():
+    """insert_asset must respect the request timeout and report failure when the
+    plugin gives no response (Phase 7D: delayed / missing response is not
+    treated as success)."""
+    mod = load_cli_module()
+    rbx = FakeRBX(None)  # send_request returns None, simulating a timeout
+    rbx.remember_assets([{"asset_id": "135522", "asset_type": "Model"}])
+    ok = mod.default_registry().execute(
+        rbx, "insert_asset", {"asset_id": "135522"}, timeout=0.01
+    )
+    assert ok is False, ok
+    assert rbx.requests == [("insert_asset", {"asset_id": "135522"})], rbx.requests
+    assert any("no response" in line for line in rbx.logs), rbx.logs
+    print("OK  insert_asset timeout / no plugin response is reported as failure")
+
+
 def scenario_insert_asset_cli_rejects_usage():
     """--insert-asset-once usage errors exit 2 before any insertion: a missing
     --asset-id, a position+reference_path conflict, and unparsable JSON."""
@@ -2468,6 +2484,7 @@ def main():
     scenario_insert_asset_success()
     scenario_insert_asset_failure()
     scenario_insert_asset_placement_modes()
+    scenario_insert_asset_timeout()
     scenario_insert_asset_cli_rejects_usage()
     scenario_interactive_insert_asset_registered()
     scenario_inspect_hierarchy_roundtrip()

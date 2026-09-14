@@ -434,9 +434,10 @@ def build_system_prompt(registry):
         "places it: give a vec3 'position', or a 'reference_path' to place it "
         "near an existing instance (e.g. when the user says 'near the "
         "SpawnLocation', inspect the scene first for its path), or neither to "
-        "use the plugin's default spot. After it succeeds you may call "
-        "inspect_instance exactly once to verify the placed asset at its "
-        "reported path, then report; do not call any other tools afterwards.\n"
+        "use the plugin's default spot. After insert_asset succeeds the system "
+        "automatically verifies the placed instance at its reported path, so "
+        "do not call inspect_instance yourself; report as soon as insert_asset "
+        "succeeds.\n"
         "- create_part and create_script change the project; once a change tool reports "
         "success, the model may call inspect_instance exactly once to verify the "
         "result if the target can be resolved and verification is useful; "
@@ -478,7 +479,9 @@ class AgentResult:
       when no action tool executed (a final-report completion or pure-inspection
       loop). For a successful ``modify_instance`` the action call is reported
       even when the loop also ran the single optional verification step (the
-      verification is recorded in ``steps``).
+      verification is recorded in ``steps``). For ``insert_asset`` the loop
+      automatically runs one ``inspect_instance`` verification step (Phase 7D)
+      and reports failure if verification does not match.
     - ``output``: the last tool execution result from the tool layer (e.g. bool).
     - ``message``: a final model report, or None.
     - ``steps``: ordered record of each parsed tool call and its outcome as
@@ -551,6 +554,99 @@ class Agent:
         """The currently registered tool definitions sent to the model."""
         return tool_definitions(self.registry)
 
+    def _verify_inserted_asset(self, insert_response, timeout):
+        """Phase 7D: after a successful insert_asset, verify the instance exists
+        at the reported path and matches the reported name/class.
+
+        Returns ``(verified: bool, info: dict)`` where ``info`` contains the
+        inspect_instance arguments, output, compacted data, result text, and a
+        human-readable message. On failure ``verified`` is False and
+        ``info["message"]`` explains why.
+        """
+        info = {
+            "arguments": None,
+            "output": False,
+            "data": None,
+            "result": None,
+            "message": None,
+        }
+        if not insert_response or not insert_response.get("ok"):
+            info["message"] = "insert_asset did not report success"
+            return False, info
+
+        result = insert_response.get("result") or {}
+        path = result.get("path")
+        if not path:
+            info["message"] = "insert_asset succeeded but did not return a path to verify"
+            return False, info
+
+        expected_name = result.get("name")
+        expected_class = result.get("class")
+        arguments = {"path": path}
+        info["arguments"] = arguments
+
+        capturer = CapturingRBX(self.rbx)
+        try:
+            output = self.registry.execute(
+                capturer, "inspect_instance", arguments, timeout
+            )
+        except (rbxforge.UnknownToolError, rbxforge.InvalidParamsError) as exc:
+            info["message"] = "verification tool error: " + str(exc)
+            return False, info
+
+        response_payload = (
+            capturer.responses[-1]["response"] if capturer.responses else None
+        )
+        info["output"] = output
+        info["data"] = (
+            _compact_value(response_payload)
+            if response_payload is not None
+            else None
+        )
+        info["result"] = compact_tool_result(
+            ToolCall(name="inspect_instance", arguments=arguments),
+            output,
+            response_payload,
+        )
+
+        if not output or not response_payload or not response_payload.get("ok"):
+            info["message"] = (
+                "insert_asset reported success but verification of {0} failed".format(
+                    path
+                )
+            )
+            return False, info
+
+        inspected = response_payload.get("result") or {}
+        actual_path = inspected.get("path")
+        actual_name = inspected.get("name")
+        actual_class = inspected.get("className") or inspected.get("class")
+
+        if actual_path != path:
+            info["message"] = "verification path mismatch: expected {0}, found {1}".format(
+                path, actual_path
+            )
+            return False, info
+        if expected_name is not None and actual_name != expected_name:
+            info["message"] = (
+                "verification name mismatch at {0}: expected {1}, found {2}".format(
+                    path, expected_name, actual_name
+                )
+            )
+            return False, info
+        if expected_class is not None and actual_class != expected_class:
+            info["message"] = (
+                "verification class mismatch at {0}: expected {1}, found {2}".format(
+                    path, expected_class, actual_class
+                )
+            )
+            return False, info
+
+        info["message"] = "Verified insertion: asset {0} is {1} ({2}) at {3}".format(
+            result.get("asset_id"), actual_name, actual_class, path
+        )
+        return True, info
+
     def run(self, prompt, **chat_options):
         """Run ``prompt`` through the bounded multi-step loop.
 
@@ -562,7 +658,10 @@ class Agent:
         Single-step requests behave as before: a model that replies with a
         ``create_part`` call executes it once and stops. A successful
         ``modify_instance`` pauses the loop for exactly one optional
-        ``inspect_instance`` verification step, then ends.
+        ``inspect_instance`` verification step, then ends. A successful
+        ``insert_asset`` automatically runs one ``inspect_instance``
+        verification step (Phase 7D) and fails if the instance is not found or
+        does not match the reported path/name/class.
         """
         messages = [
             providers.message("system", build_system_prompt(self.registry)),
@@ -713,6 +812,47 @@ class Agent:
                     error=failure,
                 )
             if call.name in ACTION_TOOLS:
+                # Phase 7D: insert_asset automatically verifies the placed
+                # instance at the reported path before the loop ends. This makes
+                # the end-to-end asset workflow reliable: the agent never claims
+                # success when the instance cannot be found or does not match
+                # the insertion report.
+                if call.name == "insert_asset":
+                    verified, verify_info = self._verify_inserted_asset(
+                        response_payload, self.timeout
+                    )
+                    issued += 1
+                    steps.append(
+                        {
+                            "tool": "inspect_instance",
+                            "arguments": verify_info["arguments"],
+                            "output": verify_info["output"],
+                            "data": verify_info["data"],
+                            "result": verify_info["result"],
+                            "ok": verified,
+                        }
+                    )
+                    if not verified:
+                        return AgentResult(
+                            ok=False,
+                            tool=call,
+                            output=output,
+                            provider_text=last_text,
+                            steps=steps,
+                            error={
+                                "code": "verification_failed",
+                                "message": verify_info["message"],
+                            },
+                        )
+                    return AgentResult(
+                        ok=True,
+                        tool=call,
+                        output=output,
+                        provider_text=last_text,
+                        steps=steps,
+                        message=verify_info["message"],
+                    )
+
                 # Phase 6B: a successful action tool does not end the loop
                 # immediately - it permits exactly one optional inspect_instance
                 # verification step before the loop ends. After a successful
@@ -720,12 +860,11 @@ class Agent:
                 # result when the target can be resolved and verification is
                 # useful; verification is skipped when the tool result already
                 # provides sufficient information.
-                # modify_instance and insert_asset (Phase 7C) always permit
-                # verification; create_part and create_script only permit it
-                # when the model has previously called an inspection tool to
-                # gather project context.
+                # modify_instance always permits verification; create_part and
+                # create_script only permit it when the model has previously
+                # called an inspection tool to gather project context.
                 if pending_verify is None:
-                    if call.name in ("modify_instance", "insert_asset"):
+                    if call.name == "modify_instance":
                         pending_verify = {"call": call, "output": output}
                     elif (
                         call.name in ("create_part", "create_script")

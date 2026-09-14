@@ -33,7 +33,10 @@ plugin/rbxforge.lua) connects to this process. This milestone implements:
   (the model can never invent one), validates the asset before anything is
   sent, and the plugin resolves the parent, places the asset (explicit
   position, near a referenced instance, or beside the SpawnLocation), and
-  reports the resulting instance path.
+  reports the resulting instance path. Phase 7D makes the Agent path
+  reliable: after a successful insertion the agent automatically verifies
+  the placed instance with inspect_instance at the reported path and fails
+  closed if the instance is missing or does not match.
 
 Standard library only; no external dependencies.
 
@@ -67,11 +70,13 @@ Creator Store over the Open Cloud API and needs RBXFORGE_OPEN_CLOUD_API_KEY
 into a bounded, explainable recommendation list (see cli/asset_ranking.py).
 Both run locally and do not touch the plugin.
 
-insert_asset (Phase 7C) goes over the WebSocket to the plugin and needs a
+insert_asset (Phase 7C/7D) goes over the WebSocket to the plugin and needs a
 connected Studio session. It only accepts asset ids that a prior
 asset_search / recommend_assets call in the same RBXForge session returned,
 so the AI can never invent an id; --insert-asset-once is the explicit
-human exception (the id is typed on the command line).
+human exception (the id is typed on the command line). In the Agent path
+(Phase 7D) the insertion is automatically verified with inspect_instance
+before success is reported.
 
 Protocol details: see docs/PROTOCOL.md.
 """
@@ -1228,13 +1233,16 @@ def insert_asset_tool():
         "sensible location. The 'asset_id' MUST be the exact id of an asset "
         "already returned by asset_search or recommend_assets (ids are never "
         "invented); it is validated before anything is sent and the plugin "
-        "loads it, gives it a unique name, and reports the resulting instance "
-        "path. 'parent_path' (game-rooted, default Workspace) is the target "
-        "container; supply exactly one of 'position' (absolute vec3) or "
-        "reference_path (a path like 'Workspace.SpawnLocation' to place near) "
-        "or neither (the plugin places the asset beside the project's "
-        "SpawnLocation). Insertable asset types: Model, MeshPart, Decal, "
-        "Audio. Read-only search never inserts; this tool does.",
+        "loads it, gives it a unique name, parents it, and reports the "
+        "resulting instance path. 'parent_path' (game-rooted, default "
+        "Workspace) is the target container; supply exactly one of 'position' "
+        "(absolute vec3) or 'reference_path' (a path like "
+        "'Workspace.SpawnLocation' to place near) or neither (the plugin "
+        "places the asset beside the project's SpawnLocation). Insertable "
+        "asset types: Model, MeshPart, Decal, Audio. In the Agent path the "
+        "insertion is automatically verified with inspect_instance at the "
+        "reported path before success is reported (Phase 7D). Read-only "
+        "search never inserts; this tool does.",
         INSERT_ASSET_SCHEMA,
         run,
     )

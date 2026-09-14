@@ -199,12 +199,10 @@ bounded compacted result is appended to the conversation
    ↓
 model can call find_instances / inspect_instance / inspect_hierarchy again, or act
    ↓
-action tool succeeds → loop permits exactly one optional inspect_instance
-  verification step before ending (conditional on whether the model
-  previously called an inspection tool during the same request to gather project context).
-  modify_instance also permits exactly one optional inspect_instance verification step
-  after success (existing Phase 4D behavior). insert_asset (Phase 7C) likewise permits
-  exactly one optional inspect_instance verification step of the placed asset.
+action tool succeeds → loop ends (create_part/create_script/modify_instance permit
+  one optional model-driven inspect_instance verification step before ending;
+  insert_asset automatically verifies with inspect_instance at the reported path
+  and fails closed if the instance is missing or does not match).
 ```
 
 `asset_search` (Phase 7A) and `recommend_assets` (Phase 7B) participate in the same loop but
@@ -212,10 +210,13 @@ execute as **local HTTP calls** (no plugin `request`), so `ToolRegistry.execute 
 (plugin)` does not apply to them. `asset_search` returns the bounded candidate list;
 `recommend_assets` ranks that metadata in-process into a bounded, explainable recommendation
 list (no extra API calls). Their structured dict results take the place of the plugin `response`
-payload when the loop compacts what to show the model. `insert_asset` (Phase 7C) is the
+payload when the loop compacts what to show the model. `insert_asset` (Phase 7C/7D) is the
 counterpart that does cross to the plugin: it only accepts an `asset_id` that a prior
 `asset_search` / `recommend_assets` result recorded in the session's bounded known-id registry,
-so the model bases every insertion on real discovered assets.
+so the model bases every insertion on real discovered assets. Phase 7D makes the verification
+automatic: after `insert_asset` succeeds, the Agent calls `inspect_instance` at the reported
+path and reports `verification_failed` if the instance is missing or its name/class/path does
+not match the insertion report.
 
 - The model replies with **one JSON object per step**: a tool call or a final report. The loop
   continues only while the model keeps choosing inspection tools successfully and the per-request
@@ -223,10 +224,11 @@ so the model bases every insertion on real discovered assets.
 - **Stopping:** the loop ends on an executed **action tool** (`create_part`, `create_script`,
   `modify_instance`, `insert_asset`), a final model report (`{"message": ...}`), a hard rejection
   (`unknown_tool` / `invalid_arguments` / `malformed_output` / `provider_error` /
-  `execution_failed`), or the **5-call budget** being exhausted (`max_tool_calls`). It stops
-  rather than guessing when it cannot determine what to do. `asset_search` and
-  `recommend_assets` are **not** action tools, so a successful search/recommendation alone never
-  ends the loop — the loop ends when the model inserts (7C) or otherwise acts.
+  `execution_failed` / `verification_failed`), or the **5-call budget** being exhausted
+  (`max_tool_calls`). It stops rather than guessing when it cannot determine what to do.
+  `asset_search` and `recommend_assets` are **not** action tools, so a successful
+  search/recommendation alone never ends the loop — the loop ends when the model inserts (7C/7D)
+  or otherwise acts.
 - **Tool results are bounded.** Each result is compacted before being shown to the model
   (`compact_tool_result`): match lists / children are capped, strings are truncated, and the
   serialized payload has a hard character budget — unbounded hierarchy/property data is never
@@ -250,6 +252,11 @@ so the model bases every insertion on real discovered assets.
     or `inspect_instance`) during the same request, allowing it to verify the newly-created
     instance against the gathered context. Verification is skipped when the tool result already
     provides sufficient information or when no inspection context was gathered.
+  - `insert_asset` (Phase 7D): after success, the Agent **automatically** executes one
+    `inspect_instance` call at the reported path and compares path, name, and class. If the
+    instance is missing or does not match, the result is `verification_failed` and the loop
+    stops without reporting success. The model should not call `inspect_instance` itself after
+    `insert_asset`.
 - Provider-native tool calling (OpenAI-style `tool_calls`, NIM) is **not** used yet; the loop
   relies on plain `chat` output parsed as JSON (one object per step). Normalizing
   provider-specific tool-call formats behind the provider abstraction is future work.

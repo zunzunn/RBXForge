@@ -381,6 +381,57 @@ currently connected Studio project at a specified or sensible location.
 **Explicitly NOT included:** purchasing assets, arbitrary external downloads, asset
 deletion, or unrelated project changes.
 
+### Phase 7D — Asset Insertion Verification and Reliability
+
+> **Status:** Done. After `insert_asset` reports success, the Agent automatically
+> verifies the placed instance with `inspect_instance` at the reported path and
+> fails closed when verification does not match; the plugin also defends against
+> silent parenting failures, duplicate-name exhaustion, and inconsistent paths.
+
+**Goal:** make the end-to-end asset workflow reliable: search (7A) → rank (7B) →
+select → insert (7C) → **inspect/verify**. The Agent must never claim success when
+the expected instance is missing, the returned path is wrong, or the inspected
+properties do not match the insertion report.
+
+**Deliverables:**
+
+- **Agent-side automatic verification:** after a successful `insert_asset`, the
+  Agent immediately executes `inspect_instance` at the path the plugin returned and
+  compares path, name, and class. Any mismatch (including a missing instance,
+  wrong path, or name/class mismatch) is reported as `verification_failed`; the
+  result is **not** presented as a successful insertion.
+- **Graceful handling of delayed/missing responses:** `insert_asset` already
+  respects the per-tool timeout; a missing plugin response is reported as a
+  failure, not success.
+- **Plugin-side reliability checks:** `plugin/rbxforge.lua` verifies that the
+  loaded asset is actually parented in the project (`loaded.Parent == parent` and
+  `IsDescendantOf(game)`), caps the sibling-unique name scan and reports an error
+  if no unique name can be found, and verifies that the reported path round-trips
+  back to the inserted instance before returning success.
+- **Duplicate-name handling:** the plugin's `uniqueSiblingName` appends a bounded
+  numeric suffix ("Cafe Shop2", "Cafe Shop3", ...) and errors out if the scan
+  exhausts its budget; the Agent verifies at the *returned* path so it reports the
+  actual unique name.
+- **Bounded tool calls preserved:** automatic verification adds exactly one
+  `inspect_instance` call after a successful `insert_asset`; no unbounded loop is
+  introduced.
+- **No new protocol version:** verification reuses the existing `insert_asset` and
+  `inspect_instance` `request`/`response` messages.
+
+**Verification criteria:**
+
+- Automated tests cover successful verification, missing inserted instance,
+  delayed/timeout response, duplicate-name suffix handling, incorrect returned path,
+  name/class mismatch, insertion failure, and the full Agent flow
+  `asset_search` → ranking → `insert_asset` → automatic `inspect_instance`.
+- The Agent never reports success when verification fails; every failure path
+  produces a clear `verification_failed` or `execution_failed` result.
+
+**Dependencies:** Phases 7A, 7B, and 7C.
+
+**Explicitly NOT included:** purchasing assets, arbitrary external downloads,
+asset deletion, or unrelated project changes.
+
 ---
 
 ## No Dates
@@ -405,4 +456,4 @@ estimates are avoided until the system is real and measurable.
 | Phase 4 — Project Awareness | **In progress** (4A basic inspection done: `inspect_hierarchy`; 4B hierarchy search done: `find_instances`; 4C single-instance inspection done: `inspect_instance`; 4D AI project context / bounded multi-step agent loop done; 4E hosted Groq provider done; 6C verification behavior extensions) |
 | Phase 5 — Building Systems | **In progress** (5A color enum done; 5B physics defaults done; 5C material enum/default + validation done) |
 | Phase 6 — Gameplay Logic | **In progress** (6A `create_script` done: script creation with type/parent/source; 6B `modify_instance` done: allowlisted property changes on existing instances; 6C verification behavior extensions) |
-| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default, verification via one optional `inspect_instance`) |
+| Phase 7 — Autonomous Game Development | **In progress** (7A asset discovery done: `asset_search` searches the public Roblox Creator Store over the Open Cloud API — read-only, local HTTP, no plugin/Studio changes; exposed to the REPL, the one-shot CLI, and the agent without ending the agent loop; 7B asset ranking done: `recommend_assets` ranks search results into a bounded, deterministic, explainable recommendation list — read-only, no extra API calls, likewise exposed; 7C asset insertion done: `insert_asset` inserts a Creator Store asset by an id a prior search/ranking returned — ids are never invented, placement is explicit/near-a-reference/default; 7D verification done: after `insert_asset` the Agent automatically verifies the placed instance with `inspect_instance` and fails closed on mismatch/missing/timeout, and the plugin defends against silent parenting failures, duplicate-name exhaustion, and inconsistent paths) |

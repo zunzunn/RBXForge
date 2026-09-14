@@ -1046,13 +1046,14 @@ def scenario_agent_recommend_flow():
 
 
 def scenario_agent_insert_flow():
-    """Agent-level Phase 7C flow: search -> rank -> select -> insert -> verify.
+    """Agent-level Phase 7D flow: search -> rank -> select -> insert -> verify.
 
     The model searches the store, ranks the results, picks the ranked asset,
-    inserts it exactly by the id the search returned (never invented), and
-    verifies the placed instance once. Only insert_asset and inspect_instance
-    touch the plugin/WebSocket path; the id is enforced against the ids the
-    search/ranking recorded in this session."""
+    inserts it exactly by the id the search returned (never invented), and the
+    agent automatically verifies the placed instance at the reported path.
+    Only insert_asset and the automatic inspect_instance touch the
+    plugin/WebSocket path; the id is enforced against the ids the search/ranking
+    recorded in this session."""
     mod = agent_mod
     with FakeStoreServer(body=recommend_body()) as server:
         client = assets_mod.RobloxAssetClient(_KEY, base_url=full_server_url(server.port))
@@ -1111,10 +1112,6 @@ def scenario_agent_insert_flow():
             asset_call("sword"),
             recommend_call("sword", limit=2),
             json.dumps({"tool": "insert_asset", "arguments": {"asset_id": "3"}}),
-            json.dumps({
-                "tool": "inspect_instance",
-                "arguments": {"path": "Workspace/Enchanted Sword"},
-            }),
         ])
         rbx = FakeRBX(client)
         registry = rbxforge.default_registry()
@@ -1124,12 +1121,14 @@ def scenario_agent_insert_flow():
 
         assert result.ok is True, result
         assert result.tool.name == "insert_asset", result
+        assert result.message is not None, result
+        assert "Verified insertion" in result.message, result.message
         assert [step["tool"] for step in result.steps] == [
             "asset_search", "recommend_assets", "insert_asset", "inspect_instance",
         ], result.steps
         assert all(step["ok"] for step in result.steps), result.steps
-        # Loop ended after the single verification step - exactly four chats.
-        assert len(provider.chat_calls) == 4, provider.chat_calls
+        # Three model chats (search, rank, insert); verification is automatic.
+        assert len(provider.chat_calls) == 3, provider.chat_calls
         # The id inserted came exactly from the search/ranking results.
         assert rbx.requests[0] == ("insert_asset", {"asset_id": "3"}), rbx.requests
         assert rbx.requests[1] == (

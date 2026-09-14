@@ -741,10 +741,10 @@ def scenario_create_script_action_tool():
 
 
 def scenario_insert_asset_action_tool():
-    """insert_asset must be an action tool (Phase 7C): listed in ACTION_TOOLS,
-    exposed to the model, executed with the id decided from search, and — like
-    modify_instance — the loop pauses for exactly one optional inspect_instance
-    verification step before ending."""
+    """insert_asset must be an action tool (Phase 7C) and Phase 7D must
+    automatically verify the inserted instance at the reported path before
+    reporting success. Verification failures are reported as
+    verification_failed, not success."""
     mod = load_agent_module()
     assert "insert_asset" in mod.ACTION_TOOLS, mod.ACTION_TOOLS
 
@@ -761,16 +761,26 @@ def scenario_insert_asset_action_tool():
         "tool": "insert_asset",
         "arguments": {"asset_id": "135522"},
     })
+    verify_payload = {
+        "ok": True,
+        "result": {
+            "name": "Cafe Shop",
+            "className": "Model",
+            "path": "Workspace/Cafe Shop",
+            "parent_path": "Workspace",
+            "properties": {},
+        },
+    }
 
-    # With verification: insert + one inspect_instance, then the loop ends
-    # immediately (no third provider reply is consumed).
+    # Successful insert: the agent automatically calls inspect_instance at the
+    # reported path and only reports success after verification matches.
     provider = SequenceProvider([
         insert_call,
-        json.dumps({"tool": "inspect_instance", "arguments": {"path": "Workspace/Cafe Shop"}}),
+        json.dumps({"message": "inserted a cafe shop model into Workspace"}),
     ])
     rbx = MultiFakeRBX({
         "insert_asset": insert_result,
-        "inspect_instance": inspect_payload("Cafe Shop"),
+        "inspect_instance": verify_payload,
     }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
                                 "name": "Cafe Shop"}})
     result = make_agent(provider, rbx=rbx).run("add a shop model near the SpawnLocation")
@@ -778,34 +788,91 @@ def scenario_insert_asset_action_tool():
     assert result.ok is True, result
     assert result.error is None, result
     assert result.tool.name == "insert_asset", result
-    assert result.message is None, result
+    assert result.message is not None, result
+    assert "Verified" in result.message, result.message
     assert [step["tool"] for step in result.steps] == ["insert_asset", "inspect_instance"], result.steps
     assert rbx.requests == [
         ("insert_asset", {"asset_id": "135522"}),
         ("inspect_instance", {"path": "Workspace/Cafe Shop"}),
     ], rbx.requests
-    assert len(provider.chat_calls) == 2, len(provider.chat_calls)
+    # Only one provider chat is consumed: the agent auto-verifies and reports.
+    assert len(provider.chat_calls) == 1, len(provider.chat_calls)
     assert any("insert_asset OK" in line for line in rbx.logs), rbx.logs
-    print("OK  insert_asset is an action tool; one optional verify step then loop ends")
+    print("OK  insert_asset is an action tool; automatic verification succeeds")
 
-    # Without a verification call the model's final report completes the task
-    # (one extra chat turn gives it that choice, then it reports).
-    provider2 = SequenceProvider([
-        insert_call,
-        json.dumps({"message": "inserted a cafe shop model into Workspace"}),
+    # Duplicate-name handling: the plugin may rename to a unique suffix; the
+    # agent verifies at the returned path and reports that path, not the
+    # original name.
+    duplicate_insert = dict(insert_result)
+    duplicate_insert["result"] = dict(insert_result["result"])
+    duplicate_insert["result"]["name"] = "Cafe Shop2"
+    duplicate_insert["result"]["path"] = "Workspace/Cafe Shop2"
+    duplicate_verify = {
+        "ok": True,
+        "result": {
+            "name": "Cafe Shop2",
+            "className": "Model",
+            "path": "Workspace/Cafe Shop2",
+            "parent_path": "Workspace",
+            "properties": {},
+        },
+    }
+    provider_dup = SequenceProvider([
+        json.dumps({"tool": "insert_asset", "arguments": {"asset_id": "135522"}}),
+        json.dumps({"message": "inserted a uniquely-named shop model"}),
     ])
-    rbx2 = MultiFakeRBX({"insert_asset": insert_result},
-                        known_assets={"135522": {"asset_id": "135522",
-                                                 "asset_type": "Model"}})
-    result2 = make_agent(provider2, rbx=rbx2).run("insert the shop")
-    assert result2.ok is True, result2
-    assert result2.tool.name == "insert_asset", result2
-    assert result2.message == "inserted a cafe shop model into Workspace", result2
-    assert [step["tool"] for step in result2.steps] == ["insert_asset"], result2.steps
-    assert len(provider2.chat_calls) == 2, len(provider2.chat_calls)
-    print("OK  insert_asset completes via final report when no verification is needed")
+    rbx_dup = MultiFakeRBX({
+        "insert_asset": duplicate_insert,
+        "inspect_instance": duplicate_verify,
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}})
+    result_dup = make_agent(provider_dup, rbx=rbx_dup).run("add another shop model")
+    assert result_dup.ok is True, result_dup
+    assert "Cafe Shop2" in result_dup.message, result_dup
+    assert [step["tool"] for step in result_dup.steps] == ["insert_asset", "inspect_instance"], result_dup.steps
+    assert rbx_dup.requests[1] == ("inspect_instance", {"path": "Workspace/Cafe Shop2"}), rbx_dup.requests
+    assert len(provider_dup.chat_calls) == 1, len(provider_dup.chat_calls)
+    print("OK  insert_asset verification follows duplicate-name suffix from the plugin")
 
-    # A plugin-side failure (ok:false) is reported as execution_failed.
+    # Verification failure: insert reports success but the instance is missing.
+    provider_missing = SequenceProvider([
+        insert_call,
+        json.dumps({"message": "done"}),
+    ])
+    rbx_missing = MultiFakeRBX({
+        "insert_asset": insert_result,
+        "inspect_instance": {"ok": False, "error": {"code": "not_found", "message": "no instance at path"}},
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}})
+    result_missing = make_agent(provider_missing, rbx=rbx_missing).run("add a shop model")
+    assert result_missing.ok is False, result_missing
+    assert result_missing.error["code"] == "verification_failed", result_missing
+    assert [step["tool"] for step in result_missing.steps] == ["insert_asset", "inspect_instance"], result_missing.steps
+    assert len(provider_missing.chat_calls) == 1, len(provider_missing.chat_calls)
+    print("OK  insert_asset verification failure (missing instance) reported as verification_failed")
+
+    # Verification failure: path/class mismatch.
+    mismatch_payload = {
+        "ok": True,
+        "result": {
+            "name": "Other Model", "className": "Part",
+            "path": "Workspace/Cafe Shop", "properties": {},
+        },
+    }
+    provider_mismatch = SequenceProvider([
+        insert_call,
+        json.dumps({"message": "done"}),
+    ])
+    rbx_mismatch = MultiFakeRBX({
+        "insert_asset": insert_result,
+        "inspect_instance": mismatch_payload,
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}})
+    result_mismatch = make_agent(provider_mismatch, rbx=rbx_mismatch).run("add a shop model")
+    assert result_mismatch.ok is False, result_mismatch
+    assert result_mismatch.error["code"] == "verification_failed", result_mismatch
+    assert len(provider_mismatch.chat_calls) == 1, len(provider_mismatch.chat_calls)
+    print("OK  insert_asset verification catches name/class mismatch")
+
+    # A plugin-side insert failure (ok:false) is reported as execution_failed
+    # and never reaches verification.
     failing = dict(insert_result)
     failing["ok"] = False
     failing["error"] = {"code": "not_found", "message": "asset not found or not insertable: 999999"}
@@ -816,7 +883,7 @@ def scenario_insert_asset_action_tool():
     result_fail = make_agent(provider_fail, rbx=rbx_fail).run("insert a ghost asset")
     assert result_fail.ok is False, result_fail
     assert result_fail.error["code"] == "execution_failed", result_fail
-    assert result_fail.steps[0]["tool"] == "insert_asset", result_fail.steps
+    assert [step["tool"] for step in result_fail.steps] == ["insert_asset"], result_fail.steps
     assert result_fail.steps[0]["ok"] is False, result_fail.steps
     print("OK  insert_asset failure in agent loop reported as execution_failed")
 

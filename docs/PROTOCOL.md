@@ -8,7 +8,9 @@
 >   dispatched through registries on both sides, with CLI-side argument validation before any
 >   `request` is sent: `create_part` (Phase 2B), `inspect_hierarchy` (Phase 4A),
 >   `find_instances` (Phase 4B), `inspect_instance` (Phase 4C), `create_script` (Phase 6A),
->   `modify_instance` (Phase 6B), and `insert_asset` (Phase 7C).
+>   `modify_instance` (Phase 6B), and `insert_asset` (Phase 7C / 7D). Phase 7D keeps the same
+>   messages but adds automatic Agent-side verification after a successful `insert_asset`
+>   (`inspect_instance` at the reported path) and plugin-side post-insert reliability checks.
 > - **Deliberate exception (Phase 7A/7B):** `asset_search` and `recommend_assets` are registered
 >   tools but are **not** dispatched through the plugin. They execute as **local HTTP calls** to
 >   the Open Cloud Creator Store API from `cli/roblox_assets.py` / `cli/asset_ranking.py`, so they
@@ -566,11 +568,13 @@ schema-validated exactly like the others, but their execution **does not produce
 `cli/roblox_assets.py` (search) and rank purely in-process in `cli/asset_ranking.py`
 (recommendation — no extra API calls beyond the search; no robot changes to Studio). Their
 structured result is returned directly (and logged / shown to the agent); there is no plugin
-handler and no `response` message. `insert_asset` (Phase 7C) is the counterpart that **does**
-produce a normal `request`/`response` pair: the CLI accepts an `asset_id` only if a prior
+handler and no `response` message. `insert_asset` (Phase 7C/7D) is the counterpart that **does**
+produce normal `request`/`response` pairs: the CLI accepts an `asset_id` only if a prior
 search/ranking recorded it in the bounded per-session known-id registry (or the human typed it
-via `--insert-asset-once`), and the plugin loads it with `InsertService:LoadAsset` and reports
-the final instance path. See [TOOLS.md](./TOOLS.md).
+via `--insert-asset-once`), and the plugin loads it with `InsertService:LoadAsset`, applies
+Phase 7D reliability checks (parenting verification, bounded unique naming, path round-trip),
+and reports the final instance path. The Agent then reuses `inspect_instance` to verify the
+placed instance before reporting success. See [TOOLS.md](./TOOLS.md).
 
 ## Future Streaming / Events (Planned)
 

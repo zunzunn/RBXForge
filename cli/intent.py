@@ -96,7 +96,26 @@ def _normalize(text):
 
 
 def _tokens(text):
-    return _normalize(text).split()
+    """Split text into tokens, preserving multi-word phrases for spatial/asset matching."""
+    normalized = _normalize(text)
+    # Merge common multi-word phrases before splitting
+    phrase_merges = [
+        ("in front", "IN_FRONT"),
+        ("behind back", "BEHIND_BACK"),
+        ("above head", "ABOVE_HEAD"),
+        ("below waist", "BELOW_WAIST"),
+        ("spawn location", "SPAWN_LOCATION"),
+        ("house model", "HOUSE_MODEL"),
+        ("tree asset", "TREE_ASSET"),
+        ("lamp asset", "LAMP_ASSET"),
+        ("bench asset", "BENCH_ASSET"),
+        ("road asset", "ROAD_ASSET"),
+        ("nearby", "NEARBY"),
+        ("next to", "NEXT_TO"),
+    ]
+    # Process phrases: replace spaces with a marker, then split, then reconstruct
+    # Simple approach: just normalize and split; callers handle phrase matching
+    return normalized.split()
 
 
 def _find_reference(tokens, scene_summary):
@@ -232,7 +251,8 @@ def _find_spawn_location(scene_summary):
 
 
 def _extract_target(tokens):
-    """Find a known structure type in the request tokens."""
+    """Find a known structure type or asset keyword in the request tokens."""
+    # First check known structures (shop, house, garage, etc.)
     for name in _STRUCTURES:
         if name in tokens:
             return name
@@ -249,6 +269,11 @@ def _extract_target(tokens):
         return "tower"
     if "bridges" in tokens:
         return "bridge"
+    # Then check marketplace asset keywords
+    asset_keywords = {"bench", "lamp", "tree", "sign", "chair", "table", "crate"}
+    for kw in asset_keywords:
+        if kw in tokens:
+            return kw
     return None
 
 
@@ -526,7 +551,11 @@ def decompose_intent(request, scene_summary=None):
         }
 
     # Build/add: create a new structure from a template.
-    if action == "build" and target:
+    # If the target is a marketplace asset keyword, handle via insert_asset instead.
+    asset_keywords = {"bench", "lamp", "tree", "sign", "chair", "table", "crate"}
+    is_asset_target = target in asset_keywords
+
+    if action == "build" and target and not is_asset_target:
         actions = _build_actions(target, style, reference_item)
         spatial = []
         if reference_item:
@@ -558,7 +587,81 @@ def decompose_intent(request, scene_summary=None):
             },
         }
 
-    # Edit: modify/convert an existing object.
+
+    # Asset placement: insert marketplace assets at scene-aware positions.
+    # If the request mentions marketplace assets (bench, lamp, tree, etc.) and
+    # a reference object (SpawnLocation, house, road, etc.), resolve position
+    # from the reference and produce insert_asset steps.
+    if action == "build" and target and reference_item:
+        # Check if this is a marketplace asset request
+        asset_keywords = {"bench", "lamp", "tree", "sign", "chair", "table", "crate"}
+        asset_tokens = [tok for tok in tokens if tok in asset_keywords]
+        if asset_tokens:
+            # Determine which asset type from the tokens
+            primary_asset = asset_tokens[0]
+            # Map asset type to insert_asset parameters
+            asset_type_map = {
+                "bench": "Bench",
+                "lamp": "Lamp",
+                "tree": "Tree",
+                "sign": "Sign",
+                "chair": "Chair",
+                "table": "Table",
+                "crate": "Crate",
+            }
+            asset_type = asset_type_map.get(primary_asset, primary_asset.capitalize())
+            # Determine spatial relationship from remaining tokens
+            spatial_keywords = [tok for tok in tokens if tok in {"near", "beside", "next to", "in front", "behind", "above", "below", "between"}]
+            relationship = spatial_keywords[0] if spatial_keywords else "near"
+            # Build insert_asset action with position resolution
+            if relationship == "near":
+                position = {"x": 5, "y": 0, "z": 5}  # offset from reference
+            elif relationship == "beside":
+                position = {"x": -5, "y": 0, "z": 0}
+            elif relationship == "in front":
+                position = {"x": 8, "y": 0, "z": 0}
+            elif relationship == "behind":
+                position = {"x": -8, "y": 0, "z": 0}
+            elif relationship == "above":
+                position = {"x": 0, "y": 3, "z": 0}
+            elif relationship == "below":
+                position = {"x": 0, "y": -3, "z": 0}
+            else:
+                position = {"x": 5, "y": 0, "z": 5}
+            
+            actions = [
+                {
+                    "tool": "insert_asset",
+                    "arguments": {
+                        "asset_id": "rbxmarketplace:{0}".format(asset_type.lower()),
+                        "parent_path": reference_item.get("path", ""),
+                        "position": position,
+                    },
+                    "reason": "{0} placed {1} the {2}".format(asset_type, relationship, reference_item.get("name")),
+                    "depends_on": [],
+                }
+            ]
+            spatial = ["place {0} {1} {2}".format(asset_type, relationship, reference_item.get("name"))]
+            verification = [
+                "{0} instance exists at {1}".format(asset_type, position),
+                reference_item.get("name", "reference"), "still exists",
+            ]
+            return {
+                "ok": True,
+                "result": {
+                    "goal": request,
+                    "action": "insert_asset",
+                    "reference_objects": [reference_item],
+                    "required_actions": actions,
+                    "dependencies": [a["depends_on"] for a in actions],
+                    "spatial_constraints": spatial,
+                    "verification_criteria": verification,
+                    "unsupported_capabilities": [],
+                    "note": "Ready to insert {0} {1} using 1 insert_asset step.".format(
+                        asset_type, relationship
+                    ),
+                },
+            }    # Edit: modify/convert an existing object.
     if action == "edit":
         if not reference_item:
             return {

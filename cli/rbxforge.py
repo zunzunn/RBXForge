@@ -457,6 +457,21 @@ class InvalidParamsError(ToolError):
     """Raised when params do not match a tool's input schema."""
 
 
+class InsertionPolicyError(ToolError):
+    """Raised when insert_asset is rejected before anything is sent (Phase 7D).
+
+    Carries a machine-readable ``code`` and a complete ``message`` describing
+    why the insertion was not allowed (invented id, missing/invalid metadata,
+    non-insertable asset type, stale search results, conflicting placement).
+    ``str(exc)`` is the human-readable message, so callers surface it directly.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 def _validate_value(value, spec, path):
     """Validate one value against a schema fragment; returns an error string or None.
 
@@ -1452,6 +1467,14 @@ INSERTABLE_ASSET_TYPES = frozenset({"Model", "MeshPart", "Decal", "Audio"})
 #: known-assets registry can never grow without bound.
 MAX_KNOWN_ASSETS = 200
 
+#: Phase 7D: how old a search-derived known-asset record may be before it is
+#: treated as stale. ``insert_asset`` rejects ids that have not appeared in a
+#: search for longer than this window (each asset_search / recommend_assets
+#: call refreshes the record), so the model can never reuse a discovery from an
+#: old session. Manual records (--insert-asset-once) are exempt because a human
+#: typed the id explicitly.
+MAX_ASSET_FRESHNESS_SECONDS = 600.0
+
 #: Phase 8D: maximum number of objects kept in the recent build context.
 #: Keeps follow-up edit prompts small and deterministic.
 MAX_RECENT_BUILD_CONTEXT = 50
@@ -1487,46 +1510,85 @@ def insert_asset_tool():
     The step before insertion is a completed asset_search / recommend_assets
     call; this tool refuses any asset id that was not among those results, so
     the model can never fabricate an id. The CLI validates the id format,
-    the known-ids requirement, the insertable asset type, and the position /
-    reference_path exclusivity before anything is sent; the plugin
-    independently re-validates, loads the asset (InsertService:LoadAsset),
-    resolves the parent, ensures a sibling-unique name, and positions the
-    asset (explicit position, near the referenced instance, or beside the
-    project's SpawnLocation). Returns clear success/error information.
+    the known-ids requirement, the insertable asset type, the recorded
+    metadata, and the position / reference_path exclusivity before anything
+    is sent; a rejection raises InsertionPolicyError with a clear code and is
+    never sent (insertion is single-attempt - failures are reported, not
+    retried). The plugin independently re-validates, loads the asset
+    (InsertService:LoadAsset), resolves the parent, ensures a
+    sibling-unique name, and positions the asset (explicit position, near the
+    referenced instance, or beside the project's SpawnLocation). Returns
+    clear success/error information.
     """
 
     def run(rbx, params, timeout):
         asset_id = params["asset_id"]
-        # Phase 7C safety: the model may only insert an asset id that a prior
-        # discover/rank step returned in this session. Connections that track
-        # known assets (RBXForge) enforce it; test doubles without tracking
-        # skip it, keeping every other tool's behavior unchanged.
+        # Phase 7D bounded insertion policy: before anything is sent, the
+        # requested id must be a *known* search/ranking result from the current
+        # session (never invented), carry valid recorded metadata, be of an
+        # insertable asset type, and not be stale. Rejections raise
+        # InsertionPolicyError (a clear error code + message); callers decide
+        # how to surface it. Connections that do not track known assets (older
+        # test doubles) skip the policy, keeping every other tool unchanged.
         known = getattr(rbx, "known_asset", None)
         if known is not None:
             record = known(asset_id)
             if record is None:
-                rbx.log(
-                    "insert_asset REJECTED: asset_id {0!r} was not returned by a "
-                    "prior asset_search / recommend_assets call - search first and "
-                    "use an id exactly as it appears in the results".format(asset_id)
+                raise InsertionPolicyError(
+                    "unknown_asset_id",
+                    "asset_id {0!r} was not returned by a prior asset_search / "
+                    "recommend_assets call - search first and use an id exactly "
+                    "as it appears in the results".format(asset_id),
                 )
-                return False
-            asset_type = record.get("asset_type")
-            if asset_type is not None and asset_type not in INSERTABLE_ASSET_TYPES:
-                rbx.log(
-                    "insert_asset REJECTED: asset_id {0!r} is type {1!r}, which "
-                    "cannot be inserted into the project (supported: {2})".format(
-                        asset_id, asset_type,
-                        ", ".join(sorted(INSERTABLE_ASSET_TYPES)),
+            # Manual records (--insert-asset-once) are the human exception: the
+            # id was typed explicitly, so the strict search-derived checks below
+            # are skipped, but being a known id is still required.
+            if record.get("source") != "manual":
+                name = record.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise InsertionPolicyError(
+                        "missing_asset_metadata",
+                        "asset_id {0!r} has missing/invalid recorded metadata "
+                        "(name and asset_type are required) - re-run asset_search "
+                        "to refresh the results".format(asset_id),
                     )
-                )
-                return False
+                asset_type = record.get("asset_type")
+                if not isinstance(asset_type, str) or not asset_type.strip():
+                    raise InsertionPolicyError(
+                        "missing_asset_metadata",
+                        "asset_id {0!r} has missing/invalid recorded metadata "
+                        "(name and asset_type are required) - re-run asset_search "
+                        "to refresh the results".format(asset_id),
+                    )
+                if asset_type not in INSERTABLE_ASSET_TYPES:
+                    raise InsertionPolicyError(
+                        "uninsertable_asset_type",
+                        "asset_id {0!r} is type {1!r}, which cannot be inserted "
+                        "into the project (supported: {2})".format(
+                            asset_id, asset_type,
+                            ", ".join(sorted(INSERTABLE_ASSET_TYPES)),
+                        ),
+                    )
+                recorded_at = record.get("recorded_at")
+                if isinstance(recorded_at, (int, float)):
+                    clock = getattr(rbx, "_now_ts", None)
+                    now = clock() if callable(clock) else time.time()
+                    if now - recorded_at > MAX_ASSET_FRESHNESS_SECONDS:
+                        raise InsertionPolicyError(
+                            "stale_search_results",
+                            "asset_id {0!r} came from stale search results "
+                            "(recorded {1:.0f}s ago, older than the {2:g}s "
+                            "freshness window) - run asset_search again before "
+                            "inserting".format(
+                                asset_id, now - recorded_at,
+                                MAX_ASSET_FRESHNESS_SECONDS,
+                            ),
+                        )
         if params.get("position") is not None and params.get("reference_path") is not None:
-            rbx.log(
-                "insert_asset REJECTED: provide either 'position' or "
-                "'reference_path', not both"
+            raise InsertionPolicyError(
+                "conflicting_placement",
+                "provide either 'position' or 'reference_path', not both",
             )
-            return False
         response = rbx.send_request("insert_asset", params, timeout)
         if response is None:
             rbx.log("insert_asset failed: no response from the plugin")
@@ -2192,6 +2254,10 @@ class RBXForge:
         # asset_search / recommend_assets calls; insert_asset only accepts ids
         # recorded here, so the model can never invent one.
         self._known_assets = {}
+        # Phase 7D: injectable clock used to stamp known-asset records with
+        # their search time so insert_asset can reject stale results. Defaults
+        # to wall time; tests override it for deterministic staleness checks.
+        self._now_ts = time.time
         # Phase 8D: lightweight context of objects created by the most recent
         # successful build, so follow-up edits can reference them naturally.
         self._recent_build_context = []
@@ -2222,10 +2288,15 @@ class RBXForge:
         """Record asset ids from search results as known (bounded).
 
         Each non-dict / id-less entry is skipped; the first metadata snapshot
-        for an id is kept. Kept hard-bounded: when the table would exceed
-        :data:`MAX_KNOWN_ASSETS` entries the oldest records are dropped, so a
-        long REPL/agent session can never grow the registry without bound
-        (each record is small: name/asset_type/creator).
+        for an id is kept unless the id was previously recorded as a manual
+        (--insert-asset-once) exception, in which case the search metadata
+        replaces it so a searched id is always treated as search-derived.
+        Every time an id appears in search results its ``recorded_at`` stamp
+        is refreshed, so the freshness policy measures time since the last
+        search that returned the id. Kept hard-bounded: when the table would
+        exceed :data:`MAX_KNOWN_ASSETS` entries the oldest records are
+        dropped, so a long REPL/agent session can never grow the registry
+        without bound (each record is small: name/asset_type/creator).
         """
         for entry in results or []:
             if not isinstance(entry, dict):
@@ -2236,13 +2307,37 @@ class RBXForge:
             asset_id = str(asset_id).strip()
             if not asset_id:
                 continue
-            self._known_assets.setdefault(asset_id, {
-                "name": entry.get("name"),
-                "asset_type": entry.get("asset_type"),
-                "creator": entry.get("creator"),
-            })
+            record = self._known_assets.get(asset_id)
+            if record is None or record.get("source") == "manual":
+                record = {
+                    "name": entry.get("name"),
+                    "asset_type": entry.get("asset_type"),
+                    "creator": entry.get("creator"),
+                    "source": "search",
+                }
+                self._known_assets[asset_id] = record
+            record["recorded_at"] = self._now_ts()
             while len(self._known_assets) > MAX_KNOWN_ASSETS:
                 self._known_assets.pop(next(iter(self._known_assets)))
+
+    def remember_manual_asset(self, asset_id):
+        """Record an asset id typed explicitly by a human (--insert-asset-once).
+
+        The record carries ``source: "manual"`` and no search metadata, so the
+        insert_asset policy accepts it without the search-derived checks
+        (metadata / insertable type / staleness) - the human explicitly took
+        responsibility for the id. It still must be a known id, and a later
+        search that returns the same id upgrades it back to search-derived.
+        """
+        asset_id = str(asset_id).strip()
+        if asset_id:
+            self._known_assets[asset_id] = {
+                "name": None,
+                "asset_type": None,
+                "creator": None,
+                "source": "manual",
+                "recorded_at": self._now_ts(),
+            }
 
     def asset_known(self, asset_id):
         """True when ``asset_id`` was returned by a prior search/ranking call."""
@@ -2467,6 +2562,12 @@ class RBXForge:
             return False
         except InvalidParamsError as exc:
             self.log("cannot execute {0}: invalid parameters: {1}".format(name, exc))
+            return False
+        except InsertionPolicyError as exc:
+            # Phase 7D: a bounded-insertion rejection before anything was sent.
+            # Log the specific reason (code + message) and fail like any other
+            # tool failure; nothing reaches the plugin.
+            self.log("cannot execute {0}: [{1}] {2}".format(name, exc.code, exc.message))
             return False
 
     def create_part(self, timeout=10.0):
@@ -3101,7 +3202,7 @@ def main(argv=None):
                     return 2
             if not wait_for_plugin(rbx, args.timeout):
                 return 2
-            rbx.remember_assets([{"asset_id": args.asset_id}])
+            rbx.remember_manual_asset(args.asset_id)
             rbx.log(
                 "insert_asset: accepting --asset-id {0!r} provided directly on "
                 "the command line (the Agent path requires ids from "

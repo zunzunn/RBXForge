@@ -228,6 +228,22 @@ MAX_TOOL_RESULT_ITEMS = 20  # cap on list/dict entries (e.g. matches, children)
 MAX_TOOL_RESULT_STRING = 200  # per-string truncation length
 MAX_TOOL_RESULT_CHARS = 2000  # serialized result budget
 
+#: Phase 7D: tolerance when verifying that an inserted asset actually landed at
+#: the intended absolute position. Position values are floats reported over the
+#: wire and the plugin may round them, so a small epsilon is applied.
+POSITION_EPSILON = 1e-3
+
+
+def _positions_close(position, other):
+    """True when two (x, y, z) tuples match within :data:`POSITION_EPSILON`.
+
+    Used by ``Agent._verify_inserted_asset`` to confirm an inserted asset was
+    created at the intended location in the Studio hierarchy.
+    """
+    return all(
+        abs(a - b) <= POSITION_EPSILON for a, b in zip(position, other)
+    )
+
 
 def _compact_value(value, depth=0):
     """Return a JSON-serializable, size-bounded copy of ``value``.
@@ -609,6 +625,20 @@ class Agent:
         """The currently registered tool definitions sent to the model."""
         return tool_definitions(self.registry)
 
+    @staticmethod
+    def _as_vec3(value):
+        """Extract an (x, y, z) tuple from a vec3 dict, or None if unparseable.
+
+        Used by ``_verify_inserted_asset`` to compare an inserted asset's
+        reported position with the position observed in the Studio hierarchy.
+        """
+        if not isinstance(value, dict):
+            return None
+        keys = ("x", "y", "z")
+        if not all(isinstance(value.get(key), (int, float)) for key in keys):
+            return None
+        return (value["x"], value["y"], value["z"])
+
     def _verify_inserted_asset(self, insert_response, timeout):
         """Phase 7D: after a successful insert_asset, verify the instance exists
         at the reported path and matches the reported name/class.
@@ -696,6 +726,25 @@ class Agent:
                 )
             )
             return False, info
+
+        # Phase 7D: when the insertion reports an absolute placement and the
+        # inspection exposes a Position, confirm the instance actually landed at
+        # the intended location (within epsilon). Skipped when either side lacks
+        # the data - the presence check is what must hold, not a guessed value.
+        positioned = (
+            result.get("positioned")
+            and Agent._as_vec3(result.get("position")) is not None
+        )
+        if positioned:
+            reported = Agent._as_vec3(result.get("position"))
+            actual = Agent._as_vec3((inspected.get("properties") or {}).get("Position"))
+            if actual is not None and not _positions_close(reported, actual):
+                info["message"] = (
+                    "verification position mismatch at {0}: expected {1}, "
+                    "found {2}".format(path, result.get("position"),
+                                       (inspected.get("properties") or {}).get("Position"))
+                )
+                return False, info
 
         info["message"] = "Verified insertion: asset {0} is {1} ({2}) at {3}".format(
             result.get("asset_id"), actual_name, actual_class, path
@@ -1224,6 +1273,12 @@ class Agent:
                         failure = {"code": "unknown_tool", "message": str(exc)}
                     except rbxforge.InvalidParamsError as exc:
                         failure = {"code": "invalid_arguments", "message": str(exc)}
+                    except rbxforge.InsertionPolicyError as exc:
+                        # Phase 7D: the bounded insertion policy rejected the
+                        # call before anything was sent (invented id, stale
+                        # search results, non-insertable type, conflicting
+                        # placement, ...). Surface the specific reason clearly.
+                        failure = {"code": "insert_rejected", "message": exc.message}
                 if failure is None and not output:
                     failure = {
                         "code": "execution_failed",
@@ -1463,8 +1518,8 @@ class Agent:
                 # Phase 7D: insert_asset automatically verifies the placed
                 # instance at the reported path before the loop ends. This makes
                 # the end-to-end asset workflow reliable: the agent never claims
-                # success when the instance cannot be found or does not match
-                # the insertion report.
+                # success when the instance cannot be found, does not match the
+                # insertion report, or is not at the intended location.
                 if call.name == "insert_asset":
                     verified, verify_info = self._verify_inserted_asset(
                         response_payload, self.timeout

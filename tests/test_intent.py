@@ -22,16 +22,26 @@ def _scene_with_spawn_and_house():
         "total_nodes": 5,
         "truncated": False,
         "landmarks": [
-            {"name": "SpawnLocation", "class": "SpawnLocation",
-             "path": "Workspace/SpawnLocation"},
-            {"name": "Baseplate", "class": "Part",
-             "path": "Workspace/Baseplate"},
+            {
+                "name": "SpawnLocation",
+                "class": "SpawnLocation",
+                "path": "Workspace/SpawnLocation",
+            },
+            {"name": "Baseplate", "class": "Part", "path": "Workspace/Baseplate"},
         ],
         "models": [
-            {"name": "House", "class": "Model", "path": "Workspace/House",
-             "child_count": 4},
-            {"name": "Room", "class": "Model", "path": "Workspace/Room",
-             "child_count": 3},
+            {
+                "name": "House",
+                "class": "Model",
+                "path": "Workspace/House",
+                "child_count": 4,
+            },
+            {
+                "name": "Room",
+                "class": "Model",
+                "path": "Workspace/Room",
+                "child_count": 3,
+            },
         ],
         "groups": [],
         "class_counts": {"SpawnLocation": 1, "Part": 1, "Model": 2},
@@ -46,7 +56,9 @@ def scenario_simple_build_intent():
     result = output["result"]
     assert result["action"] == "build", result
     assert "shop" in result["goal"].lower(), result
-    assert any(r["name"] == "SpawnLocation" for r in result["reference_objects"]), result
+    assert any(r["name"] == "SpawnLocation" for r in result["reference_objects"]), (
+        result
+    )
     actions = result["required_actions"]
     assert 3 <= len(actions) <= 5, actions
     assert all(a["tool"] == "create_part" for a in actions), actions
@@ -195,10 +207,14 @@ def scenario_registry_exposes_decompose_intent():
             self.logs.append(msg)
 
     rbx = FakeRBX()
-    result = registry.execute(rbx, "decompose_intent", {
-        "request": "build a small shop",
-        "scene_summary": _scene_with_spawn_and_house(),
-    })
+    result = registry.execute(
+        rbx,
+        "decompose_intent",
+        {
+            "request": "build a small shop",
+            "scene_summary": _scene_with_spawn_and_house(),
+        },
+    )
     assert result is not False, result
     plan = result.get("result") or {}
     assert plan.get("action") == "build", plan

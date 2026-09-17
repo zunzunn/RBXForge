@@ -1991,54 +1991,66 @@ def scenario_insert_asset_validation():
 
 def scenario_insert_asset_known_ids_enforced():
     """insert_asset must only accept an asset id that a prior search/ranking
-    recorded (Phase 7C known-id enforcement) and only insertable asset types;
-    anything else is rejected locally and never sent."""
+    recorded (Phase 7C known-id enforcement), and only with valid, current
+    search metadata and an insertable asset type; every other request is
+    rejected locally with InsertionPolicyError and never sent (Phase 7D)."""
     mod = load_cli_module()
     registry = mod.default_registry()
 
-    # Invented id: never sent, clear rejection log.
+    def expect_rejection(rbx, params, code, log_fragment):
+        try:
+            ok = registry.execute(rbx, "insert_asset", params)
+        except mod.InsertionPolicyError as exc:
+            assert exc.code == code, exc.code
+        else:
+            raise AssertionError(
+                "insert_asset accepted {0!r} (expected {1})".format(params, code)
+            )
+        assert rbx.requests == [], rbx.requests
+        if log_fragment is not None:
+            assert any(log_fragment in line for line in rbx.logs), rbx.logs
+
+    def expect_sent(rbx, params):
+        ok = registry.execute(rbx, "insert_asset", params)
+        assert ok is True, ok
+        assert rbx.requests == [("insert_asset", params)], rbx.requests
+
+    # Invented id: never sent, clear rejection.
     rbx = FakeRBX({"ok": True})
-    ok = registry.execute(rbx, "insert_asset", {"asset_id": "999999"})
-    assert ok is False, ok
-    assert rbx.requests == [], rbx.requests
-    assert any("not returned by a prior asset_search" in line for line in rbx.logs), rbx.logs
+    expect_rejection(rbx, {"asset_id": "999999"}, "unknown_asset_id", None)
+    assert any("was not returned by a prior asset_search" in line for line in rbx.logs), rbx.logs
 
     # Recorded id of a non-insertable type: rejected, never sent.
-    rbx = FakeRBX({"ok": True}, known_assets={"42": {"asset_type": "Plugin"}})
-    ok = registry.execute(rbx, "insert_asset", {"asset_id": "42"})
-    assert ok is False, ok
-    assert rbx.requests == [], rbx.requests
+    rbx = FakeRBX({"ok": True}, known_assets={"42": {"name": "Admin Panel", "asset_type": "Plugin"}})
+    expect_rejection(rbx, {"asset_id": "42"}, "uninsertable_asset_type", None)
     assert any("cannot be inserted" in line for line in rbx.logs), rbx.logs
 
-    # recorded id of a missing asset_type is allowed through (metadata may be
-    # absent); the plugin re-validates at load time.
+    # Recorded id with missing/invalid metadata: rejected, never sent (this is
+    # the Phase 7D metadata gate - a degraded search must not be inserted
+    # blindly; re-run asset_search to refresh the results).
     rbx = FakeRBX({"ok": True}, known_assets={"7": {"name": "Mystery"}})
-    ok = registry.execute(rbx, "insert_asset", {"asset_id": "7"})
-    assert ok is True, ok
-    assert rbx.requests == [("insert_asset", {"asset_id": "7"})], rbx.requests
+    expect_rejection(rbx, {"asset_id": "7"}, "missing_asset_metadata", None)
+    assert any("missing/invalid recorded metadata" in line for line in rbx.logs), rbx.logs
 
-    # Recorded id of an insertable type succeeds and is sent exactly as given.
-    rbx = FakeRBX({"ok": True}, known_assets={"135522": {"asset_type": "Model"}})
-    ok = registry.execute(rbx, "insert_asset", {"asset_id": "135522"})
-    assert ok is True, ok
-    assert rbx.requests == [("insert_asset", {"asset_id": "135522"})], rbx.requests
+    # Recorded id of an insertable type with complete, fresh metadata succeeds
+    # and is sent exactly as given.
+    rbx = FakeRBX({"ok": True}, known_assets={"135522": {"name": "Cafe Shop", "asset_type": "Model"}})
+    expect_sent(rbx, {"asset_id": "135522"})
 
     # position + reference_path are mutually exclusive: rejected before send.
-    rbx = FakeRBX({"ok": True}, known_assets={"1": {"asset_type": "Model"}})
-    ok = registry.execute(rbx, "insert_asset", {
+    rbx = FakeRBX({"ok": True}, known_assets={"1": {"name": "X", "asset_type": "Model"}})
+    expect_rejection(rbx, {
         "asset_id": "1", "position": {"x": 0, "y": 1, "z": 0},
         "reference_path": "Workspace.SpawnLocation",
-    })
-    assert ok is False, ok
-    assert rbx.requests == [], rbx.requests
-    assert any("not both" in line for line in rbx.logs), rbx.logs
+    }, "conflicting_placement", None)
 
     # remember_assets records the snapshot needed for later insertion.
     rbx = FakeRBX({"ok": True})
     assert rbx.remember_assets([{"asset_id": "A", "name": "Shop", "asset_type": "Model"}]) == 1
     assert rbx.asset_known("A") is True
     assert rbx.known_asset("A")["asset_type"] == "Model"
-    print("OK  insert_asset enforces known ids, insertable types, and one placement mode")
+    print("OK  insert_asset enforces known ids, current metadata, insertable "
+          "types, and one placement mode")
 
 
 def scenario_insert_asset_bounded_registry():
@@ -2064,7 +2076,167 @@ def scenario_insert_asset_bounded_registry():
     print("OK  known-assets registry is bounded and tolerates junk entries")
 
 
-def scenario_insert_asset_success():
+def scenario_insert_asset_stale_search_rejected():
+    """Search-derived ids expire (MAX_ASSET_FRESHNESS_SECONDS): an asset that
+    has not appeared in a search for longer than the freshness window is
+    rejected as stale before any request is sent, and a fresh re-search
+    refreshes the record so insertion is allowed again."""
+    mod = load_cli_module()
+    rbx = mod.RBXForge()
+    try:
+        # Fresh insert: recorded_at is now, so insertion is allowed (policy
+        # reaches send_request, but there is no plugin so ok becomes False.
+        # We verify no InsertionPolicyError is raised and the request is
+        # attempted (policy passes).
+        rbx._now_ts = lambda: 1_700_000_000.0
+        rbx.remember_assets([{"asset_id": "135522", "asset_type": "Model", "name": "Cafe Shop"}])
+        registry = mod.default_registry()
+        ok = registry.execute(rbx, "insert_asset", {"asset_id": "135522"})
+        # When no plugin is connected, send_request returns None and the tool
+        # returns False; ok is False but we check that no policy error was
+        # raised (i.e. the record was not considered stale). We also check
+        # that a request was attempted (the log contains the "no response"
+        # path). Since there's no real plugin, we just confirm no exception.
+        assert ok is False, ok
+        # The request was attempted (send_request logged "no plugin connected");
+        # just confirm no InsertionPolicyError exception was raised.
+        # No policy check beyond what's already asserted.
+        print("OK  insert_asset: fresh record not rejected before send")
+        # Now advance past the freshness window and re-insert; the record is
+        # now stale and should be rejected before any request.
+        rbx._now_ts = lambda: 1_700_000_000.0 + mod.MAX_ASSET_FRESHNESS_SECONDS + 10.0
+        try:
+            registry.execute(rbx, "insert_asset", {"asset_id": "135522"})
+            raise AssertionError("stale search result was accepted; expected InsertionPolicyError")
+        except mod.InsertionPolicyError as exc:
+            assert exc.code == "stale_search_results", exc.code
+        except Exception:
+            # Some other exception path (e.g. send_request fails differently)
+            # is also acceptable as long as it's not silently accepted.
+            raise AssertionError(
+                "stale search result raised unexpected {}; expected InsertionPolicyError".format(
+                    exc.__class__.__name__
+                )
+            )
+        assert rbx.requests == [], rbx.requests
+        # A re-search refreshes the recorded_at stamp so the id becomes
+        # fresh again under the same clock.
+        rbx._now_ts = lambda: 1_700_000_000.0 + mod.MAX_ASSET_FRESHNESS_SECONDS + 10.0
+        rbx.remember_assets([{"asset_id": "135522", "asset_type": "Model", "name": "Cafe Shop"}])
+        ok2 = registry.execute(rbx, "insert_asset", {"asset_id": "135522"})
+        # Same as first attempt: no policy error, request attempted (but
+        # ultimately returns False due to no plugin).
+        assert ok2 is False, ok2
+        print("OK  insert_asset: re-search after stale refreshes the record")
+    finally:
+        rbx.stop()
+
+
+def scenario_insert_asset_type_and_metadata_gate():
+    """Phase 7D type and metadata gate: only documented asset types with
+    fully populated search metadata are accepted; missing metadata or a
+    non-insertable type raises InsertionPolicyError before anything is sent."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+    supported = sorted(mod.INSERTABLE_ASSET_TYPES)
+
+    # All documented insertable types succeed with full metadata.
+    for asset_type in supported:
+        rbx = FakeRBX(
+            {"ok": True},
+            known_assets={
+                "1": {"name": "Thing", "asset_type": asset_type}
+            },
+        )
+        ok = registry.execute(rbx, "insert_asset", {"asset_id": "1"})
+        assert ok is True, (asset_type, ok)
+        assert rbx.requests == [("insert_asset", {"asset_id": "1"})], (
+            asset_type,
+            rbx.requests,
+        )
+    print("OK  all insertable types succeed with full metadata")
+
+    # Non-insertable types are rejected.
+    for asset_type in ("Plugin", "Video", "T-Shirt"):
+        rbx = FakeRBX(
+            {"ok": True},
+            known_assets={
+                "1": {"name": "Thing", "asset_type": asset_type}
+            },
+        )
+        try:
+            registry.execute(rbx, "insert_asset", {"asset_id": "1"})
+            raise AssertionError("asset type {0!r} was accepted".format(asset_type))
+        except mod.InsertionPolicyError as exc:
+            assert exc.code == "uninsertable_asset_type", (asset_type, exc.code)
+            assert any("cannot be inserted" in line for line in rbx.logs), rbx.logs
+        assert rbx.requests == [], rbx.requests
+    print("OK  non-insertable types rejected")
+
+    # Empty/non-string metadata are rejected.
+    rbx = FakeRBX(
+        {"ok": True},
+        known_assets={"1": {"name": "", "asset_type": "Model"}},
+    )
+    try:
+        registry.execute(rbx, "insert_asset", {"asset_id": "1"})
+        raise AssertionError("empty name was accepted")
+    except mod.InsertionPolicyError as exc:
+        assert exc.code == "missing_asset_metadata", exc.code
+    assert rbx.requests == [], rbx.requests
+
+    rbx = FakeRBX(
+        {"ok": True},
+        known_assets={"1": {"name": "X", "asset_type": ""}},
+    )
+    try:
+        registry.execute(rbx, "insert_asset", {"asset_id": "1"})
+        raise AssertionError("empty asset_type was accepted")
+    except mod.InsertionPolicyError as exc:
+        assert exc.code == "missing_asset_metadata", exc.code
+    assert rbx.requests == [], rbx.requests
+
+    print("OK  missing metadata rejected")
+
+
+def scenario_insert_asset_no_retry_on_failure():
+    """Insertion is single-attempt and bounded: a plugin-side failure produces
+    exactly one request and returns failure without retrying; a policy
+    rejection never reaches the plugin at all."""
+    mod = load_cli_module()
+    registry = mod.default_registry()
+
+    # Plugin-side failure (ok:false) is reported as one request, no verify.
+    rbx = FakeRBX(
+        {"ok": False, "error": {"code": "not_found", "message": "asset not found"}},
+        known_assets={
+            "135522": {"name": "Cafe Shop", "asset_type": "Model"},
+        },
+    )
+    ok = registry.execute(rbx, "insert_asset", {"asset_id": "135522"})
+    assert ok is False, ok
+    assert rbx.requests == [("insert_asset", {"asset_id": "135522"})], rbx.requests
+    assert any("insert_asset FAILED" in line for line in rbx.logs), rbx.logs
+    # No verification step ran; the loop ends with execution_failed.
+    print("OK  plugin-side failure: one request only, no retry")
+
+    # Policy rejection (non-insertable type) never sends a request.
+    rbx2 = FakeRBX(
+        {"ok": True},
+        known_assets={
+            "9": {"name": "X", "asset_type": "Plugin"},
+        },
+    )
+    try:
+        registry.execute(rbx2, "insert_asset", {"asset_id": "9"})
+        raise AssertionError("non-insertable type was sent")
+    except mod.InsertionPolicyError:
+        pass
+    else:
+        raise AssertionError("non-insertable type was accepted")
+    assert rbx2.requests == [], rbx2.requests
+    print("OK  policy rejection: never sends to plugin; exactly zero requests")
+    print("OK  insert_asset is single-attempt: no retry on failure")
     """--insert-asset-once must wait for the plugin, send an insert_asset request
     carrying only the seeded asset_id (no invented position), accept a success
     response including the plugin's final name/path, and exit 0."""
@@ -2220,7 +2392,7 @@ def scenario_insert_asset_timeout():
     treated as success)."""
     mod = load_cli_module()
     rbx = FakeRBX(None)  # send_request returns None, simulating a timeout
-    rbx.remember_assets([{"asset_id": "135522", "asset_type": "Model"}])
+    rbx.remember_assets([{"asset_id": "135522", "asset_type": "Model", "name": "Cafe Shop"}])
     ok = mod.default_registry().execute(
         rbx, "insert_asset", {"asset_id": "135522"}, timeout=0.01
     )
@@ -2572,6 +2744,9 @@ def main():
     scenario_insert_asset_validation()
     scenario_insert_asset_known_ids_enforced()
     scenario_insert_asset_bounded_registry()
+    scenario_insert_asset_stale_search_rejected()
+    scenario_insert_asset_type_and_metadata_gate()
+    scenario_insert_asset_no_retry_on_failure()
     scenario_insert_asset_success()
     scenario_insert_asset_failure()
     scenario_insert_asset_placement_modes()

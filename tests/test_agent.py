@@ -873,7 +873,8 @@ def scenario_insert_asset_action_tool():
     rbx_dup = MultiFakeRBX({
         "insert_asset": duplicate_insert,
         "inspect_instance": duplicate_verify,
-    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}})
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}})
     result_dup = make_agent(provider_dup, rbx=rbx_dup).run("add another shop model")
     assert result_dup.ok is True, result_dup
     assert "Cafe Shop2" in result_dup.message, result_dup
@@ -890,7 +891,8 @@ def scenario_insert_asset_action_tool():
     rbx_missing = MultiFakeRBX({
         "insert_asset": insert_result,
         "inspect_instance": {"ok": False, "error": {"code": "not_found", "message": "no instance at path"}},
-    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}})
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}})
     result_missing = make_agent(provider_missing, rbx=rbx_missing).run("add a shop model")
     assert result_missing.ok is False, result_missing
     assert result_missing.error["code"] == "verification_failed", result_missing
@@ -913,28 +915,114 @@ def scenario_insert_asset_action_tool():
     rbx_mismatch = MultiFakeRBX({
         "insert_asset": insert_result,
         "inspect_instance": mismatch_payload,
-    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}})
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}})
     result_mismatch = make_agent(provider_mismatch, rbx=rbx_mismatch).run("add a shop model")
     assert result_mismatch.ok is False, result_mismatch
     assert result_mismatch.error["code"] == "verification_failed", result_mismatch
     assert len(provider_mismatch.chat_calls) == 1, len(provider_mismatch.chat_calls)
     print("OK  insert_asset verification catches name/class mismatch")
 
-    # A plugin-side insert failure (ok:false) is reported as execution_failed
-    # and never reaches verification.
-    failing = dict(insert_result)
-    failing["ok"] = False
-    failing["error"] = {"code": "not_found", "message": "asset not found or not insertable: 999999"}
-    rbx_fail = MultiFakeRBX({"insert_asset": failing})
-    provider_fail = SequenceProvider([json.dumps({
+    # A forged asset id (not in known_assets) is rejected by the policy before
+    # anything is sent; the agent reports it as ``insert_rejected``, no plugin
+    # request is made, and no verification step runs.
+    rbx_forged = MultiFakeRBX({},
+                              known_assets={})
+    provider_forged = SequenceProvider([json.dumps({
         "tool": "insert_asset", "arguments": {"asset_id": "999999"},
     })])
-    result_fail = make_agent(provider_fail, rbx=rbx_fail).run("insert a ghost asset")
-    assert result_fail.ok is False, result_fail
-    assert result_fail.error["code"] == "execution_failed", result_fail
-    assert [step["tool"] for step in result_fail.steps] == ["insert_asset"], result_fail.steps
-    assert result_fail.steps[0]["ok"] is False, result_fail.steps
-    print("OK  insert_asset failure in agent loop reported as execution_failed")
+    result_forged = make_agent(provider_forged, rbx=rbx_forged).run("insert a ghost asset")
+    assert result_forged.ok is False, result_forged
+    assert result_forged.error["code"] == "insert_rejected", result_forged
+    assert [step["tool"] for step in result_forged.steps] == ["insert_asset"], result_forged.steps
+    assert rbx_forged.requests == [], rbx_forged.requests  # policy rejected; no send
+    assert len(provider_forged.chat_calls) == 1, len(provider_forged.chat_calls)
+    print("OK  insert_asset forged id rejected as insert_rejected; no plugin request; no verify step")
+
+    # Position verification: when the insertion reports an absolute placement
+    # and the inspection exposes a Position property, the agent confirms the
+    # instance was created at the intended location. The happy-path below
+    # matches positions; a mismatched-position variant below fails fast.
+    # (Existing test payloads use ``properties: {}`` so position checking is
+    # skipped for backward compatibility, but the mechanism is present.)
+
+    # ------------------------------------------------------------------
+    # NEW: position-mismatch verification (name/class match, position fail)
+    # ------------------------------------------------------------------
+    mismatched_pos_verify = {
+        "ok": True,
+        "result": {
+            "name": "Cafe Shop",
+            "className": "Model",
+            "path": "Workspace/Cafe Shop",
+            "parent_path": "Workspace",
+            "properties": {"Position": {"x": 0, "y": 100, "z": 0}},  # intentionally wrong
+        },
+    }
+    provider_pos_mismatch = SequenceProvider([
+        insert_call,
+        json.dumps({"message": "done"}),
+    ])
+    rbx_pos_mismatch = MultiFakeRBX({
+        "insert_asset": insert_result,
+        "inspect_instance": mismatched_pos_verify,
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}})
+    result_pos_mismatch = make_agent(provider_pos_mismatch, rbx=rbx_pos_mismatch).run("add a shop model with wrong position")
+    assert result_pos_mismatch.ok is False, result_pos_mismatch
+    assert result_pos_mismatch.error["code"] == "verification_failed", result_pos_mismatch
+    assert [step["tool"] for step in result_pos_mismatch.steps] == ["insert_asset", "inspect_instance"], result_pos_mismatch.steps
+    assert "position mismatch" in result_pos_mismatch.error["message"], result_pos_mismatch.error["message"]
+    print("OK  insert_asset position mismatch detected and reported as verification_failed")
+
+    # ------------------------------------------------------------------
+    # NEW: position match verification (name/class match, position succeeds)
+    # ------------------------------------------------------------------
+    matching_pos_verify = {
+        "ok": True,
+        "result": {
+            "name": "Cafe Shop",
+            "className": "Model",
+            "path": "Workspace/Cafe Shop",
+            "parent_path": "Workspace",
+            "properties": {"Position": {"x": 0, "y": 5, "z": 0}},  # matches insert position
+        },
+    }
+    provider_pos_match = SequenceProvider([
+        insert_call,
+        json.dumps({"message": "done"}),
+    ])
+    rbx_pos_match = MultiFakeRBX({
+        "insert_asset": insert_result,
+        "inspect_instance": matching_pos_verify,
+    }, known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}})
+    result_pos_match = make_agent(provider_pos_match, rbx=rbx_pos_match).run("add a shop model at the intended position")
+    assert result_pos_match.ok is True, result_pos_match
+    assert result_pos_match.error is None, result_pos_match
+    assert [step["tool"] for step in result_pos_match.steps] == ["insert_asset", "inspect_instance"], result_pos_match.steps
+    assert "Verified" in result_pos_match.message, result_pos_match.message
+    print("OK  insert_asset position matches and verified successfully")
+
+    # A genuine plugin-side insert failure (ok:false with a known id) is
+    # reported as ``execution_failed`` and never reaches verification.
+    failing = dict(insert_result)
+    failing["ok"] = False
+    failing["error"] = {"code": "not_found", "message": "asset not found or not insertable: 135522"}
+    rbx_known_fail = MultiFakeRBX({"insert_asset": failing},
+                                  known_assets={"135522": {"asset_id": "135522",
+                                                       "asset_type": "Model",
+                                                       "name": "Cafe Shop"}})
+    provider_known_fail = SequenceProvider([json.dumps({
+        "tool": "insert_asset", "arguments": {"asset_id": "135522"},
+    })])
+    result_known_fail = make_agent(provider_known_fail, rbx=rbx_known_fail).run("insert an asset that fails to place")
+    assert result_known_fail.ok is False, result_known_fail
+    assert result_known_fail.error["code"] == "execution_failed", result_known_fail
+    assert [step["tool"] for step in result_known_fail.steps] == ["insert_asset"], result_known_fail.steps
+    assert result_known_fail.steps[0]["ok"] is False, result_known_fail.steps
+    assert rbx_known_fail.requests == [("insert_asset", {"asset_id": "135522"})], rbx_known_fail.requests
+    print("OK  insert_asset plugin-side failure reported as execution_failed; exactly one request; no verify")
 
 
 def scenario_scene_aware_building():
@@ -1082,7 +1170,8 @@ def scenario_scene_aware_building():
             "create_script": sign_payload,
             "insert_asset": asset_payload,
         },
-        known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}},
+        known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}},
         verify_map=verify_ok,
         per_tool_counts={
             "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],
@@ -1181,7 +1270,8 @@ def scenario_scene_aware_building():
             "create_script": sign_payload,
             "insert_asset": asset_payload,
         },
-        known_assets={"135522": {"asset_id": "135522", "asset_type": "Model"}},
+        known_assets={"135522": {"asset_id": "135522", "asset_type": "Model",
+                                "name": "Cafe Shop"}},
         verify_map=verify_missing,
         per_tool_counts={
             "create_part": [part_payload("ShopFloor"), part_payload("ShopWall")],

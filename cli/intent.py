@@ -103,14 +103,18 @@ def _find_reference(tokens, scene_summary):
     """Find an existing object in the scene summary referenced by the request.
 
     Looks for patterns like "the house", "this room", "existing shop",
-    "near the tree", "beside SpawnLocation", etc.  Returns the first matching
-    landmark/model/group entry or None.
+    "near the tree", "beside SpawnLocation", "in front of the house",
+    "behind the shed", "above the platform", "between the two buildings".
+    Returns the first matching landmark/model/group entry or None.
     """
     if not scene_summary:
         return None
 
-    reference_indicators = {"the", "this", "that", "existing", "near", "beside",
-                            "next to", "by", "to", "of", "into", "from"}
+    reference_indicators = {
+        "the", "this", "that", "existing", "near", "beside",
+        "next to", "by", "in front of", "behind", "above",
+        "below", "between", "nearby"
+    }
     candidates = []
     for group in ("landmarks", "models", "groups", "relevant"):
         for item in scene_summary.get(group) or []:
@@ -119,20 +123,93 @@ def _find_reference(tokens, scene_summary):
                 continue
             candidates.append((name.lower(), item))
 
-    # Prefer matches preceded by a reference indicator in the token stream.
+    # Strategy 1: Prefer matches preceded by a reference indicator in the token stream.
     for i, tok in enumerate(tokens):
         if tok in reference_indicators:
-            for name, item in candidates:
-                if name in tokens[i + 1:]:
-                    return item
-                # allow compound names like "big tree" split across tokens
-                name_tokens = name.split()
-                if len(name_tokens) > 1:
-                    window = tokens[i + 1:i + 1 + len(name_tokens)]
-                    if window == name_tokens:
+            # Check for multi-word phrases like "in front of", "behind", "above", "below", "between"
+            if tok == "in" and i + 1 < len(tokens) and tokens[i + 1] == "front" and i + 2 < len(tokens) and tokens[i + 2] == "of":
+                # "in front of <object>"
+                for name, item in candidates:
+                    name_lower = name.lower()
+                    # Check if the object name appears after "in front of"
+                    remaining = tokens[i + 4:]
+                    if any(tok == name_lower.split()[0] if name_lower.split() else '' in remaining for tok in remaining):
+                        # More robust: check if any candidate name token appears after the phrase
+                        for candidate_name, candidate_item in candidates:
+                            c_tokens = candidate_name.lower().split()
+                            if len(c_tokens) <= len(remaining):
+                                if all(tok in remaining for tok in c_tokens):
+                                    return candidate_item
+                            # Also check if the full name appears as a substring of remaining tokens
+                            remaining_str = ' '.join(remaining)
+                            if candidate_name.lower() in remaining_str:
+                                return candidate_item
+
+            elif tok == "behind" and i + 1 < len(tokens):
+                # "behind <object>"
+                for name, item in candidates:
+                    name_lower = name.lower()
+                    remaining = tokens[i + 2:]
+                    # Check if object name appears after "behind"
+                    if name_lower in remaining or any(
+                        tok == name_lower.split()[0] if name_lower.split() else '' in remaining
+                        for tok in remaining
+                    ):
                         return item
 
-    # Fallback: direct name match anywhere in the request.
+            elif tok == "above" and i + 1 < len(tokens):
+                # "above <object>"
+                for name, item in candidates:
+                    name_lower = name.lower()
+                    remaining = tokens[i + 2:]
+                    if name_lower in remaining or any(
+                        tok == name_lower.split()[0] if name_lower.split() else '' in remaining
+                        for tok in remaining
+                    ):
+                        return item
+
+            elif tok == "below" and i + 1 < len(tokens):
+                # "below <object>"
+                for name, item in candidates:
+                    name_lower = name.lower()
+                    remaining = tokens[i + 2:]
+                    if name_lower in remaining or any(
+                        tok == name_lower.split()[0] if name_lower.split() else '' in remaining
+                        for tok in remaining
+                    ):
+                        return item
+
+            elif tok == "between" and i + 2 < len(tokens):
+                # "between <object1> and <object2>"
+                # Simple heuristic: both objects should appear after "between"
+                for name, item in candidates:
+                    name_lower = name.lower()
+                    remaining = tokens[i + 1:]
+                    names_in_remaining = []
+                    for candidate_name, _ in candidates:
+                        c_lower = candidate_name.lower()
+                        if c_lower in remaining:
+                            names_in_remaining.append(c_lower)
+                    if len(names_in_remaining) >= 2:
+                        return item
+
+            else:
+                # Standard single-word reference indicator: "near", "beside", "next to", "by"
+                for name, item in candidates:
+                    name_lower = name.lower()
+                    # Check if the object name appears after the indicator
+                    window_start = i + 1
+                    window = tokens[window_start:window_start + len(name_lower.split())]
+                    if window == name_lower.split():
+                        return item
+                    # Allow compound names like "big tree" split across tokens
+                    name_tokens = name_lower.split()
+                    if len(name_tokens) > 1:
+                        window = tokens[i + 1:i + 1 + len(name_tokens)]
+                        if window == name_tokens:
+                            return item
+
+    # Strategy 2: Fallback - direct name match anywhere in the request.
     for name, item in candidates:
         if name in tokens:
             return item

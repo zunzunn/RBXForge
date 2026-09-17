@@ -1584,11 +1584,52 @@ def insert_asset_tool():
                                 MAX_ASSET_FRESHNESS_SECONDS,
                             ),
                         )
+        # Phase 8A: When reference_path is provided without an explicit position,
+        # resolve the position from the referenced instance's live properties.
+        reference_path = params.get("reference_path")
+        if reference_path is not None and params.get("position") is None:
+            # Try to inspect the referenced instance to get its position
+            try:
+                inspect_result = rbx.send_request(
+                    "inspect_instance", {"path": reference_path}, timeout
+                )
+                if inspect_result and inspect_result.get("ok"):
+                    result_data = inspect_result.get("result") or {}
+                    properties = result_data.get("properties") or {}
+                    pos = properties.get("Position")
+                    if pos and isinstance(pos, dict):
+                        # Resolve the Vector3 and add a sensible offset
+                        x = pos.get("x", 0)
+                        y = pos.get("y", 0)
+                        z = pos.get("z", 0)
+                        # Apply a default offset of (5, 0, 0) relative to the reference
+                        params["position"] = {"x": x + 5, "y": y, "z": z}
+                        rbx.log(
+                            "insert_asset: resolved position from reference_path {0}: {1} + offset = {2}"
+                            .format(reference_path, pos, params["position"])
+                        )
+                    else:
+                        rbx.log(
+                            "insert_asset: reference_path {0} has no Position property, using default placement"
+                            .format(reference_path)
+                        )
+                else:
+                    rbx.log(
+                        "insert_asset: could not inspect reference_path {0}, using default placement"
+                        .format(reference_path)
+                    )
+            except Exception as e:
+                rbx.log(
+                    "insert_asset: error inspecting reference_path {0}: {1}, using default placement"
+                    .format(reference_path, str(e))
+                )
+
         if params.get("position") is not None and params.get("reference_path") is not None:
             raise InsertionPolicyError(
                 "conflicting_placement",
                 "provide either 'position' or 'reference_path', not both",
             )
+
         response = rbx.send_request("insert_asset", params, timeout)
         if response is None:
             rbx.log("insert_asset failed: no response from the plugin")
